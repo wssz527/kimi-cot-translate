@@ -1,0 +1,44 @@
+name: Windows official app smoke
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7.1.0
+        with:
+          node-version: 24
+      - name: Extract the verified official app without running its installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installer = Join-Path $env:RUNNER_TEMP 'KimiCode-win-x64.exe'
+          Invoke-WebRequest 'https://code.kimi.com/kimi-code/desktop/download/KimiCode-win-x64.exe' -OutFile $installer
+          $expected = '6938de412fa9a8481dbeffa84556a6788ae030cc362e789376f7ec3be8893137'
+          if ((Get-FileHash $installer -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expected) {
+            throw 'Official installer changed; compatibility must be reviewed first.'
+          }
+          if ((Get-AuthenticodeSignature $installer).Status -ne 'Valid') {
+            throw 'Official installer signature is not valid.'
+          }
+          $seven = (Get-Command 7z.exe -ErrorAction Stop).Source
+          $stage = Join-Path $env:RUNNER_TEMP 'kimi-installer'
+          & $seven x $installer ('-o' + $stage) '$PLUGINSDIR/app-64.7z' -y -bso0
+          if ($LASTEXITCODE -ne 0) { throw 'Installer extraction failed.' }
+          $app = Join-Path $env:LOCALAPPDATA 'Programs/Kimi Code'
+          if (Test-Path $app) { throw 'Refusing to overwrite a pre-existing app.' }
+          & $seven x (Join-Path $stage '$PLUGINSDIR/app-64.7z') ('-o' + $app) -y -bso0
+          if ($LASTEXITCODE -ne 0) { throw 'App extraction failed.' }
+      - name: Verify attachment and recovery on two owned app processes
+        run: node --test runtime-windows.live.test.mjs
+        env:
+          KCT_WINDOWS_LIVE: '1'

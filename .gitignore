@@ -1,0 +1,34 @@
+node_modules/
+.DS_Store
+
+# Local runtime data and deployment artifacts.
+runtime-state.json
+runtime-state.json.*
+*.log
+*.lock
+.state.json
+.env
+.env.*
+*-state.json
+.runtime-lock/
+.*-lock/
+.deploy-stage-*/
+.deploy-backup-*/
+.runtime-plist.backup
+
+# Legacy installers and local backups.
+/install.sh
+/uninstall.sh
+/install.cjs
+/install.mjs
+/uninstall.cjs
+/keepalive.sh
+/old-installers/
+/legacy/
+/backup/
+/backups/
+*.bak
+*.backup
+/work/
+/outputs/
+*~

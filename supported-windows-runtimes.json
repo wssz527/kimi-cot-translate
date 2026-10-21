@@ -1,0 +1,11 @@
+[
+  {
+    "sha256": "9c6aac3196d3fb2a62e3ff67e6add9f24238efddf661cfcc7088b120f7e478e9",
+    "size": 225501472,
+    "electron": "43.1.1",
+    "appVersion": "1.1.1",
+    "signerThumbprint": "F754CEE9121450C6CD50EE89D1CD9E692FE1CA40",
+    "installerSha256": "6938de412fa9a8481dbeffa84556a6788ae030cc362e789376f7ec3be8893137",
+    "validation": "Official payload checked offline on macOS; Windows live validation pending"
+  }
+]
