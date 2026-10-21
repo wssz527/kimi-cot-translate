@@ -206,13 +206,17 @@ test('hard limits preserve unbroken text and surrogate pairs', async (t) => {
 });
 
 test('changing language while a request is pending cannot render the old result', async (t) => {
-  const f = await fixture(t, { delay: 250 });
+  const f = await fixture(t, { holdResponses: true });
+  const firstRequest = f.page.waitForRequest('https://edge.microsoft.com/**');
   await f.open();
-  await f.page.waitForRequest('https://edge.microsoft.com/**');
+  await firstRequest;
+  const nextRequest = f.page.waitForRequest('https://edge.microsoft.com/**');
   await f.page.evaluate(() => {
     window.__kct.state.settings.targetLanguage = 'ja';
     window.__kct.resetAll();
   });
+  await nextRequest;
+  f.release();
   await f.done();
   assert.match(await f.page.locator('.kct-translated').textContent(), /^ja:/);
   assert.equal(f.requests.length, 2);

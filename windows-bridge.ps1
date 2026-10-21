@@ -9,6 +9,8 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+# A caller running PowerShell 7 can otherwise pass incompatible modules to Windows PowerShell.
+$env:PSModulePath = Join-Path $PSHOME 'Modules'
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 $request = if ($env:KCT_WINDOWS_REQUEST) {
     $env:KCT_WINDOWS_REQUEST | ConvertFrom-Json

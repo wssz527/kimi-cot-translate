@@ -1,13 +1,13 @@
 import assert from 'node:assert/strict';
 import { execFile, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { readFile } from 'node:fs/promises';
+import { readFile, stat } from 'node:fs/promises';
 import { connect } from 'node:net';
 import { join } from 'node:path';
 import test from 'node:test';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { promisify } from 'node:util';
-import { findProcesses } from './runtime-windows.mjs';
+import { findProcesses, windowsPaths } from './runtime-windows.mjs';
 
 const run = promisify(execFile);
 const enabled = process.platform === 'win32' && process.env.KCT_WINDOWS_LIVE === '1';
@@ -41,16 +41,22 @@ async function stopOwned(child) {
   }
 }
 
-test('verified Windows Kimi attaches on cold start and a second owned process', {
+test('verified Windows Kimi attaches, installs without restart, disables and recovers', {
   skip: !enabled,
-  timeout: 150000,
+  timeout: 180000,
 }, async (t) => {
   const exe = join(process.env.LOCALAPPDATA, 'Programs', 'Kimi Code', 'Kimi Code.exe');
+  const { dataDir } = windowsPaths();
+  await assert.rejects(stat(dataDir), { code: 'ENOENT' }, 'live test requires fresh plugin data');
   const before = createHash('sha256').update(await readFile(exe)).digest('hex');
   assert.equal(before, '9c6aac3196d3fb2a62e3ff67e6add9f24238efddf661cfcc7088b120f7e478e9');
   assert.equal(await inspectorOpen(), false, 'test needs a free inspector port');
   let child;
-  t.after(async () => stopOwned(child));
+  let installationAttempted = false;
+  t.after(async () => {
+    if (installationAttempted) await loader('--disable').catch(() => {});
+    await stopOwned(child);
+  });
   const pids = [];
   for (let cycle = 0; cycle < 2; cycle++) {
     assert.equal((await findProcesses()).length, 0, 'refusing to start alongside an existing Kimi instance');
@@ -91,6 +97,30 @@ test('verified Windows Kimi attaches on cold start and a second owned process', 
     assert.equal(unchanged.pid, state.pid);
     assert.equal(unchanged.revision, state.revision);
     assert.equal(unchanged.status, 'active', snapshot);
+    if (cycle === 0) {
+      installationAttempted = true;
+      await loader('--install');
+      let watched;
+      for (let attempt = 0; attempt < 20; attempt++) {
+        watched = JSON.parse((await loader('--check')).stdout);
+        if (watched.checkedAt !== unchanged.checkedAt) break;
+        await sleep(1000);
+      }
+      assert.equal(watched.status, 'active', JSON.stringify(watched));
+      assert.notEqual(watched.checkedAt, unchanged.checkedAt, 'scheduled watcher did not run');
+      assert.equal(child.exitCode, null, 'installation restarted the app');
+      assert.deepEqual((await findProcesses()).map((info) => info.pid), [child.pid]);
+      await loader('--disable');
+      for (let attempt = 0; attempt < 20; attempt++) {
+        const locked = await stat(join(dataDir, '.runtime-lock')).then(() => true,
+          (error) => { if (error.code === 'ENOENT') return false; throw error; });
+        if (!locked) break;
+        await sleep(1000);
+      }
+      await assert.rejects(stat(join(dataDir, '.runtime-lock')), { code: 'ENOENT' });
+      installationAttempted = false;
+      assert.equal(child.exitCode, null, 'disabling the extension terminated the app');
+    }
     await stopOwned(child);
     assert.equal(await inspectorOpen(), false);
   }

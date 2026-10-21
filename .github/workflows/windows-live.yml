@@ -38,7 +38,7 @@ jobs:
           if (Test-Path $app) { throw 'Refusing to overwrite a pre-existing app.' }
           & $seven x (Join-Path $stage '$PLUGINSDIR/app-64.7z') ('-o' + $app) -y -bso0
           if ($LASTEXITCODE -ne 0) { throw 'App extraction failed.' }
-      - name: Verify attachment and recovery on two owned app processes
+      - name: Verify attachment, install without restart, safe disable and recovery
         run: node --test runtime-windows.live.test.mjs
         env:
           KCT_WINDOWS_LIVE: '1'
