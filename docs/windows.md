@@ -1,6 +1,6 @@
 # Windows 适配记录
 
-2026-10-22：先在 macOS 上完成官方 Windows 安装包的离线检查，再实施 Windows 运行时加载器。静态检查不能替代 Windows 动态验收。
+2026-10-22：先在 macOS 上完成官方 Windows 安装包的离线检查，再实现 Windows 运行时加载器。[Windows runner 上的官方 App 动态测试已通过](https://github.com/wssz527/kimi-cot-translate/actions/runs/39645821455)。这是预览适配，不代表所有 Windows 桌面环境均已验收。
 
 ## 已完成的静态检查
 
@@ -18,7 +18,7 @@
 | 签名证书主体 | `NOVASCENT PRIVATE LIMITED` |
 | 签名叶证书 SHA-1 thumbprint | `F754CEE9121450C6CD50EE89D1CD9E692FE1CA40` |
 
-离线提取到了签名证书链；Windows 是否把实际签名判断为 `Valid`，仍须由 Windows 的 Authenticode 验证，不能仅凭证书存在宣告签名有效。
+离线提取到了签名证书链，随后 Windows 动态测试也通过了安装包与 App 的 Authenticode `Valid` 校验；加载器还比对了指定叶证书 thumbprint。
 
 ```text
 Installer SHA-256:
@@ -46,4 +46,14 @@ Windows Node 的内部接口 `process._debugProcess(pid)` 会读取目标进程�
 
 Mac 可以验证二进制结构、fuse、CSS 契约、进程数据解析、任务参数构造及模拟失败处理。Windows 调试触发、实际签名校验、监听归属和页面挂载需要 Windows 环境。
 
-目前没有验证真实官方跨版本升级、所有安装位置、管理员权限组合或长期运行。未经动态验收的环境应保持实验状态。
+Windows 动态测试在全新 GitHub `windows-latest` runner 上使用 Node 24.21.0 x64，解压官方已验证包，未执行官方安装器，未登录真实账户，覆盖：
+
+- 两个先后启动的独立 Kimi 主进程均完成真实内存 hook 挂载，挂载后 9229 关闭。
+- 同一进程重复执行加载命令不会产生第二个 Kimi 实例。
+- 注册并启动当前用户计划任务，watcher 实际更新状态，Kimi PID 保持不变。
+- 停用计划任务后 watcher 安全释放锁，Kimi 保持运行；随后重新启动 Kimi 能再次挂载。
+- 测试前后官方 EXE 哈希相同。
+
+另外，三平台共享 UI、缓存和 hook 测试，以及 Windows 加载器模拟测试全部通过，见[回归记录](https://github.com/wssz527/kimi-cot-translate/actions/runs/39645819220)。
+
+目前没有验证真实用户会话里的 Bing 翻译、普通 Windows 10/11 桌面人工操作、真实官方跨版本升级、其他安装位置、管理员权限组合或长期运行。未唤醒或连接局域网用户电脑。

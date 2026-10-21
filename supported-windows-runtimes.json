@@ -6,6 +6,6 @@
     "appVersion": "1.1.1",
     "signerThumbprint": "F754CEE9121450C6CD50EE89D1CD9E692FE1CA40",
     "installerSha256": "6938de412fa9a8481dbeffa84556a6788ae030cc362e789376f7ec3be8893137",
-    "validation": "Official payload checked offline on macOS; Windows live validation pending"
+    "validation": "Official payload checked offline on macOS; Windows runner verified attachment, install without restart, safe disable and cold-start recovery on 2026-10-22"
   }
 ]

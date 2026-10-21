@@ -9,7 +9,7 @@
 | 平台 | 状态 | 运行要求 |
 | --- | --- | --- |
 | macOS Apple Silicon | 已验证真实翻译、正常启动恢复及页面刷新恢复 | 官方 App 位于 `/Applications/Kimi Code.app`，Node.js 24 arm64 |
-| Windows x64 | 实验适配；官方安装包静态检查通过，动态验收待完成 | 官方 App 位于 `%LOCALAPPDATA%\Programs\Kimi Code`，Node.js 24 x64 |
+| Windows x64 | 预览适配；Windows runner 已验证官方 App 挂载、安装不重启、安全停用及冷启动恢复 | 官方 App 位于 `%LOCALAPPDATA%\Programs\Kimi Code`，Node.js 24 x64 |
 
 当前验证对象为 Kimi Code 1.1.1 / Electron 43.1.1。不同平台使用各自的二进制允许列表，不能互换哈希。安装和运行不需要 npm 依赖；Playwright 仅用于开发测试。
 
@@ -45,7 +45,7 @@ node runtime.mjs --install
 
 运行副本独立于解压目录，安装后移动源码不会影响它。后台任务使用安装时 Node 的绝对路径；如果移除或移动该 Node，请重新执行安装命令。
 
-### Windows（实验）
+### Windows（预览）
 
 在 PowerShell 进入本仓库目录，执行：
 
@@ -53,7 +53,9 @@ node runtime.mjs --install
 node runtime-windows.mjs --install
 ```
 
-Windows 的静态证据、运行约束和测试边界见 [Windows 适配记录](docs/windows.md)。动态验收完成之前，请不要把实验适配理解为已经支持所有 Windows 环境。
+Windows 的静态证据、动态测试和运行约束见 [Windows 适配记录](docs/windows.md)。后台使用当前用户的登录计划任务观察现有实例，不会自行启动 Kimi；停用会等待本次挂载收尾，不终止 Kimi。重复安装只保留当前及上一份完整扩展副本，不会无限堆积旧版本。
+
+测试环境是 GitHub Windows runner，不能代替所有 Windows 10/11 桌面、管理员权限组合和官方升级验收。
 
 ## 使用和隐私
 
@@ -135,11 +137,14 @@ node runtime-windows.mjs --disable
 npm ci
 npx playwright install chromium
 npm test
+npm run test:windows
 # macOS 上另执行：
 npm run test:macos
 ```
 
-GitHub Actions 在 Linux、Windows 和 macOS 上运行共享 UI 与 hook 回归；macOS 另运行对应的系统加载器单元测试。CI 成功仅说明相应测试通过，不能替代真实 Kimi 官方更新验收。
+GitHub Actions 在 Linux、Windows 和 macOS 上运行共享 UI、hook 和 Windows 加载器模拟回归；macOS 另运行对应的系统加载器单元测试。2026-10-22 的[三平台回归](https://github.com/wssz527/kimi-cot-translate/actions/runs/39645819220)全部通过。
+
+手动触发的 [Windows 官方 App smoke](https://github.com/wssz527/kimi-cot-translate/actions/runs/39645821455)也已通过，覆盖真实签名校验、调试触发、两个冷启动进程、挂载、接口关闭、计划任务安装不重启及安全停用。它使用未登录的全新环境，没有验证真实用户会话中的 Bing 翻译或官方升级。CI 成功不能替代这些缺失的验收。
 
 2026-10-21 的 macOS 部署验收覆盖了真实 Bing 翻译、原文切换、正常启动后自动加载、页面刷新恢复、官方签名和资源哈希保持不变。真实升级、睡眠唤醒和长期运行尚未验证。
 
