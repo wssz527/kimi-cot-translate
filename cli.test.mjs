@@ -41,9 +41,11 @@ test('CLI arguments reject invalid languages and empty prompts without starting 
     assert.throws(() => parseArgs(args));
   }
   assert.equal(parseArgs(['--help']).help, true);
-  assert.equal(settingsPath({}, 'linux', '/fixture'), '/fixture/.config/kimi-cot-translate/cli.json');
-  assert.equal(settingsPath({ XDG_CONFIG_HOME: '/other' }, 'darwin', '/fixture'),
+  assert.equal(settingsPath({}, 'linux', '/fixture').replaceAll('\\', '/'), '/fixture/.config/kimi-cot-translate/cli.json');
+  assert.equal(settingsPath({ XDG_CONFIG_HOME: '/other' }, 'darwin', '/fixture').replaceAll('\\', '/'),
     '/other/kimi-cot-translate/cli.json');
+  assert.equal(settingsPath({ LOCALAPPDATA: '/local' }, 'win32', '/fixture').replaceAll('\\', '/'),
+    '/local/kimi-cot-translate/cli.json');
 });
 
 test('the desktop translation engine loads without a DOM and skips target-language text in Node', async (t) => {
