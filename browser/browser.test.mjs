@@ -47,9 +47,16 @@ test('background rejects unsupported senders, endpoints, unconfirmed settings an
   for (const override of [{ id: 'other' }, { frameId: 1 }, { tab: null }, { url: 'https://evil.test/' }]) {
     await assert.rejects(translate(message, { ...sender, ...override }, api, request));
   }
-  await assert.rejects(translate(message, { ...sender, tab: { id: 1, url: 'https://www.kimi.com/other' } }, api, request));
+  for (const url of ['https://kimi.com/other', 'http://localhost:58627/', 'https://evil.test/']) {
+    await assert.rejects(translate(message, { ...sender, tab: { id: 1, url } }, api, request));
+  }
+  for (const documentLifecycle of ['prerender', 'cached', 'pending_deletion']) {
+    await assert.rejects(translate(message, { ...sender, documentLifecycle }, api, request), /Stale/);
+  }
   assert.equal(calls, 0);
-  assert.equal((await translate(message, sender, api, request))[0].translations[0].text, 'Synthetic translation.');
+  assert.equal((await translate(message, {
+    ...sender, documentLifecycle: 'active', tab: { id: 1, url: 'https://www.kimi.com/chat/new-session' },
+  }, api, request))[0].translations[0].text, 'Synthetic translation.');
   await assert.rejects(translate(message, sender, api, async () => ({ ok: false, status: 503 })), /503/);
   await assert.rejects(translate(message, sender, api, async () => ({ ok: true, json: async () => [] })), /response/);
   let receivedSignal;
@@ -379,7 +386,7 @@ test('tagged Kimi Code 2.1.1 web bundle selectors remain exact', {
   ]) assert.ok(js.includes(marker), `Missing tagged bundle marker: ${marker}`);
 });
 
-test('actual unpacked MV3 loads on a synthetic page with worker transport and extension storage', async t => {
+test('actual unpacked MV3 translates after SPA navigation with worker transport and extension storage', async t => {
   const dir = await mkdtemp(join(tmpdir(), 'kct-mv3-fixture-'));
   const extension = fileURLToPath(new URL('dist/', root));
   const context = await chromium.launchPersistentContext(dir, {
@@ -399,6 +406,7 @@ test('actual unpacked MV3 loads on a synthetic page with worker transport and ex
   await context.route('http://localhost:58627/**', route => route.fulfill({ contentType: 'text/html', body: html }));
   const page = await context.newPage();
   await page.goto(codeURL);
+  await page.evaluate(() => history.pushState(null, '', '/sessions/mv3-fixture'));
   const ui = page.locator('#thinking [data-kct-browser]');
   await ui.waitFor();
   assert.deepEqual(await worker.evaluate(() => globalThis.requests), []);

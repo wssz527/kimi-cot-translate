@@ -4,7 +4,7 @@
 
 | 产品 | 入口 | 状态 | 本次可验证范围 |
 | --- | --- | --- | --- |
-| Kimi Code Web | 本机运行 `kimi web` 后打开的 Web UI | 已实现；官方 2.1.1 源码结构核查 + 合成页面测试通过 | 未在真实登录会话中发送聊天或验收 |
+| Kimi Code Web | 本机运行 `kimi web` 后打开的 Web UI | 官方 2.1.1 真实会话与 Chromium MV3 实测通过 | 已配置的实际模型、真实 Bing 中文/日文翻译、新建会话跳转、原文和官方 journal 保持不变 |
 | kimi.com 普通聊天 | `https://www.kimi.com/` 的聊天页 | 实验实现；公开前端结构核查 + 合成页面测试通过 | 未登录、未发送聊天，未验证所有账号/灰度版本 |
 
 适配代码位于 `browser/`。它只定位**已展开、实际可见的思考正文**，在原文后增加独立译文节点。普通回答、用户输入、聊天历史、工具结果和模型上下文不会被翻译，也不会被改写。原文 DOM 节点保留。
@@ -52,7 +52,7 @@ Kimi Code Web 的匹配范围是 `http://localhost/*` 与 `http://127.0.0.1/*` �
 
 默认不自动外传。只选语言不确认、确认语言但未勾选自动翻译、折叠/裁剪/离屏/页面不可见时，都不会发出翻译请求。设置按 `origin` 保存；Kimi Code 本地端口与 `kimi.com` 不共享语言选择。
 
-翻译服务固定为 Bing 的 `edge.microsoft.com/translate/translatetext`。MV3 service worker 再次检查扩展来源、页面 URL、语言确认、请求段落数和大小，并设置 `credentials: 'omit'`、`redirect: 'error'` 和 15 秒超时。扩展没有 `<all_urls>`、cookie、脚本注入或聊天 API 权限，不保存 `#token`，也不会把它放进翻译请求。内容脚本传给后台的页面 URL 只用于同页校验，不进入网络请求。
+翻译服务固定为 Bing 的 `edge.microsoft.com/translate/translatetext`。MV3 service worker 再次检查扩展来源、顶层页面、发送文档与标签页的同源关系、文档活动状态（Chromium 提供时）、语言确认、请求段落数和大小，并设置 `credentials: 'omit'`、`redirect: 'error'` 和 15 秒超时。扩展没有 `<all_urls>`、cookie、脚本注入或聊天 API 权限，不保存 `#token`，也不会把它放进翻译请求。Chromium 的发送文档 URL 在页面内跳转后可能仍为初始地址，因此不要求两个 URL 的路径完全相等；后台只使用其 origin 校验设置与来源，不把页面地址放进翻译请求。内容脚本另会丢弃页面跳转前的待处理结果。
 
 内容脚本到 service worker 的 `sendMessage` 没有可在页面侧提前取消的 `AbortSignal`：网络请求超过 15 秒时，内容脚本会等待后台超时回复，而不是自行中断等待。后台请求本身有 15 秒上限；这一区别已由浏览器测试覆盖。
 
@@ -85,6 +85,16 @@ KCT_CHECK_UPSTREAM=1 node --test --test-timeout=30000 browser/browser.test.mjs
 ```
 
 测试使用合成 HTML 与模拟翻译响应，覆盖两个产品的精确 DOM、普通回答/输入/隐藏正文不发送、默认零请求、自动翻译仅限可见展开区块、原文节点不变、节点替换、失败重试、SPA 导航丢旧结果、设置按 origin 隔离和写入失败。另有一条使用真实 Chromium 加载 `browser/dist/` 未打包 MV3 扩展、真实 `chrome.storage.local` 与 service worker 的合成测试。上述测试通过只证明加载、权限边界、选择器和对合成 DOM 的行为；不证明登录状态下的真实会话、所有 Kimi 版本或真实 Bing 响应。
+
+2026-10-22 另在 macOS 上启动官方 `kimi web` 2.1.1，使用独立数据目录、仅绑定回环地址、保留访问认证，并在独立 Chromium 中加载实际 MV3 扩展。新建会话经已配置的 DeepSeek V4.1 Flash 生成英文思考，再由真实 Bing 翻译；没有模拟页面、模型或翻译响应。实测覆盖：
+
+- 确认语言前零翻译请求；仅展开思考正文挂载翻译控件。
+- 中文译文在两轮样本中约 0.85–1.35 秒显示，切换日文后约 0.85 秒显示；这些是小样本观测。
+- 收起再显示译文不增加网络请求；原思考节点与官方 journal 保留原文，journal 中没有显示端译文。
+- 英文目标下不显示重复译文；不确定的英文短句仍有少量请求，不能声称任意同语种输入都免请求。
+- 勾选自动翻译后，后续一轮真实会话展开思考即可显示译文，没有再次点击翻译按钮；未据此验收持续长流的逐段增量体验。
+
+本次实测发现并修复了新建会话后 `Stale sender URL` 导致翻译被拦截的问题：页面内跳转后，Chromium 的发送文档路径仍为 `/`，标签页已经变成 `/sessions/...`。后台现按同源和活动文档校验；真实 MV3 回归也覆盖了同一文档的 `history.pushState()`。
 
 ## 同类项目核查（分产品）
 
@@ -125,4 +135,6 @@ KCT_CHECK_UPSTREAM=1 node --test --test-timeout=30000 browser/browser.test.mjs
 
 本次采用的搜索包括 GitHub 网页/API 仓库搜索、官方 Kimi Code 市场配置、Chrome Web Store 页面以及公开 Web 搜索；未登录 Chrome Web Store，也未检查 Edge 商店的全部地域/私有条目。商店搜索、GitHub 代码搜索和网页索引都有盲区，因此以上只代表“截至该日期没有找到可核对匹配”，不能作为反证。
 
-尚未完成的实机验收：真实登录的 Kimi Code Web 会话、真实账号的 kimi.com 会话、真实 Bing 网络响应、不同 Kimi 灰度版本、移动端布局以及上游发布变化。浏览器适配是实验性的，不应声称与桌面端同等验证。
+本次也访问了真实 kimi.com 页面，并在独立浏览器配置中尝试提交一条新测试消息；站点要求微信或手机号登录，未生成聊天或思考，没有进行登录、发送验证码或绕过认证。
+
+尚未完成的实机验收：真实账号的 kimi.com 会话、持续长流的逐段增量体验、不同 Kimi 灰度版本、移动端布局以及上游发布变化。Kimi Code Web 的真实网络验收不代表 kimi.com 已通过；浏览器适配仍按预览提供。

@@ -21,8 +21,12 @@ export async function translate(message, sender, api = chrome, request = fetch) 
   if (sender.id !== api.runtime.id || !sender.tab || sender.frameId !== 0) {
     throw new Error('Unsupported sender');
   }
-  if (sender.tab.url !== sender.url) throw new Error('Stale sender URL');
   const key = settingsKey(sender.url);
+  // Chromium keeps sender.url at the document's initial URL after SPA navigation.
+  if (settingsKey(sender.tab.url) !== key ||
+      (sender.documentLifecycle && sender.documentLifecycle !== 'active')) {
+    throw new Error('Stale sender document');
+  }
   validateRequest(message);
   const settings = (await api.storage.local.get(key))[key];
   if (settings?.consent !== true ||
