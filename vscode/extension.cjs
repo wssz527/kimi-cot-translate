@@ -4,6 +4,8 @@ const { MAX_SOURCE_CHARS, assertEngine, createSession, renderHtml, restoreTarget
 const TARGET_KEY = 'kct.targetLanguage';
 
 function activate(context) {
+  const panels = new Set();
+  context.subscriptions.push({ dispose: () => { for (const panel of panels) panel.dispose(); } });
   context.subscriptions.push(vscode.commands.registerCommand('kct.translateCopiedThinking', async () => {
     let source;
     try {
@@ -34,8 +36,8 @@ function activate(context) {
         }
         return session.receive(message);
       });
-      panel.onDidDispose(() => { session.dispose(); listener.dispose(); });
-      context.subscriptions.push(panel);
+      panels.add(panel);
+      panel.onDidDispose(() => { panels.delete(panel); session.dispose(); listener.dispose(); });
       panel.webview.html = renderHtml({
         source,
         target,

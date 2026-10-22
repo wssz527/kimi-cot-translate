@@ -2,6 +2,7 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { readFileSync } = require('node:fs');
 const { join } = require('node:path');
+const { runInNewContext } = require('node:vm');
 const { MAX_SOURCE_CHARS, createSession, renderHtml, restoreTarget } = require('./adapter.cjs');
 
 function fakeEngine(translateText = async (text) => `translated:${text}`) {
@@ -13,6 +14,54 @@ function fakeEngine(translateText = async (text) => `translated:${text}`) {
     prunePending() { this.pruned++; },
   };
 }
+
+test('closed previews are released and extension shutdown disposes only the remaining panels', async () => {
+  let command;
+  const panels = [];
+  const context = {
+    extensionUri: 'https://extension.test/', subscriptions: [],
+    globalState: { get: () => 'ja', update: async () => {} },
+  };
+  const vscode = {
+    commands: { registerCommand: (name, handler) => { command = handler; return { dispose() {} }; } },
+    env: { clipboard: { readText: async () => 'Synthetic copied thought.' } },
+    ViewColumn: { Beside: 2 },
+    Uri: { joinPath: () => ({ toString: () => 'https://extension.test/view.js' }) },
+    window: {
+      createWebviewPanel: () => {
+        const panel = {
+          disposed: false,
+          webview: {
+            postMessage: async () => true,
+            onDidReceiveMessage: () => ({ dispose() {} }),
+            asWebviewUri: (uri) => uri,
+          },
+          onDidDispose(listener) { this.onDispose = listener; },
+          dispose() { if (!this.disposed) { this.disposed = true; this.onDispose(); } },
+        };
+        panels.push(panel);
+        return panel;
+      },
+      showErrorMessage: (message) => assert.fail(message),
+    },
+  };
+  const sandbox = {
+    module: { exports: {} },
+    require: (name) => name === 'vscode' ? vscode
+      : name === './adapter.cjs' ? require('./adapter.cjs') : fakeEngine(),
+  };
+  runInNewContext(readFileSync(join(__dirname, 'extension.cjs'), 'utf8'), sandbox);
+  sandbox.module.exports.activate(context);
+  for (let i = 0; i < 20; i++) {
+    await command();
+    panels.at(-1).dispose();
+  }
+  assert.equal(context.subscriptions.length, 2, 'disposed preview objects must not accumulate in subscriptions');
+  await command();
+  assert.equal(panels.at(-1).disposed, false);
+  context.subscriptions.forEach((entry) => entry.dispose());
+  assert(panels.every((panel) => panel.disposed));
+});
 
 test('validates the message boundary before calling the shared translator', async () => {
   let called = 0;
