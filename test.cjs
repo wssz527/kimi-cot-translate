@@ -12,7 +12,7 @@ after(async () => { await browser?.close(); });
 
 async function fixture(t, { texts = ['First paragraph.\n\nSecond paragraph.'], manual = false,
   streaming = false, delay = 0, fail = false, timeout = false, cache, settings = {},
-  clock, holdResponses = false } = {}) {
+  clock, holdResponses = false, inject = true } = {}) {
   const context = await browser.newContext({ locale: 'en-US', viewport: { width: 900, height: 700 } });
   let release = () => {};
   const gate = holdResponses ? new Promise((resolve) => { release = resolve; }) : null;
@@ -41,7 +41,6 @@ async function fixture(t, { texts = ['First paragraph.\n\nSecond paragraph.'], m
       <div class="think-body" inert><div class="think-body-inner"><pre class="think-text">${esc(text)}</pre></div></div></div>`).join('')}
       </main><script>
       localStorage.setItem('kimi-locale','zh');
-      localStorage.setItem('kct:settings:v1',JSON.stringify({autoTranslate:${!manual}}));
       document.querySelectorAll('.think-head').forEach(head => head.onclick=()=>{
         const body=head.parentElement.querySelector('.think-body');
         const open=body.classList.toggle('open'); body.inert=!open;
@@ -69,17 +68,17 @@ async function fixture(t, { texts = ['First paragraph.\n\nSecond paragraph.'], m
     finally { active--; }
   });
   await page.goto('http://kct.test/');
-  await page.evaluate(({ cache, settings }) => {
+  await page.evaluate(({ cache, settings, manual }) => {
     if (cache !== undefined) localStorage.setItem('kct:cache:v1', cache);
-    const stored = JSON.parse(localStorage.getItem('kct:settings:v1'));
-    localStorage.setItem('kct:settings:v1', JSON.stringify({ ...stored, ...settings }));
-  }, { cache, settings });
+    localStorage.setItem('kct:settings:v1',
+      JSON.stringify({ autoTranslate: !manual, targetLanguage: 'zh', ...settings }));
+  }, { cache, settings, manual });
   if (clock) await page.clock.install({ time: new Date(clock) });
   if (timeout) await page.evaluate(() => {
     const original = window.setTimeout;
     window.setTimeout = (fn, ms, ...args) => original(fn, ms === 15000 ? 80 : ms, ...args);
   });
-  await page.addScriptTag({ content: SCRIPT });
+  if (inject) await page.addScriptTag({ content: SCRIPT });
   return {
     page, requests, errors, release, peak: () => peak,
     recover: () => { shouldFail = false; },
@@ -91,7 +90,7 @@ async function fixture(t, { texts = ['First paragraph.\n\nSecond paragraph.'], m
   };
 }
 
-test('real Kimi locale, one batch, collapsed UI, original preserved, cache reused', async (t) => {
+test('selected Chinese target, one batch, collapsed UI, original preserved, cache reused', async (t) => {
   const f = await fixture(t);
   const { page } = f;
   assert.equal(await page.locator('.kct-bar').isVisible(), false);
@@ -115,6 +114,190 @@ test('real Kimi locale, one batch, collapsed UI, original preserved, cache reuse
   await page.locator('.kct-bar').waitFor({ state: 'hidden' });
   assert.equal(await page.locator('.kct-bar').isVisible(), false);
   assert.deepEqual(f.errors, []);
+});
+
+test('first expansion requires a language choice, persists it and does not prompt after reload', async (t) => {
+  for (const targetLanguage of [undefined, 'auto']) {
+    await t.test(targetLanguage === undefined ? 'missing target' : 'legacy auto target', async (t) => {
+      const f = await fixture(t, { settings: { targetLanguage } });
+      const { page } = f;
+      await page.clock.install();
+      assert.equal(await page.locator('#kct-settings').count(), 0);
+      assert.equal(f.requests.length, 0);
+      await f.open();
+      const panel = page.locator('#kct-settings');
+      await panel.waitFor({ timeout: 3000 });
+      await page.clock.runFor(1000);
+      assert.equal(f.requests.length, 0);
+      assert.equal(await page.locator('pre:not([data-kct])').isVisible(), true);
+      assert.equal(await page.locator('.kct-translated').count(), 0);
+      await page.getByLabel('目标语言').selectOption('ja');
+      await page.clock.runFor(1000);
+      assert.equal(f.requests.length, 0, 'a selection must wait for confirmation');
+      await panel.getByRole('button', { name: '开始使用', exact: true }).click();
+      await f.done();
+      assert.equal(await panel.count(), 0);
+      assert.equal(f.requests.length, 1);
+      assert.equal(f.requests[0].lang, 'ja');
+      assert.match(await page.locator('.kct-translated').textContent(), /^ja:/);
+      assert.equal(await page.evaluate(() =>
+        JSON.parse(localStorage.getItem('kct:settings:v1')).targetLanguage), 'ja');
+      await f.open();
+      await f.open();
+      await page.clock.runFor(1000);
+      assert.equal(await panel.count(), 0);
+      await page.reload();
+      await page.addScriptTag({ content: SCRIPT });
+      await f.open();
+      await f.done();
+      assert.equal(await panel.count(), 0);
+      assert.equal(await page.evaluate(() => window.__kct.state.settings.targetLanguage), 'ja');
+      assert.match(await page.locator('.kct-translated').textContent(), /^ja:/);
+      assert(f.requests.every((request) => request.lang === 'ja'));
+      assert.deepEqual(f.errors, []);
+    });
+  }
+});
+
+test('all eight matching target languages and Chinese inline code preserve the original node and its geometry', async (t) => {
+  for (const [targetLanguage, source, label = targetLanguage] of [
+    ['zh', '先检查输入是否完整，再逐步分析问题。\n\n确认结果后返回答案。'],
+    ['ja', 'まず入力を確認してから、問題を順番に分析します。\n\n結果を確認して回答します。'],
+    ['en', 'First check the input, then analyze the problem carefully.\n\nWe should check the result before we return the answer.'],
+    ['ko', '먼저 입력 내용을 확인하고 문제를 차근차근 분석합니다.\n\n결과를 확인한 뒤 정확한 답변을 제공합니다.'],
+    ['es', 'Primero debemos verificar los datos y luego revisar el resultado antes de responder.'],
+    ['fr', 'Nous devons vérifier les données et notre résultat avant de répondre.'],
+    ['de', 'Wir müssen die Daten prüfen und dann das Ergebnis mit unserem Bericht vergleichen.'],
+    ['ru', 'Сначала мы проверим данные, затем нужно проверить результат, чтобы ответ был точным.'],
+    ['zh', '先执行 `const result = await response.json()`，确认 `result.ok === true` 后再返回答案。', 'zh with inline code'],
+  ]) {
+    await t.test(label, async (t) => {
+      const f = await fixture(t, { texts: [source], settings: { targetLanguage }, inject: false });
+      const { page } = f;
+      await f.open();
+      const original = page.locator('pre:not([data-kct])');
+      const box = await original.boundingBox();
+      assert(box);
+      await original.evaluate((el) => { window.originalPre = el; });
+      await page.clock.install();
+      await page.addScriptTag({ content: SCRIPT });
+      await f.done();
+      await page.clock.runFor(1000);
+      assert.equal(f.requests.length, 0);
+      assert.equal(await original.isVisible(), true);
+      assert.equal(await original.textContent(), source);
+      assert.equal(await original.evaluate((el) => el === window.originalPre), true);
+      assert.equal(await page.locator('.kct-translated').count(), 0);
+      assert.deepEqual(await original.boundingBox(), box);
+      assert.equal(await page.locator('button[title="翻译这段思考"]').evaluate((el) => el.hidden), true);
+      assert.equal(await page.locator('#kct-settings').count(), 0);
+      await f.open();
+      await f.open();
+      await page.clock.runFor(1000);
+      assert.equal(f.requests.length, 0);
+      assert.equal(await original.isVisible(), true);
+      assert.equal(await page.locator('.kct-translated').count(), 0);
+      assert.deepEqual(await original.boundingBox(), box);
+      assert.deepEqual(f.errors, []);
+    });
+  }
+});
+
+test('unrelated class mutations on a target-language block settle without recurring animation frames', async (t) => {
+  const f = await fixture(t, { texts: ['先检查输入是否完整，再逐步分析问题。'] });
+  await f.page.clock.install();
+  await f.open();
+  await f.done();
+  await f.page.clock.runFor(1000);
+  const original = f.page.locator('pre:not([data-kct])');
+  const box = await original.boundingBox();
+  assert(box);
+  await f.page.evaluate(() => {
+    const raf = window.requestAnimationFrame;
+    window.scheduledFrames = 0;
+    window.requestAnimationFrame = (callback) => {
+      window.scheduledFrames++;
+      return raf(callback);
+    };
+    document.querySelector('.think').classList.add('unrelated-host');
+    document.querySelector('.think-body-inner').classList.add('unrelated-body');
+    document.querySelector('pre:not([data-kct])').classList.add('unrelated-source');
+  });
+  await f.page.clock.runFor(1000);
+  const frames = await f.page.evaluate(() => window.scheduledFrames);
+  assert(frames > 0, 'the mutation must exercise the thinking-block update');
+  await f.page.clock.runFor(1000);
+  assert.equal(await f.page.evaluate(() => window.scheduledFrames), frames,
+    'class mutations must settle instead of sustaining a requestAnimationFrame loop');
+  assert.equal(f.requests.length, 0);
+  assert.equal(await original.isVisible(), true);
+  assert.equal(await f.page.locator('.kct-translated').count(), 0);
+  assert.deepEqual(await original.boundingBox(), box);
+  assert.deepEqual(f.errors, []);
+});
+
+test('mixed Chinese and English send only English and preserve Chinese in place', async (t) => {
+  for (const separator of ['\n\n', '']) {
+    await t.test(separator ? 'separate paragraphs' : 'one paragraph', async (t) => {
+      const source = ['先检查输入。', 'Analyze the input carefully.', '最后确认结果。'].join(separator);
+      const f = await fixture(t, { texts: [source] });
+      await f.open();
+      await f.done();
+      assert.deepEqual(f.requests.map((request) => request.text), [['Analyze the input carefully.']]);
+      assert.equal(f.requests[0].lang, 'zh-Hans');
+      assert.equal(await f.page.locator('.kct-translated').textContent(),
+        ['先检查输入。', 'zh-Hans:Analyze the input carefully.', '最后确认结果。'].join(separator));
+      assert.equal(await f.page.locator('pre:not([data-kct])').textContent(), source);
+      assert.deepEqual(f.errors, []);
+    });
+  }
+});
+
+test('an unchanged service response keeps ambiguous text in its original node and position', async (t) => {
+  const source = 'Confirmed.';
+  const f = await fixture(t, { texts: [source], settings: { targetLanguage: 'en' }, inject: false });
+  const requests = [];
+  await f.page.route('https://edge.microsoft.com/**', (route) => {
+    const text = route.request().postDataJSON();
+    requests.push(text);
+    return route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify(text.map((value) => ({ translations: [{ text: value }] }))),
+    });
+  });
+  await f.open();
+  const original = f.page.locator('pre:not([data-kct])');
+  const box = await original.boundingBox();
+  assert(box);
+  await original.evaluate((el) => { window.originalPre = el; });
+  await f.page.addScriptTag({ content: SCRIPT });
+  await f.done();
+  assert.deepEqual(requests, [[source]]);
+  assert.equal(await original.isVisible(), true);
+  assert.equal(await original.textContent(), source);
+  assert.equal(await original.evaluate((el) => el === window.originalPre), true);
+  assert.equal(await f.page.locator('.kct-translated').count(), 0);
+  assert.deepEqual(await original.boundingBox(), box);
+  assert.equal(await f.page.locator('button[title="翻译这段思考"]').evaluate((el) => el.hidden), true);
+  assert.deepEqual(f.errors, []);
+});
+
+test('uncertain Latin text is translated instead of being mistaken for the selected language', async (t) => {
+  for (const [targetLanguage, source] of [
+    ['en', 'Lorem ipsum dolor sit amet, consectetur adipiscing elit.'],
+    ['en', 'Bonjour, veuillez examiner les données avant de répondre.'],
+    ['fr', 'Lorem ipsum dolor sit amet, consectetur adipiscing elit.'],
+  ]) {
+    await t.test(`${targetLanguage}: ${source}`, async (t) => {
+      const f = await fixture(t, { texts: [source], settings: { targetLanguage } });
+      await f.open();
+      await f.done();
+      assert.deepEqual(f.requests.map((request) => request.text), [[source]]);
+      assert.equal(f.requests[0].lang, targetLanguage);
+      assert.equal(await f.page.locator('.kct-translated').textContent(), `${targetLanguage}:${source}`);
+      assert.deepEqual(f.errors, []);
+    });
+  }
 });
 
 test('manual translation remains available with auto translation disabled', async (t) => {
@@ -210,16 +393,55 @@ test('changing language while a request is pending cannot render the old result'
   const firstRequest = f.page.waitForRequest('https://edge.microsoft.com/**');
   await f.open();
   await firstRequest;
-  const nextRequest = f.page.waitForRequest('https://edge.microsoft.com/**');
   await f.page.evaluate(() => {
-    window.__kct.state.settings.targetLanguage = 'ja';
-    window.__kct.resetAll();
+    window.languageOutputs = [];
+    new MutationObserver(() => {
+      const text = document.querySelector('.kct-translated')?.textContent;
+      if (text) window.languageOutputs.push(text);
+    }).observe(document.querySelector('.think-body-inner'), { childList: true, characterData: true, subtree: true });
   });
+  const nextRequest = f.page.waitForRequest('https://edge.microsoft.com/**');
+  await f.page.getByRole('button', { name: '思维链翻译设置' }).click();
+  await f.page.getByLabel('目标语言').selectOption('ja');
   await nextRequest;
+  await f.page.keyboard.press('Escape');
   f.release();
   await f.done();
+  await f.page.waitForFunction(() => window.__kct.state.active === 0);
   assert.match(await f.page.locator('.kct-translated').textContent(), /^ja:/);
   assert.equal(f.requests.length, 2);
+  assert.deepEqual(f.requests.map((request) => request.lang), ['zh-Hans', 'ja']);
+  const outputs = await f.page.evaluate(() => window.languageOutputs);
+  assert(outputs.length > 0);
+  assert(outputs.every((text) => text.startsWith('ja:')), 'an obsolete language must never be rendered');
+  assert.equal(await f.page.evaluate(() =>
+    JSON.parse(localStorage.getItem('kct:settings:v1')).targetLanguage), 'ja');
+  assert.deepEqual(f.errors, []);
+});
+
+test('switching a pending translation to the source language preserves the original and discards the old result', async (t) => {
+  const source = 'We should check the input before we return the answer.';
+  const f = await fixture(t, { texts: [source], holdResponses: true });
+  await f.open();
+  await f.page.waitForFunction(() => window.__kct.state.active === 1);
+  const original = f.page.locator('pre:not([data-kct])');
+  const box = await original.boundingBox();
+  assert(box);
+  await f.page.getByRole('button', { name: '思维链翻译设置' }).click();
+  await f.page.getByLabel('目标语言').selectOption('en');
+  await f.page.keyboard.press('Escape');
+  await f.done();
+  f.release();
+  await f.page.waitForFunction(() => window.__kct.state.active === 0);
+  assert.equal(f.requests.length, 1);
+  assert.equal(await original.isVisible(), true);
+  assert.equal(await original.textContent(), source);
+  assert.equal(await f.page.locator('.kct-translated').count(), 0);
+  assert.deepEqual(await original.boundingBox(), box);
+  assert.equal(await f.page.evaluate(() => window.__kct.state.cache.size), 0);
+  assert.equal(await f.page.evaluate(() =>
+    JSON.parse(localStorage.getItem('kct:settings:v1')).targetLanguage), 'en');
+  assert.deepEqual(f.errors, []);
 });
 
 test('replaced body and replaced source nodes recover without stale or duplicated output', async (t) => {
@@ -280,7 +502,7 @@ test('settings are labelled, keyboard closable and usable on a narrow dark page'
   });
   await f.open();
   await f.page.getByRole('button', { name: '思维链翻译设置' }).click();
-  assert.equal(await f.page.getByLabel('目标语言').inputValue(), 'auto');
+  assert.equal(await f.page.getByLabel('目标语言').inputValue(), 'zh');
   const dialog = f.page.getByRole('dialog');
   const box = await dialog.boundingBox();
   assert(box.x >= 0 && box.x + box.width <= 375);
@@ -342,7 +564,7 @@ test('legacy cache migration caps startup at 500 entries without changing settin
   assert.equal(result.rows.at(-1)[1], 'cached translation 649');
   assert(result.rows.every(([key, text, time]) =>
     /^[a-z0-9-]+:[a-z0-9-]+$/.test(key) && typeof text === 'string' && Number.isFinite(time)));
-  assert.deepEqual(result.settings, { autoTranslate: true, customKey: 'keep-this-test-key' });
+  assert.deepEqual(result.settings, { autoTranslate: true, targetLanguage: 'zh', customKey: 'keep-this-test-key' });
 });
 
 test('corrupt and oversized old caches are discarded at startup without touching settings', async (t) => {

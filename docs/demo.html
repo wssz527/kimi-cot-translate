@@ -1,0 +1,198 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>演示会话 · Kimi Code</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --font-ui: "Helvetica Neue", "PingFang SC", "Microsoft YaHei", sans-serif;
+      --text-base: 14px;
+      --leading-normal: 1.9;
+      --weight-regular: 400;
+      --color-text: #25282c;
+      --color-text-muted: #62676f;
+      --color-text-faint: #8b9097;
+      --color-surface-raised: #fff;
+      --color-surface-sunken: #f0f1f3;
+      --color-line: #e5e7eb;
+      --color-accent: #356ee8;
+      --radius-sm: 5px;
+      font-family: var(--font-ui);
+      color: var(--color-text);
+      background: #fff;
+      font-synthesis: none;
+      -webkit-font-smoothing: antialiased;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; font-size: 14px; }
+    button, textarea { font: inherit; }
+    button { cursor: pointer; }
+    button:focus-visible, textarea:focus-visible {
+      outline: 2px solid var(--color-accent);
+      outline-offset: 3px;
+    }
+    svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 1.6; }
+    .shell { display: grid; grid-template-columns: 208px minmax(0, 1fr); min-height: 100vh; }
+    .sidebar {
+      display: flex; flex-direction: column; padding: 28px 16px 22px;
+      background: #f7f8fa; border-right: 1px solid #eef0f2;
+    }
+    .brand { padding: 0 12px; font-size: 19px; font-weight: 650; letter-spacing: -.6px; }
+    .new-chat {
+      display: flex; align-items: center; gap: 10px; margin-top: 32px;
+      padding: 11px 12px; background: #fff; border: 1px solid #e3e6ea; border-radius: 9px;
+      color: #454b54; text-align: left;
+    }
+    .nav-label { margin: 35px 12px 12px; color: #9499a2; font-size: 11px; letter-spacing: 1px; }
+    .active-chat {
+      display: flex; align-items: center; gap: 9px; padding: 12px;
+      color: #343a43; border-radius: 8px; background: #eaeef3; font-size: 13px;
+    }
+    .active-chat svg { width: 15px; height: 15px; color: #78818e; }
+    .local-label { margin: auto 12px 0; color: #9499a2; font-size: 12px; }
+    .workspace { position: relative; min-width: 0; min-height: 100vh; padding-bottom: 180px; }
+    .topbar {
+      height: 74px; display: flex; align-items: center; justify-content: space-between;
+      margin: 0 32px; border-bottom: 1px solid #f0f1f3;
+    }
+    .session-name { font-size: 14px; font-weight: 550; }
+    .demo-label { color: #868b94; font-size: 11px; letter-spacing: .3px; }
+    .transcript { max-width: 688px; margin: 64px auto 0; padding: 0 12px; }
+    .user-message {
+      max-width: 540px; width: fit-content; margin: 0 0 37px auto;
+      padding: 14px 19px; border-radius: 16px 16px 4px 16px; background: #f3f5f8;
+      font-size: 14px; line-height: 1.8;
+    }
+    .assistant-name { display: flex; align-items: center; gap: 9px; margin-bottom: 20px; font-size: 13px; font-weight: 600; }
+    .assistant-mark { display: grid; place-items: center; width: 25px; height: 25px; border: 1px solid #e5e8ed; border-radius: 8px; }
+    .assistant-mark svg { width: 15px; height: 15px; }
+    .think { --think-gutter: 20px; --think-gap: 8px; margin: 16px 0 26px; }
+    .think-head {
+      display: flex; align-items: center; gap: 8px; width: 100%; min-height: 20px;
+      padding: 0; border: 0; background: none; color: var(--color-text-muted);
+      font: inherit; line-height: 20px; text-align: left;
+    }
+    .think-head svg { width: 16px; height: 16px; color: #8e96a2; }
+    .duration { margin-left: 3px; font-size: 12px; color: #979ca5; }
+    .chevron { width: 12px !important; height: 12px !important; transition: transform .15s; }
+    .think-head[aria-expanded="true"] .chevron { transform: rotate(90deg); }
+    .think-body { display: grid; grid-template-rows: minmax(0, 0fr); overflow: hidden; }
+    .think-body.open { grid-template-rows: minmax(0, 1fr); }
+    .think-body-inner { min-height: 0; overflow: hidden; padding-left: 28px; }
+    .think-text {
+      font: var(--text-base)/var(--leading-normal) var(--font-ui);
+      color: var(--color-text-muted); white-space: pre-wrap;
+      overflow-wrap: anywhere; margin: 0; padding: 6px 0 0;
+    }
+    .answer { padding-left: 28px; line-height: 1.9; }
+    .answer p { margin: 0 0 13px; }
+    .answer ul { padding-left: 19px; margin: 0; }
+    .answer li { padding-left: 3px; margin: 5px 0; }
+    .answer strong { font-weight: 550; }
+    .message-actions { display: flex; gap: 16px; margin: 23px 0 0 28px; color: #a1a7b0; }
+    .message-actions svg { width: 15px; height: 15px; }
+    .composer-wrap { position: absolute; bottom: 25px; left: 50%; width: 688px; max-width: calc(100% - 72px); transform: translateX(-50%); }
+    .composer {
+      padding: 16px 18px 12px; border: 1px solid #e1e5ea; border-radius: 17px;
+      box-shadow: 0 4px 18px #25324806; background: linear-gradient(180deg, #fff, #fdfdfe);
+    }
+    .composer textarea { width: 100%; height: 30px; resize: none; border: 0; background: transparent; outline: none; font-size: 14px; }
+    .composer textarea::placeholder { color: #a0a6af; }
+    .composer-tools { display: flex; align-items: center; justify-content: space-between; color: #929aa5; }
+    .send { display: grid; place-items: center; width: 28px; height: 28px; border: 0; border-radius: 50%; background: #e9edf2; color: #929ba7; }
+    .composer-note { margin: 12px 0 0; text-align: center; font-size: 10px; color: #a0a5ae; }
+    @media (max-width: 760px) {
+      .shell { grid-template-columns: 1fr; }
+      .sidebar { display: none; }
+      .topbar { margin: 0 20px; }
+      .transcript { margin-top: 32px; padding: 0 24px; }
+      .composer-wrap { max-width: calc(100% - 40px); }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar" aria-label="演示导航">
+      <div class="brand">Kimi Code</div>
+      <button class="new-chat" type="button" disabled>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M13 5H5v14h14v-8M11 13l1-4 7-7 3 3-7 7z"/></svg>
+        新建会话
+      </button>
+      <div class="nav-label">最近会话</div>
+      <div class="active-chat" aria-current="page">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h16v12H9l-5 4z"/></svg>
+        README 更新清单
+      </div>
+      <div class="local-label">本地演示</div>
+    </aside>
+    <main class="workspace">
+      <header class="topbar">
+        <span class="session-name">演示会话</span>
+        <span class="demo-label">演示内容 · 非真实会话</span>
+      </header>
+      <section class="transcript" aria-label="演示对话">
+        <div class="user-message">帮我整理一份 README 更新清单，说明安装、使用和测试方式。</div>
+        <article aria-label="助手回复">
+          <div class="assistant-name">
+            <span class="assistant-mark" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="m12 3 2.5 6.5L21 12l-6.5 2.5L12 21l-2.5-6.5L3 12l6.5-2.5z"/></svg></span>
+            Kimi Code
+          </div>
+          <div class="think" id="demo-think">
+            <button class="think-head" type="button" aria-expanded="false">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 18h6m-6 3h6M8 14a6 6 0 1 1 8 0l-1 2H9z"/></svg>
+              <span>思考过程</span>
+              <span class="duration">4 秒</span>
+              <svg class="chevron" viewBox="0 0 16 16" aria-hidden="true"><path d="m6 4 4 4-4 4"/></svg>
+            </button>
+            <div class="think-body" inert>
+              <div class="think-body-inner"><pre class="think-text" id="demo-source">I'll check the installation steps and the existing test commands first.
+
+先保留原文和段落结构，已有的中文不需要重复翻译。
+
+The usage section should explain how to choose a language and view the original text.
+
+I'll keep the checklist short so readers can follow it without extra context.</pre></div>
+            </div>
+          </div>
+          <div class="answer">
+            <p>可以按这三个部分更新：</p>
+            <ul>
+              <li><strong>安装：</strong>写清环境要求、安装步骤和启动方式。</li>
+              <li><strong>使用：</strong>说明目标语言选择，以及原文与译文的切换。</li>
+              <li><strong>测试：</strong>列出测试命令和预期结果。</li>
+            </ul>
+          </div>
+          <div class="message-actions" aria-hidden="true">
+            <svg viewBox="0 0 24 24"><rect x="8" y="8" width="12" height="13" rx="2"/><path d="M16 8V3H3v13h5"/></svg>
+            <svg viewBox="0 0 24 24"><path d="M5 9H2v12h3zm0 0 5-7h2v7h7l2 2-3 10H5"/></svg>
+            <svg viewBox="0 0 24 24"><path d="M20 7v5h-5M4 17v-5h5M6 7a7 7 0 0 1 12-1l2 3M4 15l2 3a7 7 0 0 0 12-1"/></svg>
+          </div>
+        </article>
+      </section>
+      <div class="composer-wrap">
+        <div class="composer">
+          <textarea aria-label="演示输入框" placeholder="继续这个话题…" readonly></textarea>
+          <div class="composer-tools">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m8 12 6-6a3 3 0 0 1 4 4l-8 8a5 5 0 0 1-7-7l9-9"/></svg>
+            <button class="send" type="button" aria-label="发送（演示不可用）" disabled><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 18V6m-5 5 5-5 5 5"/></svg></button>
+          </div>
+        </div>
+        <p class="composer-note">合成示例，仅用于展示界面</p>
+      </div>
+    </main>
+  </div>
+  <script>
+    localStorage.setItem('kimi-locale', 'zh');
+    document.querySelector('.think-head').addEventListener('click', (event) => {
+      const head = event.currentTarget;
+      const body = head.parentElement.querySelector('.think-body');
+      const open = body.classList.toggle('open');
+      body.inert = !open;
+      head.setAttribute('aria-expanded', String(open));
+      head.parentElement.classList.toggle('open', open);
+    });
+  </script>
+</body>
+</html>

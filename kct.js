@@ -14,6 +14,7 @@ const CONCURRENCY = 3;
 const STREAM_DEBOUNCE_MS = 700;
 const REQUEST_TIMEOUT_MS = 15000;
 const BATCH_CHARS = 4000;
+const TARGET_LANGUAGES = ['zh', 'en', 'ja', 'ko', 'es', 'fr', 'de', 'ru'];
 
 const DEFAULTS = {
   enabled: true,
@@ -43,6 +44,7 @@ const scheduled = new Set();
 let rafPending = 0;
 let cacheTimer = 0;
 let cacheEpoch = 0;
+let setupPrompted = false;
 
 // ---------------------------------------------------------------------------
 // storage
@@ -149,6 +151,42 @@ function resolveTarget() {
   try { locale = localStorage.getItem('kimi-locale'); } catch (_) { /* unavailable storage */ }
   const lang = locale || navigator.language || document.documentElement.lang || 'en';
   return String(lang).split('-')[0].toLowerCase();
+}
+
+function hasTargetLanguage() {
+  return TARGET_LANGUAGES.includes(state.settings.targetLanguage);
+}
+
+function isTargetLanguage(text, lang) {
+  const prose = text.replace(/```[\s\S]*?(?:```|$)|`[^`\n]*`|https?:\/\/\S+/g, '');
+  const letters = prose.match(/\p{L}/gu) || [];
+  if (!letters.length) return true;
+  const count = (pattern) => (prose.match(pattern) || []).length;
+  const han = count(/\p{Script=Han}/gu);
+  const kana = count(/[\p{Script=Hiragana}\p{Script=Katakana}]/gu);
+  const hangul = count(/\p{Script=Hangul}/gu);
+  const cyrillic = count(/\p{Script=Cyrillic}/gu);
+  if (lang === 'zh') return han > 0 && !kana && !hangul && !cyrillic && han / letters.length >= 0.5;
+  if (lang === 'ja') return kana > 0 && !hangul && !cyrillic && (han + kana) / letters.length >= 0.5;
+  if (lang === 'ko') return hangul > 0 && !kana && !cyrillic && (han + hangul) / letters.length >= 0.5;
+  // Ukrainian and other Cyrillic languages must not be mistaken for Russian.
+  const commonWords = {
+    en: 'the this that these those is are was were be been being and or but with without for from into of to in on at by as it its we our you your i my can could will would should have has had not do does did let first then need check',
+    es: 'el la los las un una unos unas es son está están ser estar y o pero con sin para por del de al en como este esta estos estas que se su sus nosotros nuestro podemos puede debe hay primero luego verificar',
+    fr: 'le la les un une des est sont être et ou mais avec sans pour par du de au aux en dans sur ce cette ces qui que nous notre vous votre peut faut pas ne puis vérifier',
+    de: 'der die das ein eine eines ist sind war waren sein und oder aber mit ohne für von zu zum zur den dem des im in auf aus als diese dieser dieses wir unser können kann muss nicht dann prüfen',
+    ru: 'это этот эта эти для при или как что чтобы который которая которые мы вы они его её их не нет есть будет будут нужно можно сначала затем проверить',
+  };
+  if (!commonWords[lang] || han || kana || hangul ||
+    (lang === 'ru' ? cyrillic / letters.length < 0.8 || /[іїєґў]/iu.test(prose) : cyrillic)) return false;
+  const words = prose.toLowerCase().match(/\p{L}+/gu) || [];
+  const scores = Object.entries(commonWords).map(([language, vocabulary]) => {
+    const known = new Set(vocabulary.split(' '));
+    return [language, words.filter((word) => known.has(word)).length];
+  }).sort((a, b) => b[1] - a[1]);
+  // shortcut: ambiguous short prose goes to the service; use a local model if more coverage is needed.
+  return scores[0][0] === lang && scores[0][1] >= 2 &&
+    scores[0][1] >= words.length * 0.15 && scores[0][1] - scores[1][1] >= 2;
 }
 
 function targetFor(provider, lang) {
@@ -360,21 +398,36 @@ function splitParagraphs(text) {
   return parts;
 }
 
+function translationPieces(source, lang) {
+  return splitParagraphs(source).flatMap(({ body, sep }) => {
+    const units = body.split(/(\n+|(?<=[。！？])|(?<=[.!?])(?=[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}])|(?<=[.!?])[ \t]+)/u).filter(Boolean);
+    const groups = [];
+    for (const text of units) {
+      const skip = isTargetLanguage(text, lang);
+      const last = groups.at(-1);
+      if (last && last.skip === skip) last.text += text;
+      else groups.push({ text, skip });
+    }
+    return [...groups.flatMap(({ text, skip }) =>
+      (skip ? [text] : splitLong(text)).map((piece) => ({ text: piece, skip }))), { text: sep, skip: true }];
+  });
+}
+
 async function translateText(source, lang, onProgress = () => {}, settings = { ...state.settings }, valid = () => true) {
   const provider = settings.provider;
   if (!PROVIDERS[provider]) throw new Error('未知翻译服务');
   const scope = provider === 'custom' ? `${settings.customEndpoint}\u0000${settings.customModel}` : '';
   const prefix = hashKey(`${provider}\u0000${lang}\u0000${scope ? scope + '\u0000' : ''}`);
-  const pieces = splitParagraphs(source).flatMap(({ body, sep }) => [...splitLong(body), sep]);
-  const out = [...pieces];
+  const pieces = translationPieces(source, lang);
+  const out = pieces.map(({ text }) => text);
   const missing = [];
   const tasks = [];
   let completed = 0;
-  const total = pieces.filter((text) => text.trim()).length;
+  const total = pieces.filter(({ skip }) => !skip).length;
 
   pruneCache();
-  for (const [index, text] of pieces.entries()) {
-    if (!text.trim()) continue;
+  for (const [index, { text, skip }] of pieces.entries()) {
+    if (skip) continue;
     const key = `${prefix}:${hashKey(text)}`;
     let promise;
     if (state.cache.has(key)) {
@@ -439,7 +492,7 @@ function injectStyles() {
 .${NS}-status{color:var(--color-text-faint,#888);font-size:11px}
 .${NS}-status:empty{display:none}
 .${NS}-status[data-state="error"]{color:var(--color-danger,#b9433e)}
-.${NS}-translated{font:var(--text-base,14px)/var(--leading-normal,1.6) var(--font-ui,sans-serif);font-weight:var(--weight-regular,400);color:var(--color-text-muted,#777);white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word;margin:0;padding:6px 0 0}
+.${NS}-translated{white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word}
 [kct-view="original"] .${NS}-translated{display:none}
 [kct-view="translated"] .${NS}-translated{display:block}
 .${NS}-source-hidden{display:none !important}
@@ -449,6 +502,7 @@ function injectStyles() {
 .${NS}-row{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:6px 0}
 .${NS}-row>select,.${NS}-row>input{min-width:0;max-width:164px;font:inherit;padding:3px 5px;border-radius:4px;border:1px solid var(--color-line,rgba(128,128,128,.4));background:var(--color-surface-raised,#fff);color:inherit}
 .${NS}-hint{margin-top:8px;opacity:.65;font-size:11px}
+.${NS}-start{display:block;width:100%;margin-top:12px;padding:6px 10px;background:var(--color-text,#222);color:var(--color-surface-raised,#fff)}
 @media(max-width:480px){.${NS}-bar{gap:2px;font-size:11px;max-width:180px}.${NS}-status{max-width:85px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
 `;
   document.head.appendChild(style);
@@ -512,6 +566,7 @@ function mount(think) {
     generation: 0,
     preferOriginal: false,
     rendered: false,
+    skipped: false,
     translatedPrefix: '',
     translatedSource: '',
     failedSource: '',
@@ -520,6 +575,10 @@ function mount(think) {
   ctxs.set(think, ctx);
 
   toggle.addEventListener('click', () => {
+    if (!hasTargetLanguage()) {
+      openPanel({ currentTarget: toggle });
+      return;
+    }
     if (ctx.rendered) {
       ctx.preferOriginal = ctx.view === 'translated';
       setView(ctx, ctx.view === 'original' ? 'translated' : 'original');
@@ -553,12 +612,16 @@ function setView(ctx, view) {
   const source = pickSource(ctx.body);
   if (source) {
     ctx.sourceNode = source;
-    source.classList.toggle(`${NS}-source-hidden`, view === 'translated');
+    const hidden = view === 'translated';
+    if (source.classList.contains(`${NS}-source-hidden`) !== hidden) {
+      source.classList.toggle(`${NS}-source-hidden`, hidden);
+    }
   }
   ctx.toggle.textContent = view === 'translated' ? '原文' : ctx.rendered ? '译文' : '翻译';
   ctx.toggle.title = view === 'translated' ? '查看原文' : ctx.rendered ? '查看译文' : '翻译这段思考';
   ctx.toggle.setAttribute('aria-label', ctx.toggle.title);
   ctx.toggle.setAttribute('aria-pressed', String(view === 'translated'));
+  ctx.toggle.hidden = ctx.skipped;
 }
 
 function readSource(ctx) {
@@ -642,12 +705,18 @@ async function maybeRun(ctx) {
     ctx.source = '';
     ctx.done = false;
     ctx.rendered = false;
+    ctx.skipped = false;
     ctx.translatedSource = '';
     ctx.failedSource = '';
     setView(ctx, 'original');
   }
   if (!ctx.bar.isConnected) ctx.think.querySelector(HEAD)?.after(ctx.bar);
   const source = readSource(ctx);
+  if (ctx.skipped && source !== ctx.source) {
+    ctx.skipped = false;
+    ctx.done = false;
+    setView(ctx, 'original');
+  }
   if (ctx.rendered && source.startsWith(ctx.translatedSource)) {
     render(ctx, ctx.translatedPrefix + source.slice(ctx.translatedSource.length));
   } else if (ctx.rendered) {
@@ -661,10 +730,17 @@ async function maybeRun(ctx) {
     setView(ctx, 'original');
   } else if (ctx.done) {
     // Vue can replace just the source node while leaving the block alive.
-    if (!ctx.body.querySelector(`.${NS}-translated`)) ctx.done = false;
+    if (!ctx.skipped && !ctx.body.querySelector(`.${NS}-translated`)) ctx.done = false;
     setView(ctx, ctx.view);
   }
   if (!state.settings.enabled || ctx.running || !isOpen(ctx.think)) return;
+  if (!hasTargetLanguage()) {
+    if (!setupPrompted) {
+      setupPrompted = true;
+      if (!panel) openPanel({ currentTarget: ctx.bar.querySelector('[data-kct-settings]') });
+    }
+    return;
+  }
   if (!state.settings.autoTranslate && !ctx.requested) return;
 
   if (source.trim() === '') return;
@@ -686,7 +762,7 @@ async function maybeRun(ctx) {
 }
 
 async function run(ctx) {
-  if (ctx.running) return;
+  if (ctx.running || !hasTargetLanguage()) return;
   const fullSource = readSource(ctx);
   let source = fullSource;
   if (isStreaming(ctx.think)) {
@@ -694,6 +770,15 @@ async function run(ctx) {
     source = paragraphs.slice(0, -1).map(({ body, sep }) => body + sep).join('');
   }
   if (!source.trim()) return;
+  const lang = resolveTarget();
+  if (translationPieces(fullSource, lang).every(({ skip }) => skip)) {
+    render(ctx, fullSource);
+    ctx.source = fullSource;
+    ctx.done = !isStreaming(ctx.think);
+    ctx.status.dataset.state = 'ok';
+    ctx.status.textContent = '';
+    return;
+  }
   if (source === ctx.source && ctx.rendered) {
     if (!isStreaming(ctx.think)) {
       ctx.done = true;
@@ -716,7 +801,6 @@ async function run(ctx) {
   ctx.toggle.disabled = false;
 
   try {
-    const lang = resolveTarget();
     const translated = await translateText(source, lang, (text, done, total) => {
       const current = readSource(ctx);
       if (!valid() || !current.startsWith(source)) return;
@@ -755,6 +839,13 @@ async function run(ctx) {
 
 function render(ctx, text) {
   let node = ctx.body.querySelector(`.${NS}-translated`);
+  ctx.skipped = text === readSource(ctx);
+  if (ctx.skipped) {
+    node?.remove();
+    ctx.rendered = false;
+    setView(ctx, 'original');
+    return;
+  }
   if (!node) {
     node = pickSource(ctx.body)?.cloneNode(false) || document.createElement('pre');
     node.removeAttribute('id');
@@ -789,6 +880,7 @@ function openPanel(event) {
   }
   panelTrigger = event?.currentTarget || null;
   panel = document.createElement('div');
+  panel.id = 'kct-settings';
   panel.className = `${NS}-panel`;
   panel.dataset[NS] = 'panel';
   panel.setAttribute('role', 'dialog');
@@ -797,7 +889,8 @@ function openPanel(event) {
   const heading = document.createElement('div');
   heading.className = `${NS}-panel-heading`;
   const title = document.createElement('h4');
-  title.textContent = '思维链翻译';
+  const firstUse = !hasTargetLanguage();
+  title.textContent = firstUse ? '选择翻译语言' : '思维链翻译';
   const close = document.createElement('button');
   close.type = 'button';
   close.className = `${NS}-btn`;
@@ -812,16 +905,47 @@ function openPanel(event) {
     }
   });
 
+  if (firstUse) {
+    const intro = document.createElement('p');
+    intro.textContent = '你希望将思考内容翻译为什么语言？已是目标语言的内容会保留原样。之后可在设置中更改。';
+    panel.appendChild(intro);
+  }
+  const suggested = resolveTarget();
+  const language = select(TARGET_LANGUAGES,
+    firstUse ? TARGET_LANGUAGES.includes(suggested) ? suggested : 'en' : state.settings.targetLanguage,
+    (v) => {
+      if (firstUse) return;
+      state.settings.targetLanguage = v;
+      saveSettings();
+      resetAll();
+    });
   panel.appendChild(
     row(
       '目标语言',
-      select(['auto', 'zh', 'en', 'ja', 'ko', 'es', 'fr', 'de', 'ru'], state.settings.targetLanguage, (v) => {
-        state.settings.targetLanguage = v;
-        saveSettings();
-        resetAll();
-      }),
+      language,
     ),
   );
+  if (firstUse) {
+    const hint = document.createElement('div');
+    hint.className = `${NS}-hint`;
+    const service = { bing: 'Bing', google: 'Google', custom: '你配置的自定义端点' }[state.settings.provider];
+    hint.textContent = `需要翻译的思考原文会发送到${service || '所选翻译服务'}。确认前不会发送，之后可在设置中更改服务。`;
+    panel.appendChild(hint);
+    const start = document.createElement('button');
+    start.type = 'button';
+    start.className = `${NS}-btn ${NS}-start`;
+    start.textContent = '开始使用';
+    start.addEventListener('click', () => {
+      state.settings.targetLanguage = language.value;
+      saveSettings();
+      closePanel();
+      resetAll();
+    });
+    panel.appendChild(start);
+    document.body.appendChild(panel);
+    language.focus();
+    return;
+  }
 
   panel.appendChild(
     row(
@@ -982,6 +1106,7 @@ function resetAll() {
     ctx.source = '';
     ctx.failedSource = '';
     ctx.rendered = false;
+    ctx.skipped = false;
     ctx.translatedSource = '';
     ctx.preferOriginal = false;
     const node = ctx.body.querySelector(`.${NS}-translated`);
