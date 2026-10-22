@@ -195,6 +195,111 @@ test('shared kct.js Node export actually translates only foreign prose through t
   assert.equal(calls.length, 1, 'target-language-only text must not reach the provider');
 });
 
+test('shared engine batches twelve adjacent sentences into one Bing text', async (t) => {
+  const engine = require('../kct.js');
+  engine.state.cache.clear();
+  engine.state.failures.clear();
+  engine.state.cooldowns.clear();
+  const calls = [];
+  t.mock.method(globalThis, 'fetch', async (url, options) => {
+    calls.push({ url: String(url), body: JSON.parse(options.body) });
+    return new Response(JSON.stringify(JSON.parse(options.body).map(text => ({
+      translations: [{ text: `\u8bd1\u6587:${text}` }],
+    }))), { headers: { 'content-type': 'application/json' } });
+  });
+  t.after(() => engine.state.cache.clear());
+  const source = Array.from({ length: 12 }, (_, i) =>
+    `Sentence ${i + 1} checks the input before returning the result.`).join(' ');
+  const result = await engine.translateText(source, 'zh', () => {}, { provider: 'bing' });
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0].body, [source]);
+  assert.equal(result, `\u8bd1\u6587:${source}`);
+});
+
+test('shared engine leaves fenced code, inline code and bare URLs unsent and unchanged', async (t) => {
+  const engine = require('../kct.js');
+  engine.state.cache.clear();
+  engine.state.failures.clear();
+  engine.state.cooldowns.clear();
+  const calls = [];
+  t.mock.method(globalThis, 'fetch', async (url, options) => {
+    const texts = JSON.parse(options.body);
+    calls.push({ url: String(url), texts });
+    return new Response(JSON.stringify(texts.map(text => ({
+      translations: [{ text: `\u8bd1\u6587:${text}` }],
+    }))), { headers: { 'content-type': 'application/json' } });
+  });
+  t.after(() => engine.state.cache.clear());
+  const fenced = '```js\nconst cache = new Map();\n\ncache.set("key", "value");\n```';
+  const tildeFenced = '~~~text\nsecond fenced block\n\nwith a blank line\n~~~';
+  const inline = "Then review `cache.has('key')` before returning.";
+  const url = 'https://example.test/docs';
+  const source = `First check the cache.\n\n${fenced}\n\n${tildeFenced}\n\n${inline}\n\n${url}`;
+  const result = await engine.translateText(source, 'zh', () => {}, { provider: 'bing' });
+  const sent = calls.flatMap(call => call.texts).join('\n');
+  for (const code of [fenced, tildeFenced, "cache.has('key')", url]) {
+    assert.equal(sent.includes(code), false, `${code} must not reach the provider`);
+  }
+  for (const preserved of [fenced, tildeFenced, "cache.has('key')", url]) {
+    assert.equal(result.includes(preserved), true, `${preserved} must survive translation`);
+  }
+  assert.match(sent, /First check the cache\./);
+  assert.match(sent, /Then review/);
+  assert.match(sent, /before returning\./);
+});
+
+test('shared engine sends custom-provider pieces in one numbered request', async (t) => {
+  const engine = require('../kct.js');
+  engine.state.cache.clear();
+  engine.state.failures.clear();
+  engine.state.cooldowns.clear();
+  const calls = [];
+  t.mock.method(globalThis, 'fetch', async (url, options) => {
+    const body = JSON.parse(options.body);
+    calls.push({ url: String(url), body });
+    const user = body.messages.find(message => message.role === 'user').content;
+    const numbered = user.split('\n').map((line, i) => {
+      const match = /^(\d+)\.\s*(.*)$/.exec(line);
+      return match ? `${match[1]}. \u8bd1\u6587:${match[2]}` : `\u8bd1\u6587:${line}`;
+    }).join('\n');
+    return new Response(JSON.stringify({
+      choices: [{ message: { content: numbered } }],
+    }), { headers: { 'content-type': 'application/json' } });
+  });
+  t.after(() => engine.state.cache.clear());
+  const first = 'First paragraph checks the input before returning.';
+  const second = 'Second paragraph verifies the result before finishing.';
+  const source = `${first}\n\n${second}`;
+  const result = await engine.translateText(source, 'zh', () => {}, {
+    provider: 'custom',
+    customEndpoint: 'https://translator.test/numbered',
+    customModel: 'fixture',
+  });
+  assert.equal(calls.length, 1);
+  const user = calls[0].body.messages.find(message => message.role === 'user').content;
+  assert.equal(user, `1. ${first}\n2. ${second}`);
+  assert.equal(result, `\u8bd1\u6587:${first}\n\n\u8bd1\u6587:${second}`);
+});
+
+test('shared engine falls back to the source when a provider injects fenced code', async (t) => {
+  const engine = require('../kct.js');
+  engine.state.cache.clear();
+  engine.state.failures.clear();
+  engine.state.cooldowns.clear();
+  const calls = [];
+  t.mock.method(globalThis, 'fetch', async (url, options) => {
+    calls.push({ url: String(url), body: JSON.parse(options.body) });
+    return new Response(JSON.stringify([{
+      translations: [{ text: '译文\n```js\ninjected code\n```' }],
+    }]), { headers: { 'content-type': 'application/json' } });
+  });
+  t.after(() => engine.state.cache.clear());
+  const source = 'Check the input before returning the answer.';
+  const result = await engine.translateText(source, 'zh', () => {}, { provider: 'bing' });
+  assert.equal(calls.length, 1);
+  assert.equal(result, source);
+});
+
 test('real browser: explicit sending, strict CSP, literal source/result and original switch', async (t) => {
   const { chromium } = require('playwright');
   const browser = await chromium.launch();

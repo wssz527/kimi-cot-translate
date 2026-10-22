@@ -165,7 +165,7 @@ function hasTargetLanguage() {
 }
 
 function isTargetLanguage(text, lang) {
-  const prose = text.replace(/```[\s\S]*?(?:```|$)|`[^`\n]*`|https?:\/\/\S+/g, '');
+  const prose = protectedPieces(text).filter(({ skip }) => !skip).map(({ text }) => text).join('');
   const letters = prose.match(/\p{L}/gu) || [];
   if (!letters.length) return true;
   const count = (pattern) => (prose.match(pattern) || []).length;
@@ -301,7 +301,9 @@ function customEndpointURL(endpoint) {
   return url;
 }
 
-async function translateCustom(text, lang, settings) {
+async function translateCustom(texts, lang, settings) {
+  const numbered = texts.length > 1;
+  const text = numbered ? texts.map((text, i) => `${i + 1}. ${text}`).join('\n') : texts[0];
   const endpoint = customEndpointURL(settings.customEndpoint.trim()).href;
   const headers = { 'content-type': 'application/json' };
   if (settings.customKey) headers.authorization = `Bearer ${settings.customKey}`;
@@ -315,7 +317,8 @@ async function translateCustom(text, lang, settings) {
           role: 'system',
           content:
             `You are a translation engine. Translate the user's text into ${lang}. ` +
-            'Preserve line breaks, Markdown and code exactly. Output only the translation.',
+            'Preserve line breaks, Markdown and code exactly. Output only the translation.' +
+            (numbered ? ' Keep each numbered item and its number, starting each item on a new line.' : ''),
         },
         { role: 'user', content: text },
       ],
@@ -328,7 +331,14 @@ async function translateCustom(text, lang, settings) {
     ? payload.choices[0].message.content
     : undefined;
   if (typeof content !== 'string' || content === '') throw new Error('custom bad shape');
-  return content;
+  if (!numbered) return [content];
+  // shortcut: ambiguous numbered lists use singles; use structured output if these need batching.
+  const lines = [...content.matchAll(/^(\d+)\.[ \t]+/gm)];
+  if (lines.length !== texts.length || content.slice(0, lines[0]?.index).trim() ||
+    lines.some((line, i) => Number(line[1]) !== i + 1)) return null;
+  const results = lines.map((line, i) =>
+    content.slice(line.index + line[0].length, lines[i + 1]?.index ?? content.length).trim());
+  return results.every(Boolean) ? results : null;
 }
 
 const PROVIDERS = { google: translateGoogle, bing: translateBing, custom: translateCustom };
@@ -413,10 +423,17 @@ async function translateBatch({ batch, provider, lang, settings }) {
   if (!live.length) return;
   const results = provider === 'bing'
     ? await translateBing(live.map((item) => item.text), lang)
-    : [await PROVIDERS[provider](live[0].text, lang, settings)];
+    : provider === 'custom'
+      ? await translateCustom(live.map((item) => item.text), lang, settings)
+      : [await translateGoogle(live[0].text, lang)];
+  if (!results) {
+    for (const item of live) enqueue([item], provider, lang, settings);
+    return;
+  }
   if (results.some((text) => typeof text !== 'string' || !text.trim())) throw new Error('译文为空，请重试');
   live.forEach((item, i) => {
     if (!pruneConsumers(item)) return;
+    results[i] = preserveFencedCode(item.text, results[i]);
     if (item.epoch === cacheEpoch && results[i].length * 2 <= CACHE_BYTES) {
       state.cache.delete(item.key);
       state.cache.set(item.key, { text: results[i], usedAt: Date.now() });
@@ -430,12 +447,59 @@ async function translateBatch({ batch, provider, lang, settings }) {
 // segmentation
 // ---------------------------------------------------------------------------
 
+function protectedPieces(text) {
+  const pieces = [];
+  const tokens = /^ {0,3}(`{3,})[^`\n]*(?:\n|$)|^ {0,3}(~{3,})[^\n]*(?:\n|$)|(?<!`)(`+)(?!`)[\s\S]*?(?<!`)\3(?!`)|https?:\/\/[^\s`<>。！？；，]+/gm;
+  let last = 0;
+  let match;
+  while ((match = tokens.exec(text)) !== null) {
+    if (match.index > last) pieces.push({ text: text.slice(last, match.index), skip: false });
+    const fence = match[1] || match[2];
+    if (fence) {
+      const closing = new RegExp(`^ {0,3}${fence[0]}{${fence.length},}[ \\t]*\\r?$`, 'gm');
+      closing.lastIndex = tokens.lastIndex;
+      const end = closing.exec(text);
+      tokens.lastIndex = end ? closing.lastIndex : text.length;
+    }
+    pieces.push({ text: text.slice(match.index, tokens.lastIndex), skip: true, fenced: !!fence });
+    last = tokens.lastIndex;
+  }
+  if (last < text.length) pieces.push({ text: text.slice(last), skip: false });
+  return pieces;
+}
+
+function preserveFencedCode(source, translated) {
+  const fences = (text) => protectedPieces(text).filter(({ fenced }) => fenced).map(({ text }) => text);
+  const original = fences(source);
+  const result = fences(translated);
+  return original.length === result.length && original.every((text, i) => text === result[i])
+    ? translated : source;
+}
+
+function endsWithAbbreviation(text) {
+  return /\b(?:Dr\.|Mr\.|Mrs\.|Ms\.|e\.g\.|i\.e\.|etc\.|vs\.|v?\d+(?:\.\d+)+\.?)$/i.test(text.trimEnd());
+}
+
+function sentenceUnits(text) {
+  const units = [];
+  let last = 0;
+  for (const match of text.matchAll(/\n+|[。！？]|[.!?](?:[ \t]+|(?=[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]))/gu)) {
+    if (match[0][0] === '.' && endsWithAbbreviation(text.slice(last, match.index + 1))) continue;
+    const end = match.index + match[0].length;
+    units.push(text.slice(last, end));
+    last = end;
+  }
+  if (last < text.length) units.push(text.slice(last));
+  return units;
+}
+
 // Keep sentence boundaries when a chunk is too long for one request.
 function splitLong(text) {
   const parts = [];
   while (text.length > MAX_CHARS) {
     const prefix = text.slice(0, MAX_CHARS);
-    const boundaries = [...prefix.matchAll(/(?:[。！？.!?]\s+|\n+|\s+)/g)];
+    const boundaries = [...prefix.matchAll(/(?:[。！？.!?]\s+|\n+|\s+)/g)]
+      .filter((match) => !endsWithAbbreviation(prefix.slice(0, match.index + match[0].length)));
     const boundary = boundaries.at(-1);
     let end = boundary && boundary.index > MAX_CHARS / 2
       ? boundary.index + boundary[0].length : MAX_CHARS;
@@ -463,17 +527,34 @@ function splitParagraphs(text) {
 }
 
 function translationPieces(source, lang) {
-  return splitParagraphs(source).flatMap(({ body, sep }) => {
-    const units = body.split(/(\n+|(?<=[。！？])|(?<=[.!?])(?=[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}])|(?<=[.!?])[ \t]+)/u).filter(Boolean);
+  // Equal-length masks keep sentence context and source offsets without counting code or URLs.
+  const masked = protectedPieces(source).map(({ text, skip }) => skip ? ' '.repeat(text.length) : text).join('');
+  let offset = 0;
+  return splitParagraphs(masked).flatMap(({ body, sep }) => {
     const groups = [];
-    for (const text of units) {
-      const skip = isTargetLanguage(text, lang);
-      const last = groups.at(-1);
-      if (last && last.skip === skip) last.text += text;
-      else groups.push({ text, skip });
+    for (const unit of sentenceUnits(body)) {
+      const skip = unit.trim() ? isTargetLanguage(unit, lang) : groups.at(-1)?.skip ?? true;
+      for (const piece of protectedPieces(source.slice(offset, offset + unit.length))) {
+        const last = groups.at(-1);
+        const preserve = skip || piece.skip;
+        if (last && last.skip === preserve) last.text += piece.text;
+        else groups.push({ text: piece.text, skip: preserve });
+      }
+      offset += unit.length;
     }
+    const separator = source.slice(offset, offset + sep.length);
+    offset += sep.length;
     return [...groups.flatMap(({ text, skip }) =>
-      (skip ? [text] : splitLong(text)).map((piece) => ({ text: piece, skip }))), { text: sep, skip: true }];
+      skip ? [{ text, skip }] : splitLong(text).flatMap((text) => {
+        const body = text.trim();
+        if (!body) return [{ text, skip: true }];
+        const start = text.indexOf(body);
+        return [
+          { text: text.slice(0, start), skip: true },
+          { text: body, skip: false },
+          { text: text.slice(start + body.length), skip: true },
+        ].filter(({ text }) => text);
+      })), { text: separator, skip: true }];
   });
 }
 
@@ -518,19 +599,20 @@ async function translateText(source, lang, onProgress = () => {}, settings = { .
       promise = new Promise((resolve, reject) => pending.consumers.add({ valid, resolve, reject }));
     }
     tasks.push(promise.then((translated) => {
-      out[index] = translated;
+      out[index] = preserveFencedCode(text, translated);
       completed += 1;
-      if (valid()) onProgress(out.join(''), completed, total);
+      if (valid()) onProgress(preserveFencedCode(source, out.join('')), completed, total);
     }));
   }
   saveCache();
 
   while (missing.length) {
     const batch = [missing.shift()];
-    let chars = batch[0].text.length;
-    while (provider === 'bing' && missing.length && batch.length < 8 &&
-      chars + missing[0].text.length <= BATCH_CHARS) {
-      chars += missing[0].text.length;
+    const numbering = provider === 'custom' ? 4 : 0;
+    let chars = batch[0].text.length + (numbering ? 3 : 0);
+    while (provider !== 'google' && missing.length && batch.length < 8 &&
+      chars + missing[0].text.length + numbering <= BATCH_CHARS) {
+      chars += missing[0].text.length + numbering;
       batch.push(missing.shift());
     }
     enqueue(batch, provider, lang, settings);
@@ -538,7 +620,7 @@ async function translateText(source, lang, onProgress = () => {}, settings = { .
   const results = await Promise.allSettled(tasks);
   const failed = results.find((result) => result.status === 'rejected');
   if (failed) throw failed.reason;
-  return out.join('');
+  return preserveFencedCode(source, out.join(''));
 }
 
 // ---------------------------------------------------------------------------

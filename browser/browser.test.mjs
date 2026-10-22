@@ -355,6 +355,88 @@ test('pure target-language source keeps the original node and shows no duplicate
   assert.equal(await f.page.evaluate(() => document.querySelector('[data-kct-browser]').shadowRoot.querySelectorAll('output').length), 1);
 });
 
+test('twelve adjacent foreign sentences share one Bing request and one text', async t => {
+  const source = Array.from({ length: 12 }, (_, i) =>
+    `Sentence ${i + 1} checks the input before returning the result.`).join(' ');
+  const f = await fixture(t, {
+    settings: { language: 'zh', consent: true, auto: false },
+    source,
+  });
+  await f.ui.getByRole('button', { name: '翻译本段', exact: true }).click();
+  await f.ui.locator('output').waitFor({ state: 'visible' });
+  const requests = await f.requests();
+  assert.equal(requests.length, 1);
+  assert.deepEqual(requests[0].texts, [source]);
+});
+
+test('fenced and inline code and bare URLs are not sent and remain unchanged', async t => {
+  const fenced = '```js\nconst cache = new Map();\n\ncache.set("key", "value");\n```';
+  const tildeFenced = '~~~text\nsecond fenced block\n\nwith a blank line\n~~~';
+  const inline = "Then review `cache.has('key')` before returning.";
+  const url = 'https://example.test/docs';
+  const source = `先检查缓存行为。\n\n${fenced}\n\n${tildeFenced}\n\n${inline}\n\n${url}`;
+  const f = await fixture(t, {
+    settings: { language: 'zh', consent: true, auto: false },
+    source,
+  });
+  await f.ui.getByRole('button', { name: '翻译本段', exact: true }).click();
+  await f.ui.locator('output').waitFor({ state: 'visible' });
+  const requests = await f.requests();
+  assert.equal(requests.length, 1);
+  const sent = requests.flatMap((request) => request.texts).join('\n');
+  for (const code of [fenced, tildeFenced, "cache.has('key')", url]) {
+    assert.equal(sent.includes(code), false, `${code} must not reach the provider`);
+  }
+  const output = await f.ui.locator('output').textContent();
+  for (const preserved of [fenced, tildeFenced, "cache.has('key')", url]) {
+    assert.equal(output.includes(preserved), true, `${preserved} must survive translation`);
+  }
+});
+
+test('target-language prose around fenced and inline code makes no provider request', async t => {
+  const source = [
+    '先检查缓存行为。',
+    '```js\nconst cache = new Map();\n\ncache.set("key", "value");\n```',
+    '~~~text\nsecond fenced block\n\nwith a blank line\n~~~',
+    "使用 `cache.has('key')` 并参考 https://example.test/docs 后返回答案。",
+  ].join('\n\n');
+  const f = await fixture(t, {
+    settings: { language: 'zh', consent: true, auto: false },
+    source,
+  });
+  await f.ui.getByRole('button', { name: '翻译本段', exact: true }).click();
+  await f.page.waitForFunction(() =>
+    document.querySelector('#thinking [data-kct-browser]')?.shadowRoot
+      ?.querySelector('[role="status"]')?.textContent.includes('无需翻译'), null, { timeout: 3000 });
+  assert.deepEqual(await f.requests(), []);
+  assert.equal(await f.page.evaluate(() => window.originalSource.innerText), source);
+});
+
+test('provider-injected fenced code falls back to the original source', async t => {
+  const source = 'Check the input before returning the answer.';
+  const f = await fixture(t, {
+    settings: { language: 'zh', consent: true, auto: false },
+    source,
+  });
+  await f.page.evaluate(() => {
+    window.requests = [];
+    chrome.runtime.sendMessage = async message => {
+      window.requests.push(message);
+      return {
+        ok: true,
+        payload: message.texts.map(() => ({
+          translations: [{ text: '译文\n```js\ninjected code\n```' }],
+        })),
+      };
+    };
+  });
+  const result = await f.page.evaluate(source => KCTBrowserCore.translateText(
+    source, 'zh', () => {}, { provider: 'bing' }, () => true, true,
+  ), source);
+  assert.equal(result, source);
+  assert.equal((await f.requests()).length, 1);
+});
+
 test('supported #token fragment can translate without persisting or forwarding the token', async t => {
   const f = await fixture(t, {
     chat: true,

@@ -170,6 +170,8 @@ test('all eight matching target languages and Chinese inline code preserve the o
     ['de', 'Wir müssen die Daten prüfen und dann das Ergebnis mit unserem Bericht vergleichen.'],
     ['ru', 'Сначала мы проверим данные, затем нужно проверить результат, чтобы ответ был точным.'],
     ['zh', '先执行 `const result = await response.json()`，确认 `result.ok === true` 后再返回答案。', 'zh with inline code'],
+    ['en', 'Check `const cache = new Map();` before we return the result.', 'en with inline code'],
+    ['en', 'Check https://example.test/docs before we return the result.', 'en with a URL'],
   ]) {
     await t.test(label, async (t) => {
       const f = await fixture(t, { texts: [source], settings: { targetLanguage }, inject: false });
@@ -251,6 +253,114 @@ test('mixed Chinese and English send only English and preserve Chinese in place'
       assert.deepEqual(f.errors, []);
     });
   }
+});
+
+test('adjacent foreign sentences merge into one Bing text', async (t) => {
+  const source = Array.from({ length: 12 }, (_, i) => `Sentence ${i} checks the input.`).join(' ');
+  const f = await fixture(t, { texts: [source] });
+  await f.open();
+  await f.done();
+  assert.deepEqual(f.requests.map((request) => request.text), [[source]]);
+  assert.equal(await f.page.locator('.kct-translated').textContent(), `zh-Hans:${source}`);
+  assert.deepEqual(f.errors, []);
+});
+
+test('fenced code, inline code and URLs stay literal and never reach the provider', async (t) => {
+  const fence = '````js\nconst cache = new Map();\n\n// Keep ``` inside the longer fence.\n`````';
+  const tilde = '~~~js\nconst other = new Map();\n~~~';
+  const source = `Check the input.\n\n${fence}\n\nRun \`cache.get(key)\` then verify.\n\n${tilde}\n\nhttps://example.test/private`;
+  const f = await fixture(t, { texts: [source] });
+  await f.open();
+  await f.done();
+  assert.deepEqual(f.requests.map((request) => request.text),
+    [['Check the input.', 'Run', 'then verify.']]);
+  assert.equal(await f.page.locator('.kct-translated').textContent(),
+    `zh-Hans:Check the input.\n\n${fence}\n\nzh-Hans:Run \`cache.get(key)\` zh-Hans:then verify.\n\n${tilde}\n\nhttps://example.test/private`);
+  assert.deepEqual(f.errors, []);
+});
+
+test('URL punctuation and multi-backtick inline code leave following prose available for translation', async (t) => {
+  const f = await fixture(t, { manual: true });
+  const sources = ['https://example.test/docs。检查输入并返回答案。',
+    '```const cache = new Map();``` Check the result.',
+    '``cache.get(`key`)`` Verify the result.'];
+  const output = await f.page.evaluate(async (sources) => {
+    const out = [];
+    for (const [i, source] of sources.entries()) {
+      out.push(await window.__kct.translateText(source, i === 0 ? 'en' : 'zh'));
+    }
+    return out;
+  }, sources);
+  assert.deepEqual(f.requests.map((request) => request.text),
+    [['检查输入并返回答案。'], ['Check the result.'], ['Verify the result.']]);
+  assert.deepEqual(output, ['https://example.test/docs。en:检查输入并返回答案。',
+    '```const cache = new Map();``` zh-Hans:Check the result.',
+    '``cache.get(`key`)`` zh-Hans:Verify the result.']);
+  assert.deepEqual(f.errors, []);
+});
+
+test('an unmatched inline backtick cannot consume a fenced-code delimiter', async (t) => {
+  const source = 'A literal ` before the code.\n```js\nconst hidden = true;\n```\nThen check the result.';
+  const f = await fixture(t, { texts: [source] });
+  await f.open();
+  await f.done();
+  assert.deepEqual(f.requests.map((request) => request.text),
+    [['A literal ` before the code.', 'Then check the result.']]);
+  assert.equal(await f.page.locator('.kct-translated').textContent(),
+    'zh-Hans:A literal ` before the code.\n```js\nconst hidden = true;\n```\nzh-Hans:Then check the result.');
+  assert.deepEqual(f.errors, []);
+});
+
+test('abbreviations and versions stay with their sentence during language detection', async (t) => {
+  const f = await fixture(t, { manual: true });
+  const sources = ['Dr.', 'Mr.', 'Mrs.', 'Ms.', 'e.g.', 'i.e.', 'etc.', 'vs.', 'v1.2.3', 'v1.2.3.']
+    .map((prefix) => `${prefix} We should check the input before we return the result.`);
+  const output = await f.page.evaluate(async (sources) => {
+    const out = [];
+    for (const source of sources) out.push(await window.__kct.translateText(source, 'en'));
+    return out;
+  }, sources);
+  assert.deepEqual(output, sources);
+  assert.equal(f.requests.length, 0);
+  assert.deepEqual(f.errors, []);
+});
+
+test('long chunks keep abbreviations and versions with their following text', async (t) => {
+  const f = await fixture(t, { manual: true });
+  const prefixes = ['Dr.', 'Mr.', 'Mrs.', 'Ms.', 'e.g.', 'i.e.', 'etc.', 'vs.', 'v1.2.3', 'v1.2.3.'];
+  const sources = prefixes.map((prefix) => `${'x'.repeat(1498 - prefix.length)} ${prefix} Continue checking the input.`);
+  const output = await f.page.evaluate(async (sources) => {
+    const out = [];
+    for (const source of sources) out.push(await window.__kct.translateText(source, 'zh'));
+    return out;
+  }, sources);
+  const pieces = f.requests.flatMap((request) => request.text);
+  for (const prefix of prefixes) {
+    assert(pieces.includes(`${prefix} Continue checking the input.`));
+    assert(pieces.every((text) => !text.endsWith(` ${prefix}`)));
+  }
+  assert(pieces.every((text) => text.length <= 1500));
+  assert.deepEqual(output.map((text) => text.replaceAll('zh-Hans:', '')), sources);
+  assert.deepEqual(f.errors, []);
+});
+
+test('a response that adds fenced code falls back to the source and caches only safe text', async (t) => {
+  const source = 'Check this input.\n\n```js\nconst cache = new Map();\n```';
+  const f = await fixture(t, { texts: [source] });
+  await f.page.route('https://edge.microsoft.com/**', (route) => route.fulfill({
+    contentType: 'application/json',
+    body: JSON.stringify(route.request().postDataJSON().map(() => ({
+      translations: [{ text: 'Changed.\n```js\nconst altered = true;\n```' }],
+    }))),
+  }));
+  await f.open();
+  await f.done();
+  assert.equal(await f.page.locator('pre:not([data-kct])').textContent(), source);
+  assert.equal(await f.page.locator('pre:not([data-kct])').isVisible(), true);
+  assert.equal(await f.page.locator('.kct-translated').count(), 0);
+  assert.deepEqual(await f.page.evaluate(() => [...window.__kct.state.cache.values()].map((entry) => entry.text)),
+    ['Check this input.']);
+  assert.deepEqual(f.errors, []);
 });
 
 test('an unchanged service response keeps ambiguous text in its original node and position', async (t) => {
@@ -721,6 +831,151 @@ test('custom model and endpoint changes do not reuse another service cache', asy
   });
   assert.deepEqual(out, ['one:/first', 'two:/first', 'two:/second', 'two:/second']);
   assert.equal(requests.length, 3);
+});
+
+test('custom batches 1819 characters and 300 words in one numbered request and reuses the cache', async (t) => {
+  const source = Array.from({ length: 300 }, (_, i) =>
+    `w${String(i).padStart(i < 10 ? 3 : 4, '0')}${i % 10 === 9 ? '.' : ''}`).join(' ');
+  assert.equal(source.length, 1819);
+  const f = await fixture(t, { manual: true });
+  const calls = [];
+  await f.page.route('https://translator.test/**', async (route) => {
+    const body = route.request().postDataJSON();
+    calls.push(body);
+    const text = body.messages.at(-1).content;
+    await route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({ choices: [{ message: {
+        content: text.replace(/^(\d+\. )/gm, '$1\u8bd1:'),
+      } }] }),
+    });
+  });
+  const output = await f.page.evaluate(async (source) => {
+    const settings = { provider: 'custom', customEndpoint: 'https://translator.test/batch', customKey: 'secret' };
+    const first = await window.__kct.translateText(source, 'zh', () => {}, settings);
+    const cached = await window.__kct.translateText(source, 'zh', () => {}, settings);
+    return [first, cached];
+  }, source);
+  assert.equal(calls.length, 1);
+  const sent = calls[0].messages.at(-1).content;
+  assert.match(sent, /^1\. /);
+  assert(sent.length <= 4000);
+  assert.equal([...sent.matchAll(/^\d+\. /gm)].length, 2);
+  assert(sent.split(/\n(?=\d+\. )/).every((text) => text.replace(/^\d+\. /, '').length <= 1500));
+  assert.equal(output[0].replaceAll('\u8bd1:', ''), source);
+  assert.equal(output[1], output[0]);
+  assert.deepEqual(f.errors, []);
+});
+
+test('custom batch budgets include numbering and separators', async (t) => {
+  const f = await fixture(t, { manual: true });
+  const calls = [];
+  await f.page.route('https://translator.test/**', async (route) => {
+    const text = route.request().postDataJSON().messages.at(-1).content;
+    calls.push(text);
+    await route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({ choices: [{ message: { content: text } }] }),
+    });
+  });
+  const source = Array.from({ length: 5 }, (_, i) => `${i}${'x'.repeat(996)}`).join('\n\n');
+  const output = await f.page.evaluate((source) => window.__kct.translateText(source, 'zh', () => {}, {
+    provider: 'custom', customEndpoint: 'https://translator.test/budget',
+  }), source);
+  assert.equal(calls.length, 2, 'four 997-character items plus numbering would exceed 4000');
+  assert(calls.every((text) => text.length <= 4000));
+  assert.deepEqual(calls.map((text) => [...text.matchAll(/^\d+\. /gm)].length), [3, 2]);
+  assert.equal(output, source);
+  assert.deepEqual(f.errors, []);
+});
+
+test('unparseable custom numbering falls back to queued singles and preserves successful cache entries', async (t) => {
+  for (const response of ['No numbering.', '1. First only.', '1. First.\n1. Duplicate.', '2. Second.\n1. First.']) {
+    await t.test(response, async (t) => {
+      const f = await fixture(t, { manual: true });
+      const calls = [];
+      await f.page.route('https://translator.test/**', async (route) => {
+        const text = route.request().postDataJSON().messages.at(-1).content;
+        calls.push(text);
+        await route.fulfill({
+          contentType: 'application/json',
+          body: JSON.stringify({ choices: [{ message: {
+            content: /^\d+\. /m.test(text) ? response : `\u8bd1:${text}`,
+          } }] }),
+        });
+      });
+      const output = await f.page.evaluate(async () => {
+        const settings = { provider: 'custom', customEndpoint: 'https://translator.test/fallback' };
+        const source = 'First thought.\n\nSecond thought.';
+        const first = await window.__kct.translateText(source, 'zh', () => {}, settings);
+        const cached = await window.__kct.translateText(source, 'zh', () => {}, settings);
+        return [first, cached, window.__kct.state.failures.size];
+      });
+      assert.deepEqual(calls, ['1. First thought.\n2. Second thought.', 'First thought.', 'Second thought.']);
+      assert.deepEqual(output, ['\u8bd1:First thought.\n\n\u8bd1:Second thought.',
+        '\u8bd1:First thought.\n\n\u8bd1:Second thought.', 0]);
+      assert.deepEqual(f.errors, []);
+    });
+  }
+});
+
+test('custom batch fallback retains backoff, provider cooldown and per-fragment failure caching', async (t) => {
+  const f = await fixture(t, { manual: true, clock: '2026-10-22T00:00:00Z' });
+  await f.page.clock.pauseAt(new Date('2026-10-22T00:00:01Z'));
+  await f.page.evaluate(() => {
+    window.customCalls = [];
+    window.allowRejected = false;
+    const settings = { provider: 'custom', customEndpoint: 'https://translator.test/retry' };
+    const source = 'Retryable thought.\n\nRejected thought.';
+    let batches = 0;
+    let limited = false;
+    Math.random = () => 0.5;
+    window.fetch = async (url, options) => {
+      const text = JSON.parse(options.body).messages.at(-1).content;
+      window.customCalls.push({ text, time: Date.now() });
+      if (text.startsWith('1. ')) {
+        if (++batches === 1) return new Response('', { status: 503 });
+        return new Response(JSON.stringify({ choices: [{ message: { content: 'Missing numbering.' } }] }));
+      }
+      if (text === 'Retryable thought.' && !limited) {
+        limited = true;
+        return new Response('', { status: 429, headers: { 'retry-after': '2' } });
+      }
+      if (text === 'Rejected thought.' && !window.allowRejected) return new Response('', { status: 400 });
+      return new Response(JSON.stringify({ choices: [{ message: { content: `\u8bd1:${text}` } }] }));
+    };
+    window.customRun = (retry = false) => window.__kct.translateText(source, 'zh', () => {}, settings,
+      () => true, retry).then((text) => ({ text }), (error) => ({ status: error.status }));
+    window.customOutcome = window.customRun();
+    window.customSettings = settings;
+  });
+  await f.page.waitForFunction(() => window.__kct.state.active === 0 && window.__kct.state.queue.length === 1);
+  await f.page.clock.runFor(999);
+  assert.equal(await f.page.evaluate(() => window.customCalls.length), 1);
+  await f.page.clock.runFor(1);
+  await f.page.waitForFunction(() => window.__kct.state.cooldowns.has('custom') && window.__kct.state.active === 0);
+  assert.equal(await f.page.evaluate(() => window.customCalls.length), 4);
+  await f.page.evaluate(() => {
+    window.customQueued = window.__kct.translateText('Queued thought.', 'zh', () => {}, window.customSettings);
+  });
+  await f.page.clock.runFor(1999);
+  assert.equal(await f.page.evaluate(() => window.customCalls.length), 4);
+  await f.page.clock.runFor(1);
+  assert.equal(await f.page.evaluate(() => window.customQueued), '\u8bd1:Queued thought.');
+  assert.deepEqual(await f.page.evaluate(() => window.customOutcome), { status: 400 });
+  const calls = await f.page.evaluate(() => window.customCalls);
+  assert.equal(calls.length, 6);
+  assert.equal(calls[1].time - calls[0].time, 1000);
+  assert(calls.slice(4).every((call) => call.time >= calls[2].time + 2000));
+  assert.deepEqual(await f.page.evaluate(() => window.customRun()), { status: 400 });
+  assert.equal(await f.page.evaluate(() => window.customCalls.length), 6);
+  const retried = await f.page.evaluate(async () => {
+    window.allowRejected = true;
+    return window.customRun(true);
+  });
+  assert.deepEqual(retried, { text: '\u8bd1:Retryable thought.\n\n\u8bd1:Rejected thought.' });
+  assert.equal(await f.page.evaluate(() => window.customCalls.length), 7);
+  assert.deepEqual(f.errors, []);
 });
 
 test('changing a custom endpoint origin clears the old key and pauses automatic translation until confirmation', async (t) => {
