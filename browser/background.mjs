@@ -52,6 +52,7 @@ export async function translate(message, sender, api = chrome, request = fetch) 
   const url = new URL('https://edge.microsoft.com/translate/translatetext');
   url.searchParams.set('to', message.lang);
   url.searchParams.set('isEnterpriseClient', 'false');
+  const signal = AbortSignal.timeout(15000);
   let response;
   try {
     response = await request(url.href, {
@@ -60,7 +61,7 @@ export async function translate(message, sender, api = chrome, request = fetch) 
       body: JSON.stringify(message.texts),
       credentials: 'omit',
       redirect: 'error',
-      signal: AbortSignal.timeout(15000),
+      signal,
     });
   } catch (cause) {
     const error = cause instanceof Error ? cause : new Error(String(cause));
@@ -75,7 +76,13 @@ export async function translate(message, sender, api = chrome, request = fetch) 
     else if (retryAfterMs !== undefined) error.retryAfterMs = retryAfterMs;
     throw error;
   }
-  const payload = await response.json();
+  let payload;
+  try {
+    payload = await response.json();
+  } catch (error) {
+    if (signal.aborted || error instanceof TypeError) error.network = true;
+    throw error;
+  }
   if (!Array.isArray(payload) || payload.length !== message.texts.length ||
       payload.some(item => typeof item?.translations?.[0]?.text !== 'string' ||
         !item.translations[0].text.trim() || item.translations[0].text.length > 20000)) {

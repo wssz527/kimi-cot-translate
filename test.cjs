@@ -388,6 +388,9 @@ async function mockFailures(page, mode, retryAfter = null) {
         ? [new URLSearchParams(options.body).get('q')] : JSON.parse(options.body);
       window.translationCalls.push({ texts, time: Date.now(), host });
       if (window.responseMode === 'network') throw new TypeError('Failed to fetch');
+      if (window.responseMode === 'body network') return {
+        ok: true, json: async () => { throw new TypeError('Failed to read response body'); },
+      };
       if (window.responseMode === 'json') return new Response('{');
       if (window.responseMode === 'shape') return new Response('[]');
       if (window.responseMode !== 'ok') return new Response('', {
@@ -438,7 +441,9 @@ test('429 pauses only its provider, honors seconds and HTTP-date, and resumes qu
 });
 
 test('5xx and network failures back off with bounded jitter, stop after two retries, and release concurrency', async (t) => {
-  for (const [mode, random, delay] of [['503', 0, 800], ['network', 0.5, 1000], ['503', 1, 1200]]) {
+  for (const [mode, random, delay] of [
+    ['503', 0, 800], ['network', 0.5, 1000], ['503', 1, 1200], ['body network', 0.5, 1000],
+  ]) {
     await t.test(`${mode}, jitter ${random}`, async (t) => {
       const f = await fixture(t, { texts: ['Retry source.'], clock: '2026-10-22T00:00:00Z' });
       await mockFailures(f.page, mode);

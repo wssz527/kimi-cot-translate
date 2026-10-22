@@ -244,6 +244,7 @@ async function fetchJSON(url, options) {
       return await res.json();
     } catch (error) {
       if (controller.signal.aborted) throw Object.assign(new Error('请求超时，请重试'), { network: true });
+      if (error instanceof TypeError) error.network = true;
       throw error;
     }
   } finally {

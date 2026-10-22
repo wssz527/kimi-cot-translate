@@ -68,6 +68,9 @@ test('background rejects unsupported senders, endpoints, unconfirmed settings an
   await assert.rejects(translate(message, sender, api, async () => ({
     ok: true, json: async () => { throw new SyntaxError('Unexpected token'); },
   })), error => /Unexpected token/.test(error.message) && error.network === undefined);
+  await assert.rejects(translate(message, sender, api, async () => ({
+    ok: true, json: async () => { throw new TypeError('Failed to read response body'); },
+  })), { message: /read response body/, network: true });
   await assert.rejects(translate(message, sender, api, async () => ({ ok: true, json: async () => [] })), /response/);
   let receivedSignal;
   const nativeTimeout = AbortSignal.timeout;
@@ -126,7 +129,7 @@ test('generated bridge rebuilds structured errors and marks transport failures',
     const call = bridge(async () => failure);
     await assert.rejects(call(url, options), error => error.message === failure.error &&
       error.status === failure.status && error.retryAfterMs === failure.retryAfterMs &&
-      error.network === failure.network);
+      error.network === (failure.network === true));
   }
   await assert.rejects(bridge(async () => { throw new TypeError('Message port closed'); })(url, options),
     { message: /Message port closed/, network: true });
@@ -182,7 +185,8 @@ async function fixture(t, {
           if (!values[key]?.consent) throw new Error('No consent');
           window.requests.push(message);
           if (pending) await pending;
-          if (window.fail) return { ok: false, error: 'Synthetic HTTP 503' };
+          if (window.fail) return typeof window.fail === 'object'
+            ? window.fail : { ok: false, error: 'Synthetic HTTP 503' };
           const reply = window.translateMode === 'real' ? (text => `REAL:${text}`) : (text => `译文:${text}`);
           return { ok: true, payload: message.texts.map(text => ({ translations: [{ text: reply(text) }] })) };
         },
@@ -223,6 +227,60 @@ async function consent(f) {
   await f.ui.getByLabel('翻译目标语言').selectOption('zh');
   await f.ui.getByRole('button', { name: '确认语言并允许发送到 Bing' }).click();
 }
+
+test('worker 429 metadata pauses all Bing jobs until Retry-After expires', async t => {
+  const f = await fixture(t, {
+    settings: { language: 'zh', consent: true, auto: false },
+    fail: { ok: false, error: 'Translation HTTP 429', status: 429, retryAfterMs: 60000 },
+  });
+  await f.page.clock.pauseAt(await f.page.evaluate(() => Date.now() + 1000));
+  await f.page.evaluate(() => {
+    window.requestTimes = [];
+    const send = chrome.runtime.sendMessage;
+    chrome.runtime.sendMessage = async message => {
+      window.requestTimes.push(Date.now());
+      return send(message);
+    };
+  });
+  await f.ui.getByRole('button', { name: '翻译本段', exact: true }).click();
+  assert.equal((await f.requests()).length, 1);
+  await f.page.evaluate(() => {
+    window.fail = false;
+    window.queuedTranslation = KCTBrowserCore.translateText('Another queued source.', 'zh', () => {}, { provider: 'bing' });
+  });
+  await f.page.clock.runFor(59999);
+  assert.equal((await f.requests()).length, 1);
+  await f.page.clock.runFor(1);
+  await f.ui.locator('output').waitFor({ state: 'visible' });
+  assert.equal(await f.page.evaluate(() => window.queuedTranslation), '译文:Another queued source.');
+  const times = await f.page.evaluate(() => window.requestTimes);
+  assert.equal(times.length, 3);
+  assert(times.slice(1).every(time => time - times[0] >= 60000));
+});
+
+test('worker parsing failures never retry automatically, including stable fragments after source updates', async t => {
+  const f = await fixture(t, {
+    settings: { language: 'zh', consent: true, auto: true },
+    fail: { ok: false, error: 'Invalid translation response' },
+  });
+  await f.ui.getByRole('status').filter({ hasText: '翻译失败' }).waitFor();
+  assert.equal((await f.requests()).length, 1);
+  await f.tick(10000);
+  assert.equal((await f.requests()).length, 1);
+  await f.page.evaluate(() => {
+    window.originalSource.textContent = 'First check the input.\n\nA new streaming tail.';
+  });
+  await f.tick();
+  await f.ui.getByRole('status').filter({ hasText: '翻译失败' }).waitFor();
+  const requests = await f.requests();
+  assert.equal(requests.length, 2);
+  assert.deepEqual(requests[1].texts, ['A new streaming tail.']);
+  await f.page.evaluate(() => { window.fail = false; });
+  await f.ui.getByRole('button', { name: '翻译本段', exact: true }).click();
+  await f.ui.locator('output').waitFor({ state: 'visible' });
+  assert.equal((await f.requests()).length, 3);
+  assert.deepEqual(await f.page.evaluate(() => window.translateArgs.map(args => args.retryFailed)), [false, false, true]);
+});
 
 test('settings are scoped by origin and a failed save cannot enable transmission', async t => {
   const f = await fixture(t, { chat: true });
