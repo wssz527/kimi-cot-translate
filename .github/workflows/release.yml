@@ -44,9 +44,9 @@ jobs:
           cp -r browser/dist "$STAGE/kimi-cot-translate-${VERSION}/browser/dist"
           mkdir -p "$STAGE/kimi-cot-translate-${VERSION}/vscode/vendor"
           cp vscode/vendor/kct.cjs "$STAGE/kimi-cot-translate-${VERSION}/vscode/vendor/"
-          (cd "$STAGE" && zip -qr "../kimi-cot-translate-${VERSION}.zip" "kimi-cot-translate-${VERSION}")
-          (cd browser/dist && zip -qr "../../../kct-browser-${VERSION}.zip" .)
-          (cd "$STAGE/kimi-cot-translate-${VERSION}/vscode" && zip -qr "../../../kct-copied-thinking-${VERSION}.vsix" .)
+          (cd "$STAGE" && zip -qr "$GITHUB_WORKSPACE/kimi-cot-translate-${VERSION}.zip" "kimi-cot-translate-${VERSION}")
+          (cd browser/dist && zip -qr "$GITHUB_WORKSPACE/kct-browser-${VERSION}.zip" .)
+          (cd "$STAGE/kimi-cot-translate-${VERSION}/vscode" && zip -qr "$GITHUB_WORKSPACE/kct-copied-thinking-${VERSION}.vsix" .)
           shasum -a 256 "kimi-cot-translate-${VERSION}.zip" "kct-browser-${VERSION}.zip" "kct-copied-thinking-${VERSION}.vsix" > SHA256SUMS.txt
           cat SHA256SUMS.txt
       - name: Smoke test packaged source
@@ -54,7 +54,7 @@ jobs:
           set -euo pipefail
           VERSION="${GITHUB_REF_NAME}"
           rm -rf smoke && mkdir smoke
-          (cd smoke && unzip -q "../kimi-cot-translate-${VERSION}.zip")
+          (cd smoke && unzip -q "$GITHUB_WORKSPACE/kimi-cot-translate-${VERSION}.zip")
           (cd "smoke/kimi-cot-translate-${VERSION}" && node --test runtime-hook.test.mjs)
       - name: Create release
         env:
