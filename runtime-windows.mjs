@@ -6,7 +6,10 @@ import { basename, dirname, join, resolve, win32 } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { promisify } from 'node:util';
-import { assertRendererContract, inspectFuses, installIntoProcess, portOpen, stageBundle } from './runtime.mjs';
+import {
+  assertRendererContract, inspectFuses, installIntoProcess, MAX_ATTEMPTS, permanentError, portOpen,
+  recordFailure, retryDelay, reusableAttempt, stageBundle,
+} from './runtime.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const run = promisify(execFile);
@@ -141,27 +144,27 @@ export function assertIdentity(actual, expected) {
 
 export function verifyBinary(binary, signature, supported) {
   if (signature?.status !== 'Valid' || signature.thumbprint?.toUpperCase() !== SIGNER) {
-    throw new Error('Kimi does not have the expected valid official Authenticode signature');
+    throw permanentError('Kimi does not have the expected valid official Authenticode signature');
   }
   if (!Array.isArray(supported) || !supported.length || supported.some((entry) =>
     !/^[a-f0-9]{64}$/.test(entry?.sha256 ?? '') || !Number.isSafeInteger(entry.size)
       || entry.electron !== '43.1.1' || entry.appVersion !== '1.1.1'
       || entry.signerThumbprint !== SIGNER)) {
-    throw new Error('Invalid Windows runtime allowlist');
+    throw permanentError('Invalid Windows runtime allowlist');
   }
   const sha256 = hash(binary);
   const runtime = supported.find((entry) => entry.sha256 === sha256 && entry.size === binary.length);
-  if (!runtime) throw new Error('Unknown Windows EXE hash; Kimi is left untouched');
+  if (!runtime) throw permanentError('Unknown Windows EXE hash; Kimi is left untouched');
   const pe = binary.length >= 64 ? binary.readUInt32LE(0x3c) : -1;
   if (binary.toString('ascii', 0, 2) !== 'MZ' || pe < 0 || pe + 6 > binary.length
     || binary.toString('ascii', pe, pe + 4) !== 'PE\0\0' || binary.readUInt16LE(pe + 4) !== 0x8664) {
-    throw new Error('Expected a Windows PE x64 executable');
+    throw permanentError('Expected a Windows PE x64 executable');
   }
   inspectFuses(binary);
   const version = Buffer.from(`Electron/${runtime.electron}`);
   const at = binary.indexOf(version);
   if (at < 0 || /[0-9.]/.test(String.fromCharCode(binary[at + version.length] ?? 0))) {
-    throw new Error('Expected Electron/43.1.1 in the verified executable');
+    throw permanentError('Expected Electron/43.1.1 in the verified executable');
   }
   return { ...runtime, sha256 };
 }
@@ -172,12 +175,18 @@ export async function verifyApp(options = {}) {
   const identifyFile = options.fingerprint ?? fingerprint;
   const before = await identifyFile(executable);
   const signature = await callBridge(options, 'Signature', { executable });
-  const supported = JSON.parse(await read(join(options.bundleDir ?? HERE, 'supported-windows-runtimes.json'), 'utf8'));
+  let supported;
+  try {
+    supported = JSON.parse(await read(join(options.bundleDir ?? HERE, 'supported-windows-runtimes.json'), 'utf8'));
+  } catch (error) {
+    if (error instanceof SyntaxError) throw permanentError('Invalid Windows runtime allowlist');
+    throw error;
+  }
   const runtime = verifyBinary(await read(executable), signature, supported);
   const dist = win32.join(appDir, 'resources', 'desktop-dist');
   const index = await read(win32.join(dist, 'index.html'), 'utf8');
   const assets = [...index.matchAll(/href="(\/assets\/[A-Za-z0-9_-]+\.css)"/g)].map((item) => item[1]);
-  if (!assets.length) throw new Error('Cannot find Kimi renderer styles');
+  if (!assets.length) throw permanentError('Cannot find Kimi renderer styles');
   assertRendererContract((await Promise.all(assets.map((name) =>
     read(win32.join(dist, ...name.slice(1).split('/')), 'utf8')))).join('\n'));
   if (before !== await identifyFile(executable)) throw new Error('Kimi changed during verification');
@@ -195,8 +204,10 @@ export async function triggerInspector(info, {
       String(info.pid)], { timeout, killSignal: 'SIGKILL', windowsHide: true, maxBuffer: 65536,
       env: { ...process.env, NODE_OPTIONS: '', NODE_PATH: '' } });
   } catch (error) {
-    if (error.killed || error.code === 'ETIMEDOUT') {
-      throw new Error('Windows inspector helper timed out; no automatic retry', { cause: error });
+    if (error.killed || error.code === 'ETIMEDOUT' || typeof error.code === 'number' || error.signal) {
+      throw Object.assign(new Error('Windows inspector helper did not complete; trigger state is uncertain'), {
+        cause: error, failureKind: 'inspector-uncertain',
+      });
     }
     throw error;
   }
@@ -231,8 +242,8 @@ export function inspectorOperations(options = {}) {
   };
 }
 
-async function readJSON(file, missing = {}) {
-  try { return JSON.parse(await readFile(file, 'utf8')); }
+async function readJSON(file, missing = {}, read = readFile) {
+  try { return JSON.parse(await read(file, 'utf8')); }
   catch (error) { if (error.code === 'ENOENT') return missing; throw error; }
 }
 
@@ -245,70 +256,88 @@ async function atomicJSON(file, value) {
 }
 
 export async function readState(options = {}) {
-  return readJSON(join(windowsPaths(options).dataDir, 'runtime-state.json'));
+  const file = join(windowsPaths(options).dataDir, 'runtime-state.json');
+  try {
+    const state = await readJSON(file);
+    if (!state || typeof state !== 'object' || Array.isArray(state)) {
+      throw new Error('runtime-state.json must contain an object');
+    }
+    return state;
+  } catch (error) {
+    if (error.code === 'ENOENT') return {};
+    const log = options.logError ?? console.error;
+    log(`[kct-windows] runtime-state.json is unreadable; using safe defaults: ${error.message}`);
+    return {};
+  }
 }
 
 export async function tick(options = {}) {
   const paths = windowsPaths(options);
   const read = options.readFile ?? readFile;
+  const checkPort = options.portOpen ?? portOpen;
+  const now = options.now ?? Date.now;
   const save = options.saveState ?? (async (state) => {
     await mkdir(paths.dataDir, { recursive: true });
     await atomicJSON(join(paths.dataDir, 'runtime-state.json'), state);
   });
-  const previous = await (options.readState ?? readState)(options);
-  const attempt = previous.identity ? previous : previous.attempt;
-  const checkedAt = new Date((options.now ?? Date.now)()).toISOString();
-  const waiting = async (detail) => {
-    const state = { status: 'waiting', detail, checkedAt, ...(attempt ? { attempt } : {}) };
+  let previous = await (options.readState ?? readState)(options);
+  const semantic = (state) => JSON.stringify({ ...state, checkedAt: undefined });
+  const persist = async (state) => {
+    if (semantic(state) === semantic(previous)) return previous;
+    state.checkedAt = new Date(now()).toISOString();
     await save(state);
+    previous = structuredClone(state);
     return state;
   };
-  let info, revision, identity;
+  const attempt = previous.identity ? previous : previous.attempt;
+  const waiting = async (detail) => {
+    return persist({ status: 'waiting', detail, ...(attempt ? { attempt } : {}) });
+  };
+  const found = await (options.findProcesses ?? findProcesses)(options);
+  if (!found.length) return waiting('Kimi Code is not running');
+  if (found.length !== 1) return waiting('Multiple Kimi main processes; waiting for one');
+  const info = found[0];
+  const identity = `${info.pid}:${info.started}`;
+  const sameProcess = attempt?.pid === info.pid
+    && (attempt.started === info.started || attempt.identity?.startsWith(`${identity}:`)
+      || attempt.identity === identity);
+  if (sameProcess && attempt.status !== 'active' && attempt.failureKind !== 'permanent') {
+    const reusable = await reusableAttempt(attempt, now(), checkPort);
+    if (reusable) return persist(reusable);
+  }
+  if (now() - Date.parse(info.started) < 5000) return waiting('Kimi is starting');
+  const state = {
+    identity, revision: null, pid: info.pid, started: info.started, status: 'checking',
+    attempts: (sameProcess ? attempt.attempts ?? 1 : 0) + 1,
+    lastAttemptAt: new Date(now()).toISOString(), nextRetryAt: null, failureKind: null,
+  };
   try {
-    const found = await (options.findProcesses ?? findProcesses)(options);
-    if (!found.length) return waiting('Kimi Code is not running');
-    if (found.length !== 1) return waiting('Multiple Kimi main processes; waiting for one');
-    info = found[0];
     const bundle = options.bundleDir ?? HERE;
     const bytes = await Promise.all(FILES.map((name) => read(join(bundle, name))));
-    revision = hash(Buffer.concat(bytes.map((value, i) =>
+    const revision = hash(Buffer.concat(bytes.map((value, i) =>
       Buffer.concat([Buffer.from(`${FILES[i]}\0${Buffer.byteLength(value)}\0`), Buffer.from(value)]))));
     const source = Buffer.from(bytes[FILES.indexOf('kct.js')]).toString('utf8');
-    identity = `${info.pid}:${info.started}`;
-    if (attempt?.identity === identity && attempt.revision === revision) {
-      const state = { ...attempt, checkedAt };
-      if (state.status === 'checking') {
-        state.status = 'error';
-        state.detail = 'Previous attempt was interrupted; no automatic retry for this process and revision';
-      }
-      await save(state);
-      return state;
+    state.revision = revision;
+    const matched = attempt?.identity === identity && attempt.revision === revision ? attempt : null;
+    if (matched) {
+      const reusable = await reusableAttempt(matched, now(), checkPort);
+      if (reusable) return persist(reusable);
     }
-    if ((options.now ?? Date.now)() - Date.parse(info.started) < 5000) return waiting('Kimi is starting');
+    if (sameProcess && state.attempts > MAX_ATTEMPTS) return persist(attempt);
+    // Persist before attachment so a crash cannot blindly repeat a possible signal.
+    await persist(state);
     const app = await (options.verifyApp ?? verifyApp)(options);
-    if (await (options.portOpen ?? portOpen)()) return waiting('Inspector port 9229 is occupied; no trigger sent');
-    const state = { identity, revision, pid: info.pid, status: 'checking', checkedAt, appVersion: app.version };
-    // Persist before the trigger: a crash or helper timeout must not cause a second signal.
-    await save(state);
-    try {
-      const result = await (options.installIntoProcess ?? installIntoProcess)(
-        info, app, source, revision, inspectorOperations(options));
-      state.status = 'active';
-      state.loaded = result.loaded;
-      state.inspectorClosed = true;
-    } catch (error) {
-      state.status = error.inspectorOpen ? 'blocked-inspector' : 'error';
-      state.detail = error.message;
-    }
-    await save(state);
-    return state;
+    state.appVersion = app.version;
+    if (await checkPort()) throw new Error('Inspector port 9229 is occupied; no trigger sent');
+    const result = await (options.installIntoProcess ?? installIntoProcess)(
+      info, app, source, revision, inspectorOperations(options));
+    state.status = 'active';
+    state.loaded = result.loaded;
+    state.inspectorClosed = true;
   } catch (error) {
-    const state = { status: 'error', detail: error.message, checkedAt,
-      ...(identity && revision ? { identity, revision, pid: info.pid } : {}),
-      ...(attempt ? { attempt } : {}) };
-    await save(state);
-    return state;
+    recordFailure(state, error, now());
   }
+  return persist(state);
 }
 
 export async function acquireLock(dataDir, name = '.runtime-lock') {
@@ -342,8 +371,8 @@ export async function acquireLock(dataDir, name = '.runtime-lock') {
   return { release: () => rm(lock, { recursive: true, force: true }) };
 }
 
-async function stopped(dataDir) {
-  return stat(join(dataDir, 'stop')).then(() => true, (error) => {
+async function stopped(dataDir, readStat = stat) {
+  return readStat(join(dataDir, 'stop')).then(() => true, (error) => {
     if (error.code === 'ENOENT') return false;
     throw error;
   });
@@ -354,23 +383,56 @@ export async function watch(options = {}) {
   const lock = await acquireLock(dataDir);
   if (!lock) return { status: 'busy' };
   const entry = join(options.bundleDir ?? HERE, 'runtime-windows.mjs');
+  const now = options.now ?? Date.now;
+  const pause = options.sleep ?? sleep;
+  const logError = options.logError ?? console.error;
+  const read = options.readFile ?? readFile;
+  const readStat = options.statFile ?? stat;
   try {
-    if (await stopped(dataDir)) return { status: 'disabled' };
-    let enabled = await readJSON(join(dataDir, 'enabled.json'), null);
-    if (!enabled) {
-      enabled = { entry, generation: randomUUID() };
-      await atomicJSON(join(dataDir, 'enabled.json'), enabled);
-    }
-    if (enabled.entry !== entry) return { status: 'disabled' };
+    let enabled;
     let nextTick = 0;
-    while (!await stopped(dataDir)) {
-      const current = await readJSON(join(dataDir, 'enabled.json'), null);
-      if (current?.generation !== enabled.generation || current.entry !== entry) break;
-      if (Date.now() >= nextTick) {
-        await (options.tick ?? tick)(options);
-        nextTick = Date.now() + 10000;
+    let failures = 0;
+    while (true) {
+      try {
+        if (await stopped(dataDir, readStat)) break;
+        if (!enabled) {
+          if (now() < nextTick) {
+            await pause(1000);
+            continue;
+          }
+          let initial;
+          try { initial = await readJSON(join(dataDir, 'enabled.json'), null, read); }
+          catch (error) {
+            if (!(error instanceof SyntaxError)) throw error;
+            logError(`[kct-windows] enabled.json is unreadable; restoring watcher state: ${error.message}`);
+          }
+          if (!initial) {
+            initial = { entry, generation: randomUUID() };
+            await atomicJSON(join(dataDir, 'enabled.json'), initial);
+          }
+          if (initial.entry !== entry) break;
+          enabled = initial;
+        }
+        let current;
+        try { current = await readJSON(join(dataDir, 'enabled.json'), null, read); }
+        catch (error) {
+          if (!(error instanceof SyntaxError)) throw error;
+          logError(`[kct-windows] enabled.json is unreadable; keeping current watcher: ${error.message}`);
+          await atomicJSON(join(dataDir, 'enabled.json'), enabled);
+          current = enabled;
+        }
+        if (current?.generation !== enabled.generation || current.entry !== entry) break;
+        if (now() >= nextTick) {
+          await (options.tick ?? tick)(options);
+          failures = 0;
+          nextTick = now() + 10000;
+        }
+      } catch (error) {
+        failures += 1;
+        logError(`[kct-windows] Watcher iteration failed; retrying: ${error.message}`);
+        nextTick = now() + retryDelay(failures);
       }
-      await (options.sleep ?? sleep)(1000);
+      await pause(1000);
     }
     return { status: 'disabled' };
   } finally { await lock.release(); }

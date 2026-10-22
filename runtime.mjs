@@ -22,7 +22,41 @@ const LABEL = 'com.user.kimi-cot-translate.runtime';
 const PLIST = join(homedir(), 'Library/LaunchAgents', `${LABEL}.plist`);
 const hash = (bytes) => createHash('sha256').update(bytes).digest('hex');
 const CORE_FILES = ['runtime.mjs', 'runtime-hook.mjs', 'supported-runtimes.json', 'kct.js'];
-const SETTLED = new Set(['active', 'error', 'blocked-inspector']);
+const SETTLED = new Set(['active', 'error', 'blocked-inspector', 'checking']);
+export const MAX_ATTEMPTS = 8;
+export const retryDelay = (attempts) => [30000, 120000, 600000, 1800000][
+  Math.min(Math.max(attempts - 1, 0), 3)];
+
+export function permanentError(message) {
+  return Object.assign(new Error(message), { failureKind: 'permanent' });
+}
+
+export function recordFailure(state, error, now) {
+  state.failureKind = error.inspectorOpen ? 'inspector-uncertain' : error.failureKind ?? 'transient';
+  state.status = state.failureKind === 'inspector-uncertain' ? 'blocked-inspector' : 'error';
+  state.detail = error.message;
+  state.nextRetryAt = state.failureKind === 'permanent' || state.attempts >= MAX_ATTEMPTS
+    ? null : new Date(now + retryDelay(state.attempts)).toISOString();
+  if (state.attempts >= MAX_ATTEMPTS && state.failureKind !== 'permanent') {
+    state.detail += '; retry limit reached; waiting for Kimi to restart';
+  }
+  return state;
+}
+
+export async function reusableAttempt(attempt, now, checkPort) {
+  if (attempt.status === 'active') return attempt;
+  if (attempt.status === 'checking' || !attempt.failureKind) {
+    attempt = recordFailure({ ...attempt, attempts: attempt.attempts ?? 1,
+      lastAttemptAt: attempt.lastAttemptAt ?? attempt.checkedAt ?? new Date(now).toISOString() },
+      Object.assign(new Error('Previous attempt was interrupted or its trigger state is unknown'),
+        { failureKind: 'inspector-uncertain' }), now);
+  }
+  // Probe even during backoff: an uncertain trigger must never be followed by another on an open port.
+  if (attempt.failureKind === 'inspector-uncertain' && await checkPort()) return attempt;
+  if (attempt.failureKind === 'permanent' || attempt.attempts >= MAX_ATTEMPTS
+    || now < Date.parse(attempt.nextRetryAt)) return attempt;
+  return null;
+}
 const output = async (command, args) => (await run(command, args, {
   encoding: 'utf8', timeout: 20000, maxBuffer: 1024 * 1024,
   env: { ...process.env, LC_ALL: 'C' },
@@ -69,12 +103,12 @@ export async function findProcesses() {
   return found;
 }
 
-export async function portOpen() {
+export async function portOpen(openSocket = connect) {
   return new Promise((resolvePort) => {
-    const socket = connect({ host: '127.0.0.1', port: 9229 });
+    const socket = openSocket({ host: '127.0.0.1', port: 9229 });
     const finish = (value) => { socket.destroy(); resolvePort(value); };
     socket.once('connect', () => finish(true));
-    socket.once('error', () => finish(false));
+    socket.once('error', (error) => finish(error.code !== 'ECONNREFUSED'));
     socket.setTimeout(500, () => finish(true));
   });
 }
@@ -82,41 +116,49 @@ export async function portOpen() {
 export function inspectFuses(binary) {
   const sentinel = Buffer.from('dL7pKGdnNz796PbbjQWNKmHXBZaB9tsX');
   const at = binary.indexOf(sentinel);
-  if (at < 0 || binary[at + sentinel.length] !== 1) throw new Error('Unknown Electron fuse layout');
+  if (at < 0 || binary[at + sentinel.length] !== 1) throw permanentError('Unknown Electron fuse layout');
   if (binary[at + sentinel.length + 1] < 4 || binary[at + sentinel.length + 2 + 3] !== 49) {
-    throw new Error('Node inspector signal support is disabled');
+    throw permanentError('Node inspector signal support is disabled');
   }
 }
 
 export function assertRendererContract(css) {
   for (const selector of ['think', 'think-head', 'think-body', 'think-body-inner', 'think-text']) {
     if (!new RegExp(`\\.${selector}(?:\\[|[\\s.{:#>])`).test(css)) {
-      throw new Error('Kimi reasoning UI changed; translation is disabled until compatibility is checked');
+      throw permanentError('Kimi reasoning UI changed; translation is disabled until compatibility is checked');
     }
   }
 }
 
-export async function verifyApp() {
-  const before = await fingerprint(EXECUTABLE);
-  await output('/usr/bin/codesign', ['--verify', '--deep', '--strict', APP]);
-  const signature = await run('/usr/bin/codesign', ['-dv', '--verbose=2', APP], { timeout: 10000 });
+export async function verifyApp(deps = {}) {
+  const identify = deps.fingerprint ?? fingerprint;
+  const command = deps.output ?? output;
+  const read = deps.readFile ?? readFile;
+  const before = await identify(EXECUTABLE);
+  try {
+    await command('/usr/bin/codesign', ['--verify', '--deep', '--strict', APP]);
+  } catch (error) {
+    if (typeof error.code === 'number' && !error.killed) error.failureKind = 'permanent';
+    throw error;
+  }
+  const signature = await (deps.run ?? run)('/usr/bin/codesign', ['-dv', '--verbose=2', APP], { timeout: 10000 });
   if (!/^Identifier=com\.kimi\.code\.desktop$/m.test(signature.stderr)
     || !/^TeamIdentifier=2J9472RW75$/m.test(signature.stderr)) {
-    throw new Error('Application does not have the expected official signing identity');
+    throw permanentError('Application does not have the expected official signing identity');
   }
-  const binary = await readFile(FRAMEWORK);
-  const supported = JSON.parse(await readFile(join(HERE, 'supported-runtimes.json'), 'utf8'));
+  const binary = await read(FRAMEWORK);
+  const supported = JSON.parse(await read(join(HERE, 'supported-runtimes.json'), 'utf8'));
   const runtime = supported.find((item) => item.sha256 === hash(binary));
-  if (!runtime) throw new Error('New Electron runtime needs an isolated compatibility check; Kimi is left untouched');
+  if (!runtime) throw permanentError('New Electron runtime needs an isolated compatibility check; Kimi is left untouched');
   inspectFuses(binary);
-  const version = (await output('/usr/libexec/PlistBuddy', [
+  const version = (await command('/usr/libexec/PlistBuddy', [
     '-c', 'Print :CFBundleShortVersionString', join(APP, 'Contents/Info.plist'),
   ])).trim();
   const dist = join(APP, 'Contents/Resources/desktop-dist');
-  const index = await readFile(join(dist, 'index.html'), 'utf8');
+  const index = await read(join(dist, 'index.html'), 'utf8');
   const assets = [...index.matchAll(/href="(\/assets\/[A-Za-z0-9_-]+\.css)"/g)].map((item) => item[1]);
-  assertRendererContract((await Promise.all(assets.map((name) => readFile(join(dist, name), 'utf8')))).join('\n'));
-  if (before !== await fingerprint(EXECUTABLE)) throw new Error('Application changed during verification');
+  assertRendererContract((await Promise.all(assets.map((name) => read(join(dist, name), 'utf8')))).join('\n'));
+  if (before !== await identify(EXECUTABLE)) throw new Error('Application changed during verification');
   return { version, electron: runtime.electron, executable: before };
 }
 
@@ -125,11 +167,12 @@ async function verifyLiveProcess(info, app) {
   if (await fingerprint(EXECUTABLE) !== app.executable) throw new Error('Application changed during attachment');
   const files = await output('/usr/sbin/lsof', ['-nP', '-a', '-p', String(info.pid), '-d', 'txt', '-Fin']);
   const inode = (await stat(EXECUTABLE)).ino;
-  if (!files.includes(`i${inode}\nn${EXECUTABLE}\n`)) throw new Error('Running executable does not match the verified app');
+  if (!files.includes(`i${inode}\nn${EXECUTABLE}\n`)) throw permanentError('Running executable does not match the verified app');
 }
 
 export async function attachInspector(info, app, operations = {}) {
   const verifyLive = operations.verifyLiveProcess ?? verifyLiveProcess;
+  const checkPort = operations.portOpen ?? portOpen;
   const trigger = operations.triggerInspector ?? ((target) => process.kill(target.pid, 'SIGUSR1'));
   const checkIdentity = operations.checkIdentity
     ?? (async (target) => assertIdentity(await processIdentity(target.pid), target));
@@ -142,11 +185,12 @@ export async function attachInspector(info, app, operations = {}) {
     }
   });
   await verifyLive(info, app);
-  if (await portOpen()) throw new Error('Inspector port 9229 is occupied; refusing to attach');
+  if (await checkPort()) throw new Error('Inspector port 9229 is occupied; refusing to attach');
   await verifyLive(info, app);
   let socket;
   let counter = 0;
   let closed = false;
+  let triggered = false;
   const pending = new Map();
   let evaluate;
   const loaderRequire = `(typeof require === 'function' ? require : process.mainModule.require.bind(process.mainModule))`;
@@ -155,6 +199,7 @@ export async function attachInspector(info, app, operations = {}) {
     setTimeout(()=>${loaderRequire}('node:inspector').close(),25);}true`;
   try {
     await trigger(info);
+    triggered = true;
     let endpoint;
     for (let attempt = 0; attempt < 50; attempt++) {
       await checkIdentity(info);
@@ -220,9 +265,9 @@ export async function attachInspector(info, app, operations = {}) {
         if (!closed) {
           await evaluate(closeExpression).catch(() => {});
         }
-        for (let attempt = 0; attempt < 150 && await portOpen(); attempt++) await sleep(100);
+        for (let attempt = 0; attempt < 150 && await checkPort(); attempt++) await sleep(100);
         socket.close();
-        if (await portOpen()) {
+        if (await checkPort()) {
           const error = new Error('Inspector did not close; quit Kimi normally to close port 9229');
           error.inspectorOpen = true;
           throw error;
@@ -233,11 +278,12 @@ export async function attachInspector(info, app, operations = {}) {
     if (socket?.readyState === WebSocket.OPEN && evaluate) {
       await evaluate(closeExpression).catch(() => {});
     }
-    if (await portOpen()) {
-      for (let attempt = 0; attempt < 150 && await portOpen(); attempt++) await sleep(100);
+    if (triggered) error.failureKind = 'inspector-uncertain';
+    if (await checkPort()) {
+      for (let attempt = 0; attempt < 150 && await checkPort(); attempt++) await sleep(100);
     }
     socket?.close();
-    if (await portOpen()) {
+    if (await checkPort()) {
       error.inspectorOpen = true;
       error.message = 'Inspector could not be closed; quit Kimi normally to close port 9229';
     }
@@ -276,6 +322,9 @@ export async function installIntoProcess(info, app, source, revision, operations
     })()`);
     if (!result?.loaded) throw new Error('No main Kimi renderer accepted the translation script');
     return result;
+  } catch (error) {
+    error.failureKind = 'inspector-uncertain';
+    throw error;
   } finally { await inspector.close(); }
 }
 
@@ -284,12 +333,12 @@ async function readState() {
   catch (error) { if (error.code === 'ENOENT') return {}; throw error; }
 }
 
-async function saveState(state) {
+export async function saveState(state, file = STATE) {
   const next = JSON.stringify(state, null, 2) + '\n';
-  const old = await readFile(STATE, 'utf8').catch(() => '');
+  const old = await readFile(file, 'utf8').catch(() => '');
   if (next === old) return;
-  await writeFile(`${STATE}.next`, next, { mode: 0o600 });
-  await rename(`${STATE}.next`, STATE);
+  await writeFile(`${file}.next`, next, { mode: 0o600 });
+  await rename(`${file}.next`, file);
 }
 
 function waitingState(detail, now = Date.now(), extra = {}) {
@@ -323,7 +372,15 @@ export async function tick(deps = {}) {
   const install = deps.installIntoProcess ?? installIntoProcess;
   const now = deps.now ?? Date.now;
   const processes = await find();
-  const beforeWait = await previousState().catch(() => ({}));
+  let beforeWait = await previousState().catch(() => ({}));
+  const persist = async (state) => {
+    const fields = (value) => JSON.stringify({ ...value, checkedAt: undefined });
+    if (fields(state) === fields(beforeWait)) return beforeWait;
+    state.checkedAt = new Date(now()).toISOString();
+    await save(state);
+    beforeWait = structuredClone(state);
+    return state;
+  };
   const preserved = matchedAttempt(beforeWait);
   const waiting = (detail, extra = {}, now = Date.now()) => {
     const state = waitingState(detail, now, { ...extra, ...(preserved ? { attempt: preserved } : {}) });
@@ -331,59 +388,60 @@ export async function tick(deps = {}) {
   };
   if (!processes.length) {
     const state = waiting('Kimi Code is not running', {}, now());
-    await save(state);
-    return state;
+    return persist(state);
   }
   if (processes.length !== 1) {
     const state = waiting('Multiple Kimi main processes; waiting for one default instance',
       { identity: processSetIdentity(processes) }, now());
-    await save(state);
-    return state;
+    return persist(state);
   }
   const info = processes[0];
-  const source = await read(join(HERE, 'kct.js'), 'utf8');
-  const supported = await read(join(HERE, 'supported-runtimes.json'), 'utf8');
-  const loader = await read(new URL(import.meta.url), 'utf8');
-  const revision = runtimeRevision(source, supported, installRuntimeHook.toString(), loader);
-  const identity = `${info.pid}:${info.started}:${await fileFingerprint(EXECUTABLE)}`;
-  const reusable = matchedAttempt(beforeWait, identity, revision);
-  if (reusable) {
-    const restored = { ...reusable, checkedAt: new Date(now()).toISOString() };
-    await save(restored);
-    return restored;
+  const processKey = `${info.pid}:${info.started}`;
+  const sameProcess = preserved?.pid === info.pid
+    && (preserved.started === info.started || preserved.identity?.startsWith(`${processKey}:`));
+  if (sameProcess && preserved.status !== 'active' && preserved.failureKind !== 'permanent') {
+    const reusable = await reusableAttempt(preserved, now(), checkPort);
+    if (reusable) return persist(reusable);
   }
-  const nowValue = now();
-  const wait = async (detail, extra = {}) => {
-    const state = waiting(detail, extra, nowValue);
-    await save(state);
-    return state;
+  const state = {
+    identity: processKey, revision: null, pid: info.pid, started: info.started, status: 'checking',
+    attempts: (sameProcess ? preserved.attempts ?? 1 : 0) + 1,
+    lastAttemptAt: new Date(now()).toISOString(), nextRetryAt: null, failureKind: null,
   };
-  const args = await command('/bin/ps', ['-p', String(info.pid), '-o', 'command=']);
-  if (args.includes('--user-data-dir') || args.includes('--remote-debugging') || args.includes('--inspect')) {
-    return wait('A test or debugging instance is running; skipped');
-  }
-  if (now() - Date.parse(info.started) < 5000) return wait('Kimi is starting');
-  // No retry storm: make at most one signal attempt for a process and script revision.
-  const state = { identity, revision, pid: info.pid, status: 'checking', checkedAt: new Date(now()).toISOString() };
-  await save(state);
   try {
+    const source = await read(join(HERE, 'kct.js'), 'utf8');
+    const supported = await read(join(HERE, 'supported-runtimes.json'), 'utf8');
+    const loader = await read(new URL(import.meta.url), 'utf8');
+    const revision = runtimeRevision(source, supported, installRuntimeHook.toString(), loader);
+    const identity = `${processKey}:${await fileFingerprint(EXECUTABLE)}`;
+    const matched = matchedAttempt(beforeWait, identity, revision);
+    if (matched) {
+      const reusable = await reusableAttempt(matched, now(), checkPort);
+      if (reusable) return persist(reusable);
+    }
+    if (sameProcess && state.attempts > MAX_ATTEMPTS) return persist(preserved);
+    state.identity = identity;
+    state.revision = revision;
+    const args = await command('/bin/ps', ['-p', String(info.pid), '-o', 'command=']);
+    if (args.includes('--user-data-dir') || args.includes('--remote-debugging') || args.includes('--inspect')) {
+      return persist(waiting('A test or debugging instance is running; skipped', {}, now()));
+    }
+    if (now() - Date.parse(info.started) < 5000) return persist(waiting('Kimi is starting', {}, now()));
+    // Persist before attachment so a crashed loader cannot blindly repeat its signal.
+    await persist(state);
     const app = await verify();
     state.appVersion = app.version;
-    // A busy port is a retryable external condition; no signal has been sent yet.
-    if (await checkPort()) {
-      return wait('Inspector port 9229 is in use; no signal sent', { appVersion: app.version });
-    }
+    if (await checkPort()) throw new Error('Inspector port 9229 is in use; no signal sent');
     const result = await install(info, app, source, revision);
     state.status = 'active';
     state.loaded = result.loaded;
     state.inspectorClosed = true;
   } catch (error) {
-    state.status = error.inspectorOpen ? 'blocked-inspector' : 'error';
-    state.detail = error.message;
+    recordFailure(state, error, now());
   }
-  await save(state);
-  console.log(JSON.stringify(state));
-  return state;
+  const saved = await persist(state);
+  console.log(JSON.stringify(saved));
+  return saved;
 }
 
 async function acquireLock(dataDir = DATA) {

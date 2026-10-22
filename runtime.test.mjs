@@ -1,16 +1,37 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { EventEmitter } from 'node:events';
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import vm from 'node:vm';
-import { assertIdentity, assertRendererContract, deploy, inspectorDeadlineExpression,
-  inspectFuses, parseProcess, rendererBootstrap, readBundle, stageBundle, switchBundle } from './runtime.mjs';
+import { assertIdentity, assertRendererContract, attachInspector, deploy, inspectorDeadlineExpression,
+  inspectFuses, parseProcess, permanentError, portOpen, rendererBootstrap, readBundle, saveState,
+  stageBundle, switchBundle, tick, verifyApp } from './runtime.mjs';
 
 const INFO = parseProcess(
   `85123 ${process.getuid()} Wed Oct 21 21:58:18 2026 /Applications/Kimi Code.app/Contents/MacOS/Kimi Code`,
 );
 const CORE_FILES = ['runtime.mjs', 'runtime-hook.mjs', 'supported-runtimes.json', 'kct.js'];
+
+function tickFixture() {
+  let previous = {}, found = [INFO], installed = 0, verified = 0, saves = 0;
+  let time = Date.parse('Wed Oct 21 21:58:30 2026');
+  const deps = {
+    saveState: async (state) => { previous = structuredClone(state); saves++; },
+    readState: async () => structuredClone(previous),
+    findProcesses: async () => found,
+    readFile: async () => 'source',
+    fingerprint: async () => 'executable-fingerprint',
+    portOpen: async () => false,
+    output: async () => '',
+    verifyApp: async () => { verified++; return { version: '1.1.1', electron: '43.1.1' }; },
+    installIntoProcess: async () => { installed++; return { loaded: 1 }; },
+    now: () => time,
+  };
+  return { deps, state: () => previous, installed: () => installed, verified: () => verified,
+    saves: () => saves, advance: (ms) => { time += ms; }, setFound: (value) => { found = value; } };
+}
 
 test('only an unchanged main process owned by this user is eligible for a signal', () => {
   const info = parseProcess(`85123 ${process.getuid()} Wed Oct 21 21:58:18 2026 /Applications/Kimi Code.app/Contents/MacOS/Kimi Code`);
@@ -133,6 +154,233 @@ test('a supported-runtime allowlist change retries the same process', async () =
   const state = await tick({ ...base, findProcesses: async () => [INFO], output: async () => '' });
   assert.equal(installed, 2);
   assert.notEqual(state.revision, firstRevision);
+});
+
+test('transient verification errors retry only after their backoff expires', async () => {
+  const f = tickFixture();
+  let calls = 0;
+  const verify = f.deps.verifyApp;
+  f.deps.verifyApp = async () => {
+    if (++calls === 1) throw Object.assign(new Error('codesign timed out'), { killed: true });
+    return verify();
+  };
+  const failed = await tick(f.deps);
+  assert.equal(failed.status, 'error');
+  assert.equal(failed.failureKind, 'transient');
+  assert.equal(failed.attempts, 1);
+  assert.equal(Date.parse(failed.nextRetryAt) - Date.parse(failed.lastAttemptAt), 30000);
+  const saves = f.saves();
+  f.advance(29999);
+  assert.deepEqual(await tick(f.deps), failed);
+  assert.equal(calls, 1);
+  assert.equal(f.saves(), saves);
+  f.advance(1);
+  const active = await tick(f.deps);
+  assert.equal(active.status, 'active');
+  assert.equal(active.attempts, 2);
+  assert.equal(active.failureKind, null);
+  assert.equal(active.nextRetryAt, null);
+  assert.equal(f.installed(), 1);
+});
+
+test('signature rejection, unknown runtime hashes and fuse mismatches are permanent', async () => {
+  const verification = {
+    fingerprint: async () => 'file',
+    output: async () => '',
+    run: async () => ({ stderr: 'Identifier=com.kimi.code.desktop\nTeamIdentifier=2J9472RW75\n' }),
+    readFile: async (file) => String(file).endsWith('.json') ? '[]' : Buffer.from('unknown runtime'),
+  };
+  for (const override of [
+    { output: async () => { throw Object.assign(new Error('invalid signature'), { code: 1 }); } },
+    { run: async () => ({ stderr: 'Identifier=untrusted\n' }) },
+    {},
+  ]) {
+    await assert.rejects(verifyApp({ ...verification, ...override }), { failureKind: 'permanent' });
+  }
+  await assert.rejects(verifyApp({ ...verification, output: async () => {
+    throw Object.assign(new Error('codesign timed out'), { code: null, killed: true });
+  } }), (error) => error.failureKind === undefined);
+  assert.throws(() => inspectFuses(Buffer.from('unknown layout')), { failureKind: 'permanent' });
+  const f = tickFixture();
+  let checks = 0;
+  f.deps.verifyApp = async () => { checks++; throw permanentError('Unknown runtime hash'); };
+  const failed = await tick(f.deps);
+  assert.equal(failed.failureKind, 'permanent');
+  assert.equal(failed.nextRetryAt, null);
+  f.advance(86400000);
+  assert.deepEqual(await tick(f.deps), failed);
+  assert.equal(checks, 1);
+  assert.equal(f.installed(), 0);
+});
+
+test('PID and process start changes each reset the retry budget', async () => {
+  for (const changed of [{ ...INFO, pid: INFO.pid + 1 },
+    { ...INFO, started: 'Wed Oct 21 21:58:19 2026' }]) {
+    const f = tickFixture();
+    f.deps.verifyApp = async () => { throw new Error('temporary IO failure'); };
+    assert.equal((await tick(f.deps)).attempts, 1);
+    f.setFound([changed]);
+    const retried = await tick(f.deps);
+    assert.equal(retried.attempts, 1);
+    assert.equal(retried.pid, changed.pid);
+    assert.equal(retried.started, changed.started);
+  }
+});
+
+test('retry delays grow to thirty minutes and stop after eight attempts per process', async () => {
+  const f = tickFixture();
+  let calls = 0;
+  f.deps.verifyApp = async () => { calls++; throw new Error('temporary IO failure'); };
+  const delays = [30000, 120000, 600000, 1800000, 1800000, 1800000, 1800000];
+  for (let attempt = 1; attempt <= 8; attempt++) {
+    const failed = await tick(f.deps);
+    assert.equal(failed.attempts, attempt);
+    if (attempt === 8) {
+      assert.equal(failed.nextRetryAt, null);
+      assert.match(failed.detail, /retry limit reached; waiting for Kimi to restart/);
+    } else {
+      assert.equal(Date.parse(failed.nextRetryAt) - Date.parse(failed.lastAttemptAt), delays[attempt - 1]);
+      f.advance(delays[attempt - 1]);
+    }
+  }
+  f.advance(86400000);
+  await tick(f.deps);
+  assert.equal(calls, 8);
+  f.deps.readFile = async () => 'new source revision';
+  await tick(f.deps);
+  assert.equal(calls, 8, 'source revisions must not reset the same process budget');
+});
+
+test('blocked inspectors are probed every tick and retry after release and backoff', async () => {
+  const f = tickFixture();
+  let calls = 0, probes = 0, open = false;
+  f.deps.portOpen = async () => { probes++; return open; };
+  f.deps.installIntoProcess = async () => {
+    if (++calls === 1) throw Object.assign(new Error('Inspector command timeout'),
+      { failureKind: 'inspector-uncertain' });
+    return { loaded: 1 };
+  };
+  const failed = await tick(f.deps);
+  assert.equal(failed.status, 'blocked-inspector');
+  open = true;
+  f.advance(10000);
+  const before = probes;
+  await tick(f.deps);
+  assert.equal(probes, before + 1);
+  f.advance(20000);
+  f.deps.readFile = async () => 'new revision while inspector is occupied';
+  await tick(f.deps);
+  assert.equal(calls, 1);
+  open = false;
+  const active = await tick(f.deps);
+  assert.equal(active.status, 'active');
+  assert.equal(active.attempts, 2);
+  assert.equal(calls, 2);
+});
+
+test('busy ports and preflight IO failures observe the same backoff before any signal', async () => {
+  for (const failure of ['port', 'read']) {
+    const f = tickFixture();
+    const read = f.deps.readFile;
+    f.deps.portOpen = async () => failure === 'port';
+    if (failure === 'read') f.deps.readFile = async () => { throw new Error('temporary IO failure'); };
+    assert.equal((await tick(f.deps)).failureKind, 'transient');
+    f.deps.readFile = read;
+    f.deps.portOpen = async () => false;
+    await tick(f.deps);
+    assert.equal(f.installed(), 0);
+    f.advance(30000);
+    assert.equal((await tick(f.deps)).status, 'active');
+    assert.equal(f.installed(), 1);
+  }
+});
+
+test('an interrupted checking attempt waits for port release before recovery', async () => {
+  const f = tickFixture();
+  await tick(f.deps);
+  const interrupted = { ...f.state(), status: 'checking' };
+  const read = f.deps.readState;
+  f.deps.readState = async () => interrupted;
+  f.deps.portOpen = async () => true;
+  const blocked = await tick(f.deps);
+  assert.equal(blocked.status, 'blocked-inspector');
+  assert.equal(blocked.failureKind, 'inspector-uncertain');
+  assert.equal(f.installed(), 1);
+  f.deps.readState = read;
+  f.deps.portOpen = async () => false;
+  f.advance(29999);
+  assert.deepEqual(await tick(f.deps), blocked);
+  f.advance(1);
+  assert.equal((await tick(f.deps)).status, 'active');
+  assert.equal(f.installed(), 2);
+});
+
+test('legacy errors with an unknown trigger stage migrate to guarded recovery', async () => {
+  const f = tickFixture();
+  f.deps.readState = async () => ({
+    identity: `${INFO.pid}:${INFO.started}:executable-fingerprint`, revision: 'old-loader',
+    pid: INFO.pid, status: 'error', detail: 'old failure',
+    checkedAt: new Date(f.deps.now()).toISOString(),
+  });
+  const blocked = await tick(f.deps);
+  assert.equal(blocked.status, 'blocked-inspector');
+  assert.equal(blocked.attempts, 1);
+  assert.equal(blocked.lastAttemptAt, '2026-10-21T13:58:30.000Z');
+  assert.equal(blocked.nextRetryAt, '2026-10-21T13:59:00.000Z');
+  assert.equal(f.installed(), 0);
+});
+
+test('inspector failures distinguish errors before and after a successful trigger', async () => {
+  let signals = 0;
+  const operations = {
+    verifyLiveProcess: async () => {},
+    portOpen: async () => false,
+    triggerInspector: async () => { signals++; },
+    checkIdentity: async () => { throw new Error('process check failed'); },
+  };
+  await assert.rejects(attachInspector(INFO, {}, { ...operations, triggerInspector: async () => {
+    throw Object.assign(new Error('process already exited'), { code: 'ESRCH' });
+  } }), (error) => error.failureKind === undefined);
+  assert.equal(signals, 0);
+  await assert.rejects(attachInspector(INFO, {}, operations), { failureKind: 'inspector-uncertain' });
+  assert.equal(signals, 1);
+});
+
+test('only a refused local connection confirms that the inspector port is free', async () => {
+  for (const code of ['ECONNREFUSED', 'EACCES', 'ENETUNREACH']) {
+    const open = await portOpen(() => {
+      const socket = new EventEmitter();
+      socket.destroy = () => {};
+      socket.setTimeout = () => {};
+      queueMicrotask(() => socket.emit('error', { code }));
+      return socket;
+    });
+    assert.equal(open, code !== 'ECONNREFUSED');
+  }
+});
+
+test('unchanged active, waiting and failed states keep checkedAt and do not rewrite the state file', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'kct-state-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  for (const status of ['active', 'waiting', 'error']) {
+    const f = tickFixture();
+    const file = join(dir, `${status}.json`);
+    if (status === 'waiting') f.setFound([]);
+    if (status === 'error') f.deps.verifyApp = async () => { throw new Error('temporary failure'); };
+    const save = f.deps.saveState;
+    f.deps.saveState = async (state) => { await save(state); await saveState(state, file); };
+    const first = await tick(f.deps);
+    const before = await stat(file, { bigint: true });
+    const contents = await readFile(file, 'utf8');
+    const saves = f.saves();
+    f.advance(10000);
+    assert.deepEqual(await tick(f.deps), first);
+    assert.equal(f.saves(), saves);
+    const after = await stat(file, { bigint: true });
+    assert.equal(after.ino, before.ino);
+    assert.equal(after.mtimeNs, before.mtimeNs);
+    assert.equal(await readFile(file, 'utf8'), contents);
+  }
 });
 
 test('a file failure during the switch restores the complete old deployment', async (t) => {

@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, join, win32 } from 'node:path';
 import {
@@ -206,6 +206,7 @@ test('one attempt survives absence and multiple processes; a new start or source
   f.sources['runtime-windows.mjs'] += '\nrevision change';
   await tick(f.options);
   assert.equal(f.installs(), 3);
+  assert.equal(f.state().attempts, 2, 'revision changes retain the current process budget');
   assert.notEqual(f.state().revision, firstRevision);
 });
 
@@ -215,16 +216,25 @@ test('signature and hash rejection never reach installation or the trigger', asy
     const { binary, allow } = binaryFixture();
     const known = allow();
     if (reason === 'hash') binary[1000] = 1;
-    f.options.verifyApp = async () => verifyApp({
-      localAppData, fingerprint: async () => 'file',
-      bridge: async () => reason === 'signature' ? { ...SIGNATURE, status: 'NotTrusted' } : SIGNATURE,
-      readFile: async (file) => String(file).endsWith('.json') ? JSON.stringify(known) : binary,
-    });
+    let checks = 0;
+    f.options.verifyApp = async () => {
+      checks++;
+      return verifyApp({
+        localAppData, fingerprint: async () => 'file',
+        bridge: async () => reason === 'signature' ? { ...SIGNATURE, status: 'NotTrusted' } : SIGNATURE,
+        readFile: async (file) => String(file).endsWith('.json') ? JSON.stringify(known) : binary,
+      });
+    };
     const state = await tick(f.options);
     assert.equal(state.status, 'error');
+    assert.equal(state.failureKind, 'permanent');
+    assert.equal(state.nextRetryAt, null);
     assert.match(state.detail, reason === 'signature' ? /Authenticode/ : /Unknown Windows EXE hash/);
     assert.equal(f.installs(), 0);
-    await tick(f.options);
+    f.options.now = () => Date.parse('2026-10-22T03:00:00Z');
+    const later = await tick(f.options);
+    assert.equal(later.status, 'error');
+    assert.equal(checks, 1);
     assert.equal(f.installs(), 0);
   }
 });
@@ -232,8 +242,11 @@ test('signature and hash rejection never reach installation or the trigger', asy
 test('occupied ports remain retryable without recording a signal attempt', async () => {
   const f = tickFixture();
   f.options.portOpen = async () => true;
-  assert.match((await tick(f.options)).detail, /occupied/);
+  const occupied = await tick(f.options);
+  assert.match(occupied.detail, /occupied/);
+  assert.equal(occupied.status, 'error');
   assert.equal(f.installs(), 0);
+  f.options.now = () => Date.parse('2026-10-22T00:00:40Z');
   f.options.portOpen = async () => false;
   assert.equal((await tick(f.options)).status, 'active');
   assert.equal(f.installs(), 1);
@@ -241,7 +254,7 @@ test('occupied ports remain retryable without recording a signal attempt', async
 
 test('the helper uses a bounded separate Node process with an argument-safe PID', async () => {
   let calls = 0;
-  await assert.rejects(triggerInspector(INFO, {
+  const error = await triggerInspector(INFO, {
     platformCheck: () => {},
     timeout: 123,
     execFile: async (command, args, options) => {
@@ -252,29 +265,160 @@ test('the helper uses a bounded separate Node process with an argument-safe PID'
       assert.equal(options.timeout, 123);
       assert.equal(options.windowsHide, true);
       assert.equal(options.env.NODE_OPTIONS, '');
-      const error = new Error('terminated'); error.killed = true; throw error;
+      const failure = new Error('terminated'); failure.killed = true; throw failure;
     },
-  }), /helper timed out/);
+  }).catch((failure) => failure);
+  assert.match(error.message, /helper did not complete/);
+  assert.equal(error.failureKind, 'inspector-uncertain');
   assert.equal(calls, 1);
+  const exited = await triggerInspector(INFO, {
+    platformCheck: () => {},
+    execFile: async () => { const failure = new Error('exited'); failure.code = 1; throw failure; },
+  }).catch((failure) => failure);
+  assert.equal(exited.failureKind, 'inspector-uncertain');
+  await assert.rejects(triggerInspector(INFO, {
+    platformCheck: () => {},
+    execFile: async () => { const failure = new Error('missing'); failure.code = 'ENOENT'; throw failure; },
+  }), { code: 'ENOENT' });
   await assert.rejects(triggerInspector({ pid: '42;bad' }, {
     execFile: async () => { throw new Error('must not execute'); },
   }), /Invalid target PID/);
 });
 
-test('helper timeout and interrupted checking state never trigger a second attempt', async () => {
+test('helper timeout stays blocked until its port is released, then retries after backoff', async () => {
   const f = tickFixture();
   let calls = 0;
   f.options.installIntoProcess = async () => {
     calls++;
-    throw new Error('Windows inspector helper timed out; no automatic retry');
+    if (calls === 1) {
+      return triggerInspector(INFO, {
+        platformCheck: () => {},
+        execFile: async () => { const error = new Error('timeout'); error.killed = true; throw error; },
+      });
+    }
+    return { loaded: 1 };
   };
-  assert.equal((await tick(f.options)).status, 'error');
+  const failed = await tick(f.options);
+  assert.equal(failed.status, 'blocked-inspector');
+  assert.equal(failed.failureKind, 'inspector-uncertain');
+  assert.equal(failed.nextRetryAt, '2026-10-22T00:00:40.000Z');
+  f.options.portOpen = async () => true;
+  f.options.now = () => Date.parse('2026-10-22T03:00:00Z');
   await tick(f.options);
   assert.equal(calls, 1);
+  f.options.portOpen = async () => false;
+  assert.equal((await tick(f.options)).status, 'active');
+  assert.equal(calls, 2);
+});
+
+test('transient failures retry after backoff and preserve the budget across revisions', async () => {
+  const f = tickFixture();
+  let fail = true;
+  const verify = f.options.verifyApp;
+  f.options.verifyApp = async () => {
+    if (fail) throw new Error('transient verification timeout');
+    return verify();
+  };
+  const first = await tick(f.options);
+  assert.equal(first.status, 'error');
+  assert.equal(first.failureKind, 'transient');
+  assert.equal(first.attempts, 1);
+  assert.equal(first.nextRetryAt, '2026-10-22T00:00:40.000Z');
+  await tick(f.options);
+  assert.equal(f.state().attempts, 1, 'backoff must not consume another attempt');
+  f.options.now = () => Date.parse('2026-10-22T00:00:40Z');
+  fail = false;
+  assert.equal((await tick(f.options)).status, 'active');
+  assert.equal(f.state().attempts, 2);
+
+  const g = tickFixture();
+  g.options.installIntoProcess = async () => { throw new Error('still transient'); };
+  for (let i = 0; i < 8; i++) {
+    await tick(g.options);
+    const next = g.state().nextRetryAt;
+    if (next) g.options.now = () => Date.parse(next);
+  }
+  const exhausted = g.state();
+  assert.equal(exhausted.attempts, 8);
+  assert.equal(exhausted.nextRetryAt, null);
+  g.sources['runtime-windows.mjs'] += '\nrevision changed';
+  g.options.now = () => Date.parse('2026-10-30T00:00:00Z');
+  await tick(g.options);
+  assert.equal(g.state().attempts, 8);
+  assert.equal(g.state().status, 'error');
+});
+
+test('a changed PID or start resets attempts without waiting for the old deadline', async () => {
+  for (const changed of [{ ...INFO, pid: 43 }, { ...INFO, started: '2026-10-22T00:00:01Z' }]) {
+    const f = tickFixture();
+    f.options.installIntoProcess = async () => { throw new Error('transient'); };
+    await tick(f.options);
+    f.setFound([changed]);
+    f.options.installIntoProcess = async () => ({ loaded: 1 });
+    const state = await tick(f.options);
+    assert.equal(state.status, 'active');
+    assert.equal(state.attempts, 1);
+  }
+});
+
+test('interrupted checking probes the port before retrying and respects backoff after release', async () => {
+  const f = tickFixture();
+  await tick(f.options);
   const interrupted = { ...f.state(), status: 'checking' };
+  const read = f.options.readState;
   f.options.readState = async () => interrupted;
-  assert.match((await tick(f.options)).detail, /interrupted/);
-  assert.equal(calls, 1);
+  let probes = 0;
+  f.options.portOpen = async () => { probes++; return true; };
+  const blocked = await tick(f.options);
+  assert.equal(blocked.status, 'blocked-inspector');
+  assert.equal(blocked.failureKind, 'inspector-uncertain');
+  assert.equal(probes, 1);
+  assert.equal(f.installs(), 1);
+  f.options.readState = read;
+  f.options.portOpen = async () => false;
+  f.options.now = () => Date.parse('2026-10-22T00:00:39Z');
+  assert.deepEqual(await tick(f.options), blocked);
+  f.options.now = () => Date.parse('2026-10-22T00:00:40Z');
+  assert.equal((await tick(f.options)).status, 'active');
+  assert.equal(f.installs(), 2);
+});
+
+test('preflight file IO failures use backoff before any installation', async () => {
+  const f = tickFixture();
+  const read = f.options.readFile;
+  f.options.readFile = async () => { throw Object.assign(new Error('temporarily locked'), { code: 'EACCES' }); };
+  const failed = await tick(f.options);
+  assert.equal(failed.failureKind, 'transient');
+  assert.equal(failed.attempts, 1);
+  f.options.readFile = read;
+  await tick(f.options);
+  assert.equal(f.installs(), 0);
+  f.options.now = () => Date.parse(failed.nextRetryAt);
+  assert.equal((await tick(f.options)).status, 'active');
+  assert.equal(f.state().attempts, 2);
+  assert.equal(f.installs(), 1);
+});
+
+test('unchanged active, waiting and error states do not rewrite the state file', async (t) => {
+  const root = await temporary(t);
+  for (const status of ['active', 'waiting', 'error']) {
+    const f = tickFixture();
+    f.options.dataDir = join(root, status);
+    delete f.options.saveState;
+    delete f.options.readState;
+    if (status === 'waiting') f.setFound([]);
+    if (status === 'error') f.options.verifyApp = async () => { throw new Error('temporary failure'); };
+    const initial = await tick(f.options);
+    const file = join(f.options.dataDir, 'runtime-state.json');
+    const contents = await readFile(file, 'utf8');
+    const before = await stat(file, { bigint: true });
+    f.options.now = () => Date.parse('2026-10-22T00:00:20Z');
+    assert.deepEqual(await tick(f.options), initial);
+    const after = await stat(file, { bigint: true });
+    assert.equal(after.ino, before.ino);
+    assert.equal(after.mtimeNs, before.mtimeNs);
+    assert.equal(await readFile(file, 'utf8'), contents);
+  }
 });
 
 test('locks exclude other watchers and once operations, then release cleanly', async (t) => {
@@ -330,6 +474,74 @@ test('disable unregisters without killing a watcher that is in the middle of att
   let ticks = 0;
   await watch({ ...options, tick: async () => { ticks++; } });
   assert.equal(ticks, 0, 'a delayed scheduled start cannot re-enable a disabled watcher');
+});
+
+test('watch keeps running after tick, stop-file and enabled.json failures', async (t) => {
+  const dataDir = await temporary(t);
+  const enabled = { entry: join(import.meta.dirname, 'runtime-windows.mjs'), generation: 'generation' };
+  await writeFile(join(dataDir, 'enabled.json'), JSON.stringify(enabled));
+  let now = 0;
+  let stoppedChecks = 0;
+  const errors = [];
+  const sleeps = [];
+  const tickTimes = [];
+  const options = {
+    localAppData, dataDir, now: () => now,
+    sleep: async (ms) => {
+      sleeps.push(ms);
+      now += ms;
+      assert.ok(sleeps.length < 4000, 'watcher must eventually recover');
+    },
+    tick: async () => {
+      tickTimes.push(now);
+      if (tickTimes.length === 1) await writeFile(join(dataDir, 'enabled.json'), 'broken');
+      if (tickTimes.length >= 2 && tickTimes.length <= 4) throw new Error('tick failed');
+      if (tickTimes.length === 5) await writeFile(join(dataDir, 'stop'), '');
+    },
+    logError: (message) => errors.push(message),
+    statFile: async () => {
+      if (++stoppedChecks === 1) throw new Error('stop file unavailable');
+      return stat(join(dataDir, 'stop'));
+    },
+  };
+  const readEnabled = readFile;
+  let failedRead = false;
+  options.readFile = async (file, ...args) => {
+    if (!failedRead && String(file).endsWith('enabled.json')) {
+      failedRead = true;
+      throw Object.assign(new Error('temporarily locked'), { code: 'EACCES' });
+    }
+    return readEnabled(file, ...args);
+  };
+  assert.equal((await watch(options)).status, 'disabled');
+  assert.deepEqual(tickTimes, [150000, 160000, 190000, 310000, 910000]);
+  assert.ok(sleeps.every((ms) => ms === 1000), 'backoff must leave stop checks responsive');
+  assert.ok(errors.some((message) => /tick failed/.test(message)));
+  assert.ok(errors.some((message) => /Watcher iteration failed/.test(message)));
+  assert.ok(errors.some((message) => /temporarily locked/.test(message)));
+  assert.ok(errors.some((message) => /enabled\.json is unreadable/.test(message)));
+  assert.deepEqual(JSON.parse(await readFile(join(dataDir, 'enabled.json'), 'utf8')), enabled);
+  const lock = await acquireLock(dataDir);
+  assert.ok(lock);
+  await lock.release();
+});
+
+test('watch repairs a corrupt enabled.json and continues', async (t) => {
+  const dataDir = await temporary(t);
+  await writeFile(join(dataDir, 'enabled.json'), 'broken');
+  let ticks = 0;
+  const errors = [];
+  const options = {
+    localAppData, dataDir,
+    sleep: async () => {},
+    tick: async () => { ticks++; await writeFile(join(dataDir, 'stop'), ''); },
+    logError: (message) => errors.push(message),
+  };
+  assert.equal((await watch(options)).status, 'disabled');
+  assert.equal(ticks, 1);
+  assert.ok(errors.some((message) => /enabled\.json is unreadable/.test(message)));
+  const repaired = JSON.parse(await readFile(join(dataDir, 'enabled.json'), 'utf8'));
+  assert.equal(repaired.entry, join(import.meta.dirname, 'runtime-windows.mjs'));
 });
 
 test('installation stages and verifies files before task registration; failure restores controls', async (t) => {
@@ -410,14 +622,26 @@ test('a busy lifecycle lock prevents install and disable from racing', async (t)
   await lock.release();
 });
 
-test('state corruption fails closed instead of permitting a repeat signal', async (t) => {
+test('state corruption uses safe defaults and reports a diagnostic', async (t) => {
   const dataDir = await temporary(t);
   await writeFile(join(dataDir, 'runtime-state.json'), 'broken');
-  await assert.rejects(readState({ localAppData, dataDir }), SyntaxError);
+  const errors = [];
+  assert.deepEqual(await readState({ localAppData, dataDir, logError: (message) => errors.push(message) }), {});
+  assert.match(errors[0], /runtime-state\.json is unreadable/);
+  await writeFile(join(dataDir, 'runtime-state.json'), 'null');
+  assert.deepEqual(await readState({ localAppData, dataDir, logError: (message) => errors.push(message) }), {});
+  assert.match(errors[1], /must contain an object/);
   const f = tickFixture();
   delete f.options.readState;
-  await assert.rejects(tick({ ...f.options, dataDir }), SyntaxError);
-  assert.equal(f.installs(), 0);
+  const state = await tick({ ...f.options, dataDir, logError: (message) => errors.push(message) });
+  assert.equal(state.status, 'active');
+  assert.equal(f.installs(), 1);
+  const occupied = tickFixture();
+  delete occupied.options.readState;
+  occupied.options.portOpen = async () => true;
+  assert.equal((await tick({ ...occupied.options, dataDir,
+    logError: (message) => errors.push(message) })).status, 'error');
+  assert.equal(occupied.installs(), 0, 'safe defaults must still check the port before triggering');
 });
 
 test('scheduled tasks are per-user limited and never request forced termination', async () => {
