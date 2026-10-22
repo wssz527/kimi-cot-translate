@@ -14,7 +14,7 @@ shasum -a 256 -c SHA256SUMS.txt
 | --- | --- |
 | `kimi-cot-translate-v0.1.0.zip` | 完整源码 + 预构建产物（桌面端 `node runtime.mjs --install` 入口） |
 | `kct-browser-v0.1.0.zip` | Chromium 浏览器扩展（解压后「加载已解压的扩展程序」） |
-| `kct-copied-thinking-0.1.0.vsix` | VS Code 复制预览（`Extensions: Install from VSIX...`） |
+| `kct-copied-thinking-v0.1.0.vsix` | VS Code 复制预览（`Extensions: Install from VSIX...`） |
 | `SHA256SUMS.txt` | 上述附件的 SHA-256 校验 |
 
 需要 Node.js 24。详细安装步骤见 [README](README.md) / [README.en](README.en.md)。
