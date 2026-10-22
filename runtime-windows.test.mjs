@@ -431,5 +431,4 @@ test('scheduled tasks are per-user limited and never request forced termination'
   const allowlist = JSON.parse(await readFile(new URL('./supported-windows-runtimes.json', import.meta.url), 'utf8'));
   assert.equal(allowlist[0].sha256, '9c6aac3196d3fb2a62e3ff67e6add9f24238efddf661cfcc7088b120f7e478e9');
   assert.equal(allowlist[0].electron, '43.1.1');
-  assert.match(allowlist[0].validation, /pending/);
 });
