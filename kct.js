@@ -45,6 +45,7 @@ let rafPending = 0;
 let cacheTimer = 0;
 let cacheEpoch = 0;
 let setupPrompted = false;
+const requestControllers = new Set();
 
 // ---------------------------------------------------------------------------
 // storage
@@ -124,6 +125,7 @@ function saveCache() {
   if (state.cache.size) {
     const expires = Math.min(...[...state.cache.values()].map((entry) => entry.usedAt)) + CACHE_TTL_MS;
     cacheTimer = setTimeout(saveCache, Math.max(0, expires - Date.now()));
+    cacheTimer.unref?.();
   }
   try {
     localStorage.setItem(CACHE_KEY, JSON.stringify(
@@ -213,6 +215,7 @@ function hashKey(text) {
 
 async function fetchJSON(url, options) {
   const controller = new AbortController();
+  requestControllers.add(controller);
   const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
   try {
     const res = await fetch(url, { ...options, signal: controller.signal });
@@ -223,6 +226,7 @@ async function fetchJSON(url, options) {
     throw error;
   } finally {
     clearTimeout(timer);
+    requestControllers.delete(controller);
   }
 }
 
@@ -1130,7 +1134,7 @@ function isOurs(node) {
   return !!node.closest('[data-kct]');
 }
 
-const observer = new MutationObserver((records) => {
+const observer = typeof document === 'undefined' ? null : new MutationObserver((records) => {
   for (const record of records) {
     const el = record.target instanceof Element ? record.target : record.target.parentElement;
     if (!el) continue;
@@ -1224,10 +1228,16 @@ function boot() {
   window.addEventListener('pagehide', leavePage);
 }
 
-if (document.readyState === 'loading') {
-  document.addEventListener('DOMContentLoaded', boot, { once: true });
+if (typeof document === 'undefined') {
+  module.exports = {
+    state, translateText, isTargetLanguage, TARGET_LANGUAGES, prunePending,
+    cancelRequests: () => { for (const controller of requestControllers) controller.abort(); },
+  };
 } else {
-  boot();
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', boot, { once: true });
+  } else {
+    boot();
+  }
+  window.__kct = { state, mount, openPanel, resetAll, translateText, diagnose };
 }
-
-window.__kct = { state, mount, openPanel, resetAll, translateText, diagnose };

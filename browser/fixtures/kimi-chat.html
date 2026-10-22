@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Kimi - synthetic fixture</title></head>
+<body>
+<main>
+  <p id="normal">Normal assistant answer: never translate this.</p>
+  <textarea id="draft">Private input: never read this.</textarea>
+  <div class="toolcall-container thinking-container is-expanded" id="thinking">
+    <div class="toolcall-title-container is-expandable">Thinking</div>
+    <div class="toolcall-content"><div class="toolcall-content-text"><p>First check the input.</p><p>Then verify the result.</p><span hidden>Hidden private text.</span></div></div>
+  </div>
+  <div class="toolcall-container thinking-container" id="collapsed">
+    <div class="toolcall-title-container">Thinking</div>
+    <div class="toolcall-content"><div class="toolcall-content-text">Collapsed secret.</div></div>
+  </div>
+  <div class="toolcall-container is-expanded">
+    <div class="toolcall-title-container">Ordinary tool result</div>
+    <div class="toolcall-content"><div class="toolcall-content-text">Ordinary tool output: never send.</div></div>
+  </div>
+  <div class="think open">
+    <button class="think-head" aria-expanded="true">Desktop lookalike, not this product</button>
+    <div class="think-body open"><div class="think-body-inner"><pre class="think-text">Wrong product: never send.</pre></div></div>
+  </div>
+</main>
+</body>
+</html>

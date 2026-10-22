@@ -23,6 +23,8 @@ jobs:
       - run: npx playwright install chromium
         if: runner.os != 'Linux'
       - run: npm test
+      - run: npm run test:browser
+      - run: npm run test:vscode
       - run: npm run test:windows
       - run: npm run test:macos
         if: runner.os == 'macOS'

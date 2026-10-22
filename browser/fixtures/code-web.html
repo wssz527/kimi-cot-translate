@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Kimi Code Web - synthetic fixture</title></head>
+<body>
+<main id="app">
+  <p id="normal">Normal answer: never translate this.</p>
+  <textarea id="draft">Private draft: never read this.</textarea>
+  <div class="think open" id="thinking">
+    <button class="think-head" type="button" aria-expanded="true">Thinking</button>
+    <div class="think-body open"><div class="think-body-inner"><pre class="think-text">First check the input.
+
+Then verify the result.</pre></div></div>
+  </div>
+  <div class="think" id="collapsed">
+    <button class="think-head" type="button" aria-expanded="false">Thinking</button>
+    <div class="think-body" inert><div class="think-body-inner"><pre class="think-text">Collapsed secret.</pre></div></div>
+  </div>
+  <pre><code class="think"><button class="think-head" aria-expanded="true">Fake thinking</button><span class="think-body open"><span class="think-body-inner"><pre class="think-text">A code example, never send.</pre></span></span></code></pre>
+</main>
+</body>
+</html>

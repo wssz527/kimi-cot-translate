@@ -1,0 +1,3 @@
+/vendor/
+/*.vsix
+package-lock.json

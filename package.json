@@ -6,14 +6,18 @@
     "node": "24.x"
   },
   "scripts": {
-    "test": "node --test test.cjs runtime-hook.test.mjs",
+    "test": "node --test test.cjs runtime-hook.test.mjs cli.test.mjs cli-acp.test.mjs",
     "test:macos": "node --test runtime.test.mjs",
-    "test:windows": "node --test runtime-windows.test.mjs"
+    "test:windows": "node --test runtime-windows.test.mjs",
+    "test:browser": "node --test --test-timeout=30000 browser/browser.test.mjs",
+    "build:browser": "node browser/build.mjs",
+    "test:vscode": "node --test vscode/test.cjs",
+    "build:vscode": "node vscode/build.cjs"
   },
   "devDependencies": {
     "playwright": "1.63.0"
   },
-  "description": "Embedded translation for visible Kimi Code reasoning, with external runtime loaders.",
+  "description": "Visible thinking translation for Kimi Code desktop, an ACP terminal, and browser previews.",
   "repository": {
     "type": "git",
     "url": "https://github.com/wssz527/kimi-cot-translate.git"
