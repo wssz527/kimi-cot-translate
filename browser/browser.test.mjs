@@ -5,7 +5,9 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
 import { chromium } from 'playwright';
-import { LANGUAGES, settingsKey, translate, validateRequest } from './background.mjs';
+import {
+  LANGUAGES, errorReply, parseRetryAfter, settingsKey, translate, validateRequest,
+} from './background.mjs';
 import './build.mjs';
 
 const root = new URL('./', import.meta.url);
@@ -57,7 +59,15 @@ test('background rejects unsupported senders, endpoints, unconfirmed settings an
   assert.equal((await translate(message, {
     ...sender, documentLifecycle: 'active', tab: { id: 1, url: 'https://www.kimi.com/chat/new-session' },
   }, api, request))[0].translations[0].text, 'Synthetic translation.');
-  await assert.rejects(translate(message, sender, api, async () => ({ ok: false, status: 503 })), /503/);
+  await assert.rejects(translate(message, sender, api, async () => ({
+    ok: false, status: 503, headers: { get: () => null },
+  })), error => error.message.includes('503') && error.status === 503 && error.network === undefined);
+  await assert.rejects(translate(message, sender, api, async () => {
+    throw new TypeError('Failed to fetch');
+  }), { message: /fetch/, network: true });
+  await assert.rejects(translate(message, sender, api, async () => ({
+    ok: true, json: async () => { throw new SyntaxError('Unexpected token'); },
+  })), error => /Unexpected token/.test(error.message) && error.network === undefined);
   await assert.rejects(translate(message, sender, api, async () => ({ ok: true, json: async () => [] })), /response/);
   let receivedSignal;
   const nativeTimeout = AbortSignal.timeout;
@@ -72,6 +82,54 @@ test('background rejects unsupported senders, endpoints, unconfirmed settings an
   }), { name: 'TimeoutError' });
   AbortSignal.timeout = nativeTimeout;
   assert.equal(receivedSignal.aborted, true);
+});
+
+test('background preserves HTTP status and parses Retry-After seconds or HTTP-date', async () => {
+  const sender = { id: 'test', tab: { id: 1, url: chatURL }, frameId: 0, url: chatURL };
+  const message = { kind: 'kct.bing', lang: 'zh-Hans', texts: ['First check the input.'] };
+  const api = {
+    runtime: { id: 'test' },
+    storage: { local: { get: async key => ({ [key]: { language: 'zh', consent: true } }) } },
+  };
+  for (const [header, expected] of [['60', 60000], [new Date(Date.now() + 60000).toUTCString(), 59000]]) {
+    await assert.rejects(translate(message, sender, api, async () => ({
+      ok: false,
+      status: 429,
+      headers: { get: name => name === 'retry-after' ? header : null },
+    })), error => error.status === 429 && Math.abs(error.retryAfterMs - expected) < 2000);
+  }
+  const now = Date.parse('2026-10-22T00:00:00Z');
+  assert.equal(parseRetryAfter('60', now), 60000);
+  assert.equal(parseRetryAfter('Thu, 22 Oct 2026 00:01:00 GMT', now), 60000);
+  assert.equal(parseRetryAfter('not-a-date', now), undefined);
+  assert.deepEqual(errorReply(Object.assign(new Error('HTTP 429'), { status: 429, retryAfterMs: 60000 })),
+    { ok: false, error: 'HTTP 429', status: 429, retryAfterMs: 60000 });
+  assert.equal(errorReply(new Error('Invalid translation response')).network, undefined);
+});
+
+test('generated bridge rebuilds structured errors and marks transport failures', async () => {
+  const core = await readFile(new URL('dist/core.js', root), 'utf8');
+  const start = core.indexOf('  const fetch = async (url, options) => {');
+  const reply = error => ({ ok: false, error: error.message, ...error });
+  const needle = '    return { ok: true, json: async () => reply.payload };';
+  const end = core.indexOf(needle, start) + needle.length + 4;
+  const bridge = sendMessage => new Function('chrome', `return (${core.slice(
+    core.indexOf('async (url, options) =>', start),
+    end,
+  )});`)({ runtime: { sendMessage } });
+  const options = { method: 'POST', body: '["hello"]' };
+  const url = 'https://edge.microsoft.com/translate/translatetext?to=zh-Hans';
+  for (const failure of [
+    reply(Object.assign(new Error('Translation HTTP 429'), { status: 429, retryAfterMs: 60000 })),
+    reply(Object.assign(new Error('Invalid translation response'), {})),
+  ]) {
+    const call = bridge(async () => failure);
+    await assert.rejects(call(url, options), error => error.message === failure.error &&
+      error.status === failure.status && error.retryAfterMs === failure.retryAfterMs &&
+      error.network === failure.network);
+  }
+  await assert.rejects(bridge(async () => { throw new TypeError('Message port closed'); })(url, options),
+    { message: /Message port closed/, network: true });
 });
 
 async function fixture(t, {
@@ -142,7 +200,17 @@ async function fixture(t, {
       window.originalMarkup = window.originalSource.innerHTML;
     }, source);
   }
-  for (const content of scripts) await page.addScriptTag({ content });
+  for (const [index, content] of scripts.entries()) {
+    await page.addScriptTag({ content });
+    if (index === 0) await page.evaluate(() => {
+      const original = KCTBrowserCore.translateText;
+      window.translateArgs = [];
+      KCTBrowserCore.translateText = (...args) => {
+        window.translateArgs.push({ retryFailed: args[5] });
+        return original(...args);
+      };
+    });
+  }
   const ui = page.locator('#thinking [data-kct-browser]');
   const tick = async (ms = 850) => {
     await page.clock.runFor(ms);
@@ -340,8 +408,7 @@ for (const chat of [false, true]) {
     assert.equal(await f.page.evaluate(() => window.originalSource.innerHTML === window.originalMarkup), true);
     await f.ui.getByRole('button', { name: '翻译本段', exact: true }).click();
     await f.page.waitForFunction(() => window.requests.length === 2);
-    await f.tick();
-    assert.match(await f.ui.getByRole('status').textContent(), /503/);
+    await f.ui.getByRole('status').filter({ hasText: '503' }).waitFor();
     await f.page.evaluate(() => { window.fail = false; });
     await f.ui.getByRole('button', { name: '翻译本段', exact: true }).click();
     await f.ui.locator('output').waitFor({ state: 'visible' });

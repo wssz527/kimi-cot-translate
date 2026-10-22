@@ -145,7 +145,7 @@
       if (ctx.result) {
         ctx.output.hidden = !ctx.output.hidden;
         ctx.button.textContent = ctx.output.hidden ? '显示译文' : '收起译文';
-      } else void run(ctx);
+      } else void run(ctx, true);
     });
     return ctx;
   }
@@ -162,7 +162,7 @@
     ctx.button.textContent = '翻译本段';
   }
 
-  async function run(ctx) {
+  async function run(ctx, retryFailed = false) {
     if (!accepted() || ctx.running || locate(ctx.block) !== ctx.source || !visible(ctx.source)) return;
     const source = sourceOf(ctx);
     if (!source.trim()) return;
@@ -182,7 +182,9 @@
     ctx.running = true;
     ctx.status.textContent = '翻译中…';
     try {
-      const result = await core.translateText(source, language, () => {}, { provider: 'bing' }, valid);
+      const result = await core.translateText(
+        source, language, () => {}, { provider: 'bing' }, valid, retryFailed,
+      );
       if (!valid()) return;
       ctx.last = source;
       if (result === source) {

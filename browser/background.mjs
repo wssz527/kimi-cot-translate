@@ -17,6 +17,22 @@ export function validateRequest(message) {
   }
 }
 
+export function parseRetryAfter(value, now = Date.now()) {
+  const text = value?.trim();
+  if (!text) return undefined;
+  if (/^\d+$/.test(text)) return Number(text) * 1000;
+  const date = Date.parse(text);
+  return Number.isNaN(date) ? undefined : Math.max(0, date - now);
+}
+
+export function errorReply(error) {
+  const reply = { ok: false, error: error?.message || 'Translation failed' };
+  for (const field of ['status', 'retryAfterMs', 'network']) {
+    if (error?.[field] !== undefined) reply[field] = error[field];
+  }
+  return reply;
+}
+
 export async function translate(message, sender, api = chrome, request = fetch) {
   if (sender.id !== api.runtime.id || !sender.tab || sender.frameId !== 0) {
     throw new Error('Unsupported sender');
@@ -36,15 +52,29 @@ export async function translate(message, sender, api = chrome, request = fetch) 
   const url = new URL('https://edge.microsoft.com/translate/translatetext');
   url.searchParams.set('to', message.lang);
   url.searchParams.set('isEnterpriseClient', 'false');
-  const response = await request(url.href, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(message.texts),
-    credentials: 'omit',
-    redirect: 'error',
-    signal: AbortSignal.timeout(15000),
-  });
-  if (!response.ok) throw new Error(`Translation HTTP ${response.status}`);
+  let response;
+  try {
+    response = await request(url.href, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(message.texts),
+      credentials: 'omit',
+      redirect: 'error',
+      signal: AbortSignal.timeout(15000),
+    });
+  } catch (cause) {
+    const error = cause instanceof Error ? cause : new Error(String(cause));
+    error.network = true;
+    throw error;
+  }
+  if (!response.ok) {
+    const error = new Error(`Translation HTTP ${response.status}`);
+    error.status = response.status;
+    const retryAfterMs = parseRetryAfter(response.headers?.get?.('retry-after'));
+    if (response.status === 429) error.retryAfterMs = retryAfterMs ?? 60000;
+    else if (retryAfterMs !== undefined) error.retryAfterMs = retryAfterMs;
+    throw error;
+  }
   const payload = await response.json();
   if (!Array.isArray(payload) || payload.length !== message.texts.length ||
       payload.some(item => typeof item?.translations?.[0]?.text !== 'string' ||
@@ -59,7 +89,7 @@ if (globalThis.chrome?.runtime?.onMessage) {
     if (message?.kind !== 'kct.bing') return false;
     translate(message, sender).then(
       payload => respond({ ok: true, payload }),
-      error => respond({ ok: false, error: error.message }),
+      error => respond(errorReply(error)),
     );
     return true;
   });

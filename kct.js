@@ -14,6 +14,7 @@ const CONCURRENCY = 3;
 const STREAM_DEBOUNCE_MS = 700;
 const REQUEST_TIMEOUT_MS = 15000;
 const BATCH_CHARS = 4000;
+const FAILURE_TTL_MS = 30000;
 const TARGET_LANGUAGES = ['zh', 'en', 'ja', 'ko', 'es', 'fr', 'de', 'ru'];
 
 const DEFAULTS = {
@@ -24,6 +25,7 @@ const DEFAULTS = {
   customEndpoint: '',
   customModel: '',
   customKey: '',
+  customKeyPending: false,
 };
 
 const THINK = '.think';
@@ -34,6 +36,8 @@ const state = {
   settings: { ...DEFAULTS },
   cache: new Map(),
   inFlight: new Map(),
+  failures: new Map(),
+  cooldowns: new Map(),
   queue: [],
   active: 0,
   stylesInjected: false,
@@ -43,6 +47,7 @@ const ctxs = new WeakMap();
 const scheduled = new Set();
 let rafPending = 0;
 let cacheTimer = 0;
+let queueTimer = 0;
 let cacheEpoch = 0;
 let setupPrompted = false;
 const requestControllers = new Set();
@@ -218,12 +223,29 @@ async function fetchJSON(url, options) {
   requestControllers.add(controller);
   const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
   try {
-    const res = await fetch(url, { ...options, signal: controller.signal });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    return await res.json();
-  } catch (error) {
-    if (controller.signal.aborted) throw new Error('请求超时，请重试');
-    throw error;
+    const res = await fetch(url, { ...options, signal: controller.signal }).catch((error) => {
+      if (controller.signal.aborted) {
+        throw Object.assign(new Error('请求超时，请重试'), { network: true });
+      }
+      if (error.status === undefined && error.network === undefined) error.network = true;
+      throw error;
+    });
+    if (!res.ok) {
+      const retryAfter = res.headers?.get('retry-after');
+      const seconds = retryAfter?.trim() ? Number(retryAfter) : NaN;
+      const retryAfterMs = retryAfter
+        ? Math.max(0, Number.isFinite(seconds) ? seconds * 1000 : Date.parse(retryAfter) - Date.now())
+        : NaN;
+      throw Object.assign(new Error(`HTTP ${res.status}`), {
+        status: res.status, retryAfterMs: Number.isFinite(retryAfterMs) ? retryAfterMs : res.status === 429 ? 60000 : 0,
+      });
+    }
+    try {
+      return await res.json();
+    } catch (error) {
+      if (controller.signal.aborted) throw Object.assign(new Error('请求超时，请重试'), { network: true });
+      throw error;
+    }
   } finally {
     clearTimeout(timer);
     requestControllers.delete(controller);
@@ -267,9 +289,19 @@ async function translateBing(texts, lang) {
   });
 }
 
-async function translateCustom(text, lang, settings) {
-  const endpoint = settings.customEndpoint.trim();
+function customEndpointURL(endpoint) {
   if (!endpoint) throw new Error('custom endpoint not configured');
+  let url;
+  try { url = new URL(endpoint); } catch (_) { throw new Error('自定义端点地址无效'); }
+  const local = ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname);
+  if (url.protocol !== 'https:' && !(url.protocol === 'http:' && local)) {
+    throw new Error('远程自定义端点必须使用 HTTPS；仅本机地址允许 HTTP');
+  }
+  return url;
+}
+
+async function translateCustom(text, lang, settings) {
+  const endpoint = customEndpointURL(settings.customEndpoint.trim()).href;
   const headers = { 'content-type': 'application/json' };
   if (settings.customKey) headers.authorization = `Bearer ${settings.customKey}`;
   const payload = await fetchJSON(endpoint, {
@@ -289,6 +321,7 @@ async function translateCustom(text, lang, settings) {
       temperature: 0,
     }),
     credentials: 'omit',
+    redirect: 'error',
   });
   const content = payload && payload.choices && payload.choices[0] && payload.choices[0].message
     ? payload.choices[0].message.content
@@ -304,15 +337,40 @@ const PROVIDERS = { google: translateGoogle, bing: translateBing, custom: transl
 // ---------------------------------------------------------------------------
 
 function pump() {
+  clearTimeout(queueTimer);
+  queueTimer = 0;
   while (state.active < CONCURRENCY && state.queue.length > 0) {
-    const job = state.queue.shift();
+    const readyAt = (job) => Math.max(job.readyAt, state.cooldowns.get(job.provider) || 0);
+    const index = state.queue.findIndex((job) => readyAt(job) <= Date.now());
+    if (index < 0) {
+      queueTimer = setTimeout(pump, Math.min(2147483647,
+        Math.max(0, Math.min(...state.queue.map(readyAt)) - Date.now())));
+      return;
+    }
+    const [job] = state.queue.splice(index, 1);
     state.active += 1;
     void translateBatch(job)
-      .catch((error) => job.batch.forEach((item) => finishItem(item, error)))
-      .finally(() => {
-        for (const item of job.batch) {
-          if (state.inFlight.get(item.key) === item) state.inFlight.delete(item.key);
+      .catch((error) => {
+        if (error.status === 429) {
+          state.cooldowns.set(job.provider, Math.max(state.cooldowns.get(job.provider) || 0,
+            Date.now() + (Number.isFinite(error.retryAfterMs) ? Math.max(0, error.retryAfterMs) : 60000)));
         }
+        if (!job.batch.some(pruneConsumers)) return;
+        if (error.status === 429) {
+          state.queue.push(job);
+        } else if ((error.network || (error.status >= 500 && error.status < 600)) && job.retries < 2) {
+          job.readyAt = Date.now() + 1000 * 2 ** job.retries * (0.8 + Math.random() * 0.4);
+          job.retries += 1;
+          state.queue.push(job);
+        } else {
+          for (const item of job.batch) {
+            if (!pruneConsumers(item)) continue;
+            state.failures.set(item.key, { error, failedAt: Date.now() });
+            finishItem(item, error);
+          }
+        }
+      })
+      .finally(() => {
         state.active -= 1;
         pump();
       });
@@ -320,7 +378,7 @@ function pump() {
 }
 
 function enqueue(batch, provider, lang, settings) {
-  state.queue.push({ batch, provider, lang, settings });
+  state.queue.push({ batch, provider, lang, settings, readyAt: 0, retries: 0 });
   pump();
 }
 
@@ -346,6 +404,7 @@ function finishItem(item, error, text) {
 function prunePending() {
   for (const item of state.inFlight.values()) pruneConsumers(item);
   state.queue = state.queue.filter((job) => job.batch.some((item) => item.consumers.size));
+  pump();
 }
 
 async function translateBatch({ batch, provider, lang, settings }) {
@@ -417,9 +476,10 @@ function translationPieces(source, lang) {
   });
 }
 
-async function translateText(source, lang, onProgress = () => {}, settings = { ...state.settings }, valid = () => true) {
+async function translateText(source, lang, onProgress = () => {}, settings = { ...state.settings }, valid = () => true, retryFailed = false) {
   const provider = settings.provider;
   if (!PROVIDERS[provider]) throw new Error('未知翻译服务');
+  if (provider === 'custom' && settings.customKeyPending) throw new Error('请先确认新端点的密钥');
   const scope = provider === 'custom' ? `${settings.customEndpoint}\u0000${settings.customModel}` : '';
   const prefix = hashKey(`${provider}\u0000${lang}\u0000${scope ? scope + '\u0000' : ''}`);
   const pieces = translationPieces(source, lang);
@@ -430,11 +490,17 @@ async function translateText(source, lang, onProgress = () => {}, settings = { .
   const total = pieces.filter(({ skip }) => !skip).length;
 
   pruneCache();
+  for (const [key, failure] of state.failures) {
+    if (Date.now() - failure.failedAt >= FAILURE_TTL_MS) state.failures.delete(key);
+  }
   for (const [index, { text, skip }] of pieces.entries()) {
     if (skip) continue;
     const key = `${prefix}:${hashKey(text)}`;
+    if (retryFailed) state.failures.delete(key);
     let promise;
-    if (state.cache.has(key)) {
+    if (state.failures.has(key)) {
+      promise = Promise.reject(state.failures.get(key).error);
+    } else if (state.cache.has(key)) {
       const hit = state.cache.get(key);
       hit.usedAt = Date.now();
       state.cache.delete(key);
@@ -573,7 +639,7 @@ function mount(think) {
     skipped: false,
     translatedPrefix: '',
     translatedSource: '',
-    failedSource: '',
+    retryFailed: false,
   };
   ctx.sourceNode = ctx.pickedSource;
   ctxs.set(think, ctx);
@@ -591,14 +657,14 @@ function mount(think) {
     // Not translated yet — treat the click as a manual "translate now".
     if (ctx.running) return;
     ctx.requested = true;
-    ctx.failedSource = '';
+    ctx.retryFailed = true;
     schedule(ctx);
   });
 
   status.addEventListener('click', () => {
     if (status.dataset.state !== 'error') return;
     ctx.requested = true;
-    ctx.failedSource = '';
+    ctx.retryFailed = true;
     schedule(ctx);
   });
 
@@ -711,7 +777,6 @@ async function maybeRun(ctx) {
     ctx.rendered = false;
     ctx.skipped = false;
     ctx.translatedSource = '';
-    ctx.failedSource = '';
     setView(ctx, 'original');
   }
   if (!ctx.bar.isConnected) ctx.think.querySelector(HEAD)?.after(ctx.bar);
@@ -746,10 +811,15 @@ async function maybeRun(ctx) {
     return;
   }
   if (!state.settings.autoTranslate && !ctx.requested) return;
+  if (state.settings.provider === 'custom' && state.settings.customKeyPending) {
+    ctx.status.dataset.state = 'error';
+    ctx.status.textContent = '请确认新端点密钥';
+    ctx.status.disabled = true;
+    return;
+  }
 
   if (source.trim() === '') return;
   if (source === ctx.source && ctx.done) return;
-  if (source === ctx.failedSource) return;
 
   if (isStreaming(ctx.think)) {
     if (!ctx.timer) ctx.timer = window.setTimeout(() => {
@@ -797,7 +867,8 @@ async function run(ctx) {
   const valid = () => ctx.generation === generation && ctx.think.isConnected &&
     body.isConnected && isOpen(ctx.think) && location.href === url && readSource(ctx).startsWith(source);
   ctx.running = true;
-  ctx.failedSource = '';
+  const retryFailed = ctx.retryFailed;
+  ctx.retryFailed = false;
   ctx.lastError = '';
   ctx.status.dataset.state = 'loading';
   ctx.status.textContent = '翻译中…';
@@ -812,7 +883,7 @@ async function run(ctx) {
       ctx.translatedSource = source;
       render(ctx, text + current.slice(source.length));
       ctx.status.textContent = `翻译中 ${done}/${total}`;
-    }, { ...state.settings }, valid);
+    }, { ...state.settings }, valid, retryFailed);
     if (!valid() || !readSource(ctx).startsWith(source)) return;
     const current = readSource(ctx);
     ctx.translatedPrefix = translated;
@@ -826,7 +897,6 @@ async function run(ctx) {
     ctx.lastError = '';
   } catch (error) {
     if (!valid()) return;
-    ctx.failedSource = fullSource;
     ctx.lastError = String((error && error.message) || error);
     ctx.status.dataset.state = 'error';
     ctx.status.textContent = '重试';
@@ -983,7 +1053,27 @@ function openPanel(event) {
     endpoint.placeholder = 'https://…/v1/chat/completions';
     endpoint.value = state.settings.customEndpoint;
     endpoint.addEventListener('change', () => {
-      state.settings.customEndpoint = endpoint.value.trim();
+      const value = endpoint.value.trim();
+      let next;
+      try {
+        next = customEndpointURL(value);
+      } catch (error) {
+        endpoint.setCustomValidity(error.message);
+        endpoint.reportValidity();
+        endpointError.textContent = error.message;
+        return;
+      }
+      endpoint.setCustomValidity('');
+      let previousOrigin = '';
+      try { previousOrigin = new URL(state.settings.customEndpoint).origin; } catch (_) { /* unset */ }
+      if (next.origin !== previousOrigin) {
+        state.settings.customKey = '';
+        key.value = '';
+        state.settings.customKeyPending = true;
+      }
+      state.settings.customEndpoint = value;
+      confirmKey.hidden = !state.settings.customKeyPending;
+      endpointError.textContent = state.settings.customKeyPending ? '请确认新端点的密钥；无密钥可留空确认。' : '';
       saveSettings();
       resetAll();
     });
@@ -1003,12 +1093,33 @@ function openPanel(event) {
     key.type = 'password';
     key.placeholder = 'API key（可选）';
     key.value = state.settings.customKey;
-    key.addEventListener('change', () => {
+    const saveKey = () => {
+      if (!endpoint.checkValidity()) {
+        endpoint.reportValidity();
+        return;
+      }
       state.settings.customKey = key.value.trim();
+      state.settings.customKeyPending = false;
+      confirmKey.hidden = true;
+      endpointError.textContent = '';
       saveSettings();
       resetAll();
+    };
+    key.addEventListener('change', () => {
+      if (!state.settings.customKeyPending) saveKey();
     });
     panel.appendChild(row('密钥', key));
+    const confirmKey = document.createElement('button');
+    confirmKey.type = 'button';
+    confirmKey.className = `${NS}-btn`;
+    confirmKey.textContent = '确认密钥';
+    confirmKey.hidden = !state.settings.customKeyPending;
+    confirmKey.addEventListener('click', saveKey);
+    panel.appendChild(confirmKey);
+    const endpointError = document.createElement('div');
+    endpointError.setAttribute('role', 'alert');
+    endpointError.textContent = state.settings.customKeyPending ? '请确认新端点的密钥；无密钥可留空确认。' : '';
+    panel.appendChild(endpointError);
   }
 
   const clear = document.createElement('button');
@@ -1108,7 +1219,7 @@ function resetAll() {
     ctx.done = false;
     ctx.requested = false;
     ctx.source = '';
-    ctx.failedSource = '';
+    ctx.retryFailed = false;
     ctx.rendered = false;
     ctx.skipped = false;
     ctx.translatedSource = '';

@@ -149,7 +149,8 @@ test('cancel, duplicate clicks and disposal cannot display stale translations', 
 test('provider failures expose no original text or endpoint and permit retry', async () => {
   const messages = [];
   let fail = true;
-  const engine = fakeEngine(async () => {
+  const engine = fakeEngine(async (source, target, progress, settings, valid, retryFailed) => {
+    assert.equal(retryFailed, true, 'an explicit translation clears the shared failure cache');
     if (fail) throw new Error('secret thought and provider internals');
     return 'retry result';
   });

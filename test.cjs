@@ -60,7 +60,7 @@ async function fixture(t, { texts = ['First paragraph.\n\nSecond paragraph.'], m
       const wait = typeof delay === 'function' ? delay(requests.length) : delay;
       if (wait) await new Promise((resolve) => setTimeout(resolve, wait));
       await route.fulfill({
-        status: shouldFail ? 503 : 200,
+        status: shouldFail ? (typeof shouldFail === 'number' ? shouldFail : 503) : 200,
         contentType: 'application/json',
         body: JSON.stringify(text.map((value) => ({ translations: [{ text: `${lang}:${value}` }] }))),
       });
@@ -364,7 +364,7 @@ test('stream ending at a paragraph boundary settles without another request', as
 });
 
 test('failures wait for explicit retry; no mutation-triggered retry storm', async (t) => {
-  const f = await fixture(t, { fail: true });
+  const f = await fixture(t, { fail: 400 });
   await f.open();
   await f.page.getByRole('button', { name: '重试', exact: true }).waitFor();
   await f.page.evaluate(() => document.querySelector('.think').classList.add('unrelated'));
@@ -375,6 +375,187 @@ test('failures wait for explicit retry; no mutation-triggered retry storm', asyn
   await f.page.getByRole('button', { name: '重试', exact: true }).click();
   await f.done();
   assert.equal(f.requests.length, 2);
+});
+
+async function mockFailures(page, mode, retryAfter = null) {
+  await page.evaluate(({ mode, retryAfter }) => {
+    window.translationCalls = [];
+    window.responseMode = mode;
+    Math.random = () => 0.5;
+    window.fetch = async (url, options) => {
+      const host = new URL(url).hostname;
+      const texts = host === 'translate.googleapis.com'
+        ? [new URLSearchParams(options.body).get('q')] : JSON.parse(options.body);
+      window.translationCalls.push({ texts, time: Date.now(), host });
+      if (window.responseMode === 'network') throw new TypeError('Failed to fetch');
+      if (window.responseMode === 'json') return new Response('{');
+      if (window.responseMode === 'shape') return new Response('[]');
+      if (window.responseMode !== 'ok') return new Response('', {
+        status: Number(window.responseMode),
+        headers: retryAfter === null ? {} : { 'retry-after': retryAfter },
+      });
+      return new Response(JSON.stringify(host === 'translate.googleapis.com'
+        ? [texts.map(text => [`译:${text}`])]
+        : texts.map(text => ({ translations: [{ text: `译:${text}` }] }))));
+    };
+  }, { mode, retryAfter });
+}
+
+test('429 pauses only its provider, honors seconds and HTTP-date, and resumes queued batches', async (t) => {
+  for (const retryAfter of ['60', 'Thu, 22 Oct 2026 00:01:00 GMT', 'invalid', null]) {
+    await t.test(String(retryAfter), async (t) => {
+      const source = Array.from({ length: 80 }, (_, i) => `Limited paragraph ${i}.`).join('\n\n');
+      const f = await fixture(t, { texts: [source], clock: '2026-10-22T00:00:00Z' });
+      await mockFailures(f.page, '429', retryAfter);
+      await f.page.clock.pauseAt(new Date('2026-10-22T00:00:01Z'));
+      await f.open();
+      await f.page.clock.runFor(16);
+      await f.page.waitForFunction(() => window.__kct.state.cooldowns.size === 1 && window.__kct.state.active === 0);
+      const initial = await f.page.evaluate(() => window.translationCalls.length);
+      assert.equal(initial, 3, 'only the requests already in flight may reach the limited provider');
+      assert.equal(await f.page.evaluate(() => window.__kct.state.queue.length), 10);
+      await f.page.evaluate(() => {
+        window.responseMode = 'ok';
+        window.googleResult = window.__kct.translateText('Other provider.', 'zh', () => {}, { provider: 'google' });
+      });
+      assert.equal(await f.page.evaluate(() => window.googleResult), '译:Other provider.');
+      assert.equal(await f.page.evaluate(() => window.translationCalls.length), initial + 1,
+        'a different provider must remain usable during cooldown');
+      const { deadline, now, first } = await f.page.evaluate(() => ({
+        deadline: window.__kct.state.cooldowns.get('bing'), now: Date.now(), first: window.translationCalls[0].time,
+      }));
+      assert.equal(deadline, retryAfter?.includes('GMT') ? Date.parse(retryAfter) : first + 60000);
+      await f.page.clock.runFor(deadline - now - 1);
+      assert.equal(await f.page.evaluate(() => window.translationCalls.length), initial + 1);
+      await f.page.clock.runFor(1);
+      await f.done();
+      const calls = await f.page.evaluate(() => window.translationCalls.filter(call => call.host === 'edge.microsoft.com'));
+      assert.equal(calls.length, 13);
+      assert(calls.slice(initial).every(call => call.time >= deadline));
+      assert.deepEqual(f.errors, []);
+    });
+  }
+});
+
+test('5xx and network failures back off with bounded jitter, stop after two retries, and release concurrency', async (t) => {
+  for (const [mode, random, delay] of [['503', 0, 800], ['network', 0.5, 1000], ['503', 1, 1200]]) {
+    await t.test(`${mode}, jitter ${random}`, async (t) => {
+      const f = await fixture(t, { texts: ['Retry source.'], clock: '2026-10-22T00:00:00Z' });
+      await mockFailures(f.page, mode);
+      await f.page.evaluate(random => { Math.random = () => random; }, random);
+      await f.page.clock.pauseAt(new Date('2026-10-22T00:00:01Z'));
+      await f.open();
+      await f.page.clock.runFor(16);
+      await f.page.waitForFunction(() => window.__kct.state.queue.length === 1 && window.__kct.state.active === 0);
+      const remaining = await f.page.evaluate(() => window.__kct.state.queue[0].readyAt - Date.now());
+      await f.page.clock.runFor(remaining - 1);
+      assert.equal(await f.page.evaluate(() => window.translationCalls.length), 1);
+      await f.page.clock.runFor(1);
+      assert.equal(await f.page.evaluate(() => window.translationCalls.length), 2);
+      await f.page.clock.runFor(delay * 2 - 1);
+      assert.equal(await f.page.evaluate(() => window.translationCalls.length), 2);
+      await f.page.clock.runFor(1);
+      await f.page.getByRole('button', { name: '重试', exact: true }).waitFor();
+      await f.page.clock.runFor(10000);
+      const calls = await f.page.evaluate(() => window.translationCalls);
+      assert.equal(calls.length, 3);
+      assert.deepEqual(calls.slice(1).map((call, i) => call.time - calls[i].time), [delay, delay * 2]);
+      assert.deepEqual(await f.page.evaluate(() => ({
+        active: window.__kct.state.active, queued: window.__kct.state.queue.length,
+      })), { active: 0, queued: 0 });
+      assert.deepEqual(f.errors, []);
+    });
+  }
+});
+
+test('a transient retry succeeds without poisoning the failure cache', async (t) => {
+  const f = await fixture(t, { clock: '2026-10-22T00:00:00Z' });
+  await mockFailures(f.page, '503');
+  await f.page.clock.pauseAt(new Date('2026-10-22T00:00:01Z'));
+  await f.open();
+  await f.page.clock.runFor(16);
+  const remaining = await f.page.evaluate(() => {
+    window.responseMode = 'ok';
+    return window.__kct.state.queue[0].readyAt - Date.now();
+  });
+  await f.page.clock.runFor(remaining);
+  await f.done();
+  assert.equal(await f.page.evaluate(() => window.translationCalls.length), 2);
+  assert.equal(await f.page.evaluate(() => window.__kct.state.failures.size), 0);
+  assert.deepEqual(f.errors, []);
+});
+
+test('collapsing a block cancels delayed retries and provider cooldown work', async (t) => {
+  for (const mode of ['503', '429']) {
+    await t.test(mode, async (t) => {
+      const f = await fixture(t, { clock: '2026-10-22T00:00:00Z' });
+      await mockFailures(f.page, mode, '60');
+      await f.page.clock.pauseAt(new Date('2026-10-22T00:00:01Z'));
+      await f.open();
+      await f.page.clock.runFor(16);
+      assert.equal(await f.page.evaluate(() => window.__kct.state.queue.length), 1);
+      await f.open();
+      await f.page.clock.runFor(60000);
+      assert.equal(await f.page.evaluate(() => window.translationCalls.length), 1);
+      assert.deepEqual(await f.page.evaluate(() => ({
+        queued: window.__kct.state.queue.length, pending: window.__kct.state.inFlight.size,
+        failures: window.__kct.state.failures.size,
+      })), { queued: 0, pending: 0, failures: 0 });
+      assert.deepEqual(f.errors, []);
+    });
+  }
+});
+
+test('4xx, JSON parsing and shape failures are structured where applicable and never auto-retry', async (t) => {
+  for (const mode of ['401', 'json', 'shape']) {
+    await t.test(mode, async (t) => {
+      const f = await fixture(t, { manual: true, clock: '2026-10-22T00:00:00Z' });
+      await mockFailures(f.page, mode, '5');
+      const error = await f.page.evaluate(async () => {
+        try { await window.__kct.translateText('Rejected source.', 'zh'); } catch (error) {
+          return { status: error.status, retryAfterMs: error.retryAfterMs };
+        }
+      });
+      if (mode === '401') assert.deepEqual(error, { status: 401, retryAfterMs: 5000 });
+      await f.page.clock.runFor(10000);
+      assert.equal(await f.page.evaluate(() => window.translationCalls.length), 1);
+    });
+  }
+});
+
+test('streaming failures are cached by completed fragment for 30 seconds; manual retry clears only those fragments', async (t) => {
+  const f = await fixture(t, {
+    texts: ['Failed completed paragraph.\n\nGrowing'], streaming: true, clock: '2026-10-22T00:00:00Z',
+  });
+  await mockFailures(f.page, '400');
+  await f.open();
+  await f.page.clock.runFor(800);
+  await f.page.getByRole('button', { name: '重试', exact: true }).waitFor();
+  for (let i = 0; i < 6; i++) {
+    await f.page.evaluate(() => { document.querySelector('.think-text').textContent += ' tail'; });
+    await f.page.clock.runFor(800);
+  }
+  assert.equal(await f.page.evaluate(() => window.translationCalls.length), 1);
+  await f.page.evaluate(() => {
+    document.querySelector('.think-text').textContent += '\n\nNew completed paragraph.\n\nTail';
+  });
+  await f.page.clock.runFor(800);
+  const calls = await f.page.evaluate(() => window.translationCalls);
+  assert.equal(calls.length, 2);
+  assert(calls[1].texts.every(text => text !== 'Failed completed paragraph.'));
+  await f.page.clock.runFor(30000);
+  await f.page.evaluate(() => { document.querySelector('.think-text').textContent += ' after expiry'; });
+  await f.page.clock.runFor(800);
+  assert.equal(await f.page.evaluate(() => window.translationCalls.length), 3);
+  await f.page.evaluate(() => {
+    window.responseMode = 'ok';
+    document.querySelector('.think').classList.remove('streaming');
+  });
+  await f.page.clock.runFor(100);
+  await f.page.getByRole('button', { name: '重试', exact: true }).click();
+  await f.done();
+  assert.equal(await f.page.evaluate(() => window.translationCalls.length), 5);
+  assert.deepEqual(f.errors, []);
 });
 
 test('hard limits preserve unbroken text and surrogate pairs', async (t) => {
@@ -535,6 +716,117 @@ test('custom model and endpoint changes do not reuse another service cache', asy
   });
   assert.deepEqual(out, ['one:/first', 'two:/first', 'two:/second', 'two:/second']);
   assert.equal(requests.length, 3);
+});
+
+test('changing a custom endpoint origin clears the old key and pauses automatic translation until confirmation', async (t) => {
+  const f = await fixture(t, { clock: '2026-10-22T00:00:00Z', settings: {
+    provider: 'custom', customEndpoint: 'https://old.translator.test/first', customKey: 'old-secret',
+  } });
+  const calls = [];
+  for (const host of ['old', 'new']) {
+    await f.page.route(`https://${host}.translator.test/**`, async (route) => {
+      calls.push({ url: route.request().url(), authorization: route.request().headers().authorization });
+      await route.fulfill({ contentType: 'application/json',
+        body: JSON.stringify({ choices: [{ message: { content: '译文' } }] }) });
+    });
+  }
+  await f.open();
+  await f.done();
+  assert(calls.every(call => call.authorization === 'Bearer old-secret'));
+  await f.page.getByRole('button', { name: '思维链翻译设置' }).click();
+  await f.page.getByLabel('端点', { exact: true }).fill('https://old.translator.test/second');
+  await f.page.getByLabel('模型', { exact: true }).click();
+  await f.done();
+  assert.equal(await f.page.getByLabel('密钥', { exact: true }).inputValue(), 'old-secret',
+    'a same-origin path change may keep the key');
+  const before = calls.length;
+  await f.page.getByLabel('端点', { exact: true }).fill('https://new.translator.test/translate');
+  await f.page.getByLabel('模型', { exact: true }).click();
+  await f.page.clock.runFor(1000);
+  assert.equal(calls.length, before);
+  assert.equal(await f.page.getByLabel('密钥', { exact: true }).inputValue(), '');
+  assert.deepEqual(await f.page.evaluate(() => ({
+    key: window.__kct.state.settings.customKey,
+    pending: window.__kct.state.settings.customKeyPending,
+    stored: JSON.parse(localStorage.getItem('kct:settings:v1')).customKey,
+  })), { key: '', pending: true, stored: '' });
+  await f.page.reload();
+  await f.page.addScriptTag({ content: SCRIPT });
+  await f.open();
+  await f.page.clock.runFor(1000);
+  assert.equal(calls.length, before, 'the confirmation requirement must survive reload');
+  await f.page.getByRole('button', { name: '思维链翻译设置' }).click();
+  await f.page.getByLabel('密钥', { exact: true }).fill('new-secret');
+  await f.page.getByLabel('模型', { exact: true }).click();
+  await f.page.clock.runFor(1000);
+  assert.equal(calls.length, before, 'editing the new key must still wait for confirmation');
+  await f.page.getByRole('button', { name: '确认密钥', exact: true }).click();
+  await f.done();
+  const newCalls = calls.filter(call => new URL(call.url).hostname === 'new.translator.test');
+  assert(newCalls.length > 0);
+  assert(newCalls.every(call => call.authorization === 'Bearer new-secret'));
+  assert.deepEqual(f.errors, []);
+});
+
+test('remote HTTP custom endpoints are rejected in settings and at send time; loopback HTTP remains supported', async (t) => {
+  const f = await fixture(t, { manual: true, settings: {
+    provider: 'custom', customEndpoint: 'https://translator.test/first', customKey: 'secret',
+  } });
+  await f.open();
+  await f.page.getByRole('button', { name: '思维链翻译设置' }).click();
+  await f.page.getByLabel('端点', { exact: true }).fill('http://remote.test/translate');
+  await f.page.getByLabel('模型', { exact: true }).click();
+  assert.match(await f.page.getByRole('alert').textContent(), /必须使用 HTTPS/);
+  assert.equal(await f.page.evaluate(() => window.__kct.state.settings.customEndpoint), 'https://translator.test/first');
+  const result = await f.page.evaluate(async () => {
+    const calls = [];
+    window.fetch = async (url, options) => {
+      calls.push({ url, redirect: options.redirect });
+      return new Response(JSON.stringify({ choices: [{ message: { content: '译文' } }] }));
+    };
+    let error;
+    try {
+      await window.__kct.translateText('Unsafe endpoint.', 'zh', () => {}, {
+        provider: 'custom', customEndpoint: 'http://remote.test/translate', customKey: 'secret',
+      });
+    } catch (failure) { error = failure.message; }
+    const rejectedCalls = calls.length;
+    for (const host of ['localhost', '127.0.0.1', '[::1]']) {
+      await window.__kct.translateText('Local endpoint.', 'zh', () => {}, {
+        provider: 'custom', customEndpoint: `http://${host}/translate`, customKey: '',
+      });
+    }
+    return { error, rejectedCalls, calls };
+  });
+  assert.match(result.error, /必须使用 HTTPS/);
+  assert.equal(result.rejectedCalls, 0);
+  assert.equal(result.calls.length, 3);
+  assert(result.calls.every(call => call.redirect === 'error'));
+  assert.deepEqual(f.errors, []);
+});
+
+test('custom endpoint confirmation also permits an explicitly empty key', async (t) => {
+  const f = await fixture(t, { manual: true, settings: {
+    provider: 'custom', customEndpoint: 'http://localhost/first', customKey: 'old-secret',
+  } });
+  const calls = [];
+  await f.page.route('http://127.0.0.1/**', async (route) => {
+    calls.push(route.request().headers().authorization);
+    await route.fulfill({ contentType: 'application/json',
+      body: JSON.stringify({ choices: [{ message: { content: '译文' } }] }) });
+  });
+  await f.open();
+  await f.page.getByRole('button', { name: '思维链翻译设置' }).click();
+  await f.page.getByLabel('端点', { exact: true }).fill('http://127.0.0.1/translate');
+  await f.page.getByLabel('模型', { exact: true }).click();
+  await f.page.getByRole('button', { name: '确认密钥', exact: true }).click();
+  await f.page.keyboard.press('Escape');
+  await f.page.getByRole('button', { name: '翻译这段思考', exact: true }).click();
+  await f.done();
+  assert(calls.length > 0);
+  assert(calls.every(authorization => authorization === undefined));
+  assert.equal(await f.page.evaluate(() => window.__kct.state.settings.customKeyPending), false);
+  assert.deepEqual(f.errors, []);
 });
 
 test('malformed batch responses remain errors and never enter the cache', async (t) => {
