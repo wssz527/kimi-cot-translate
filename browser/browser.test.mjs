@@ -133,6 +133,10 @@ test('generated bridge rebuilds structured errors and marks transport failures',
   }
   await assert.rejects(bridge(async () => { throw new TypeError('Message port closed'); })(url, options),
     { message: /Message port closed/, network: true });
+  const controller = new AbortController();
+  const pending = bridge(() => new Promise(() => {}))(url, { ...options, signal: controller.signal });
+  controller.abort();
+  await assert.rejects(pending, /cancelled/);
 });
 
 async function fixture(t, {
@@ -157,6 +161,7 @@ async function fixture(t, {
     window.blocked = false;
     window.fail = fail;
     const pending = gate ? new Promise(resolve => { release = resolve; }) : null;
+    window.releaseGate = () => release?.();
     window.release = () => release?.();
     window.__externalStorageChange = next => {
       const changes = { [key]: { oldValue: values[key], newValue: next } };
@@ -220,13 +225,85 @@ async function fixture(t, {
     await page.clock.runFor(ms);
     await page.evaluate(() => new Promise(resolve => setTimeout(resolve, 0)));
   };
-  return { page, ui, tick, requests: () => page.evaluate(() => window.requests) };
+  return {
+    page, ui, tick,
+    requests: () => page.evaluate(() => window.requests),
+    gate: () => page.evaluate(() => window.releaseGate()),
+  };
 }
 
 async function consent(f) {
   await f.ui.getByLabel('翻译目标语言').selectOption('zh');
   await f.ui.getByRole('button', { name: '确认语言并允许发送到 Bing' }).click();
 }
+
+test('continuous streaming discovers new blocks without starving old-block updates', async t => {
+  const f = await fixture(t, { settings: { language: 'zh', consent: true, auto: true } });
+  await f.ui.locator('output').waitFor({ state: 'visible' });
+  await f.page.evaluate(() => {
+    window.discoveryScans = 0;
+    const query = document.querySelectorAll.bind(document);
+    document.querySelectorAll = (selector) => {
+      if (selector === '.think:has(> button.think-head)') window.discoveryScans += 1;
+      return query(selector);
+    };
+    window.originalSource.textContent = 'First paragraph.\n\nSecond paragraph.';
+    window.added = document.createElement('div');
+    window.added.className = 'think open';
+    window.added.id = 'late';
+    window.added.innerHTML = '<button class="think-head" aria-expanded="true">Thinking</button>' +
+      '<div class="think-body open"><div class="think-body-inner"><pre class="think-text">' +
+      'Late block.\n\nStill late.</pre></div></div>';
+    document.querySelector('#thinking').after(window.added);
+    window.update = setInterval(() => {
+      window.originalSource.textContent += '\nStreaming tail.';
+    }, 100);
+  });
+  await f.page.clock.runFor(800);
+  assert.equal(await f.page.locator('#late [data-kct-browser]').count(), 1,
+    'a new block must be found while an existing block streams');
+  await f.page.clock.runFor(10000);
+  await f.page.evaluate(() => clearInterval(window.update));
+  const requests = await f.requests();
+  assert.ok(requests.length > 2, 'old-block translation must keep advancing');
+  assert.ok(requests.slice(1).every(request => request.texts.length > 0));
+  assert((await f.page.evaluate(() => window.discoveryScans)) < 5,
+    'updates to an existing block must not keep rescanning the whole transcript');
+});
+
+test('streaming prefix commits through a rewritten tail and stops re-requesting an unchanged prefix', async t => {
+  const f = await fixture(t, {
+    gate: true, source: 'First completed paragraph.\n\nGrowing tail without a final sentence boundary',
+    settings: { language: 'zh', consent: true, auto: false },
+  });
+  await f.page.evaluate(() => document.querySelector('#thinking').classList.add('streaming'));
+  await f.ui.getByLabel('自动翻译可见思考').check();
+  await f.page.waitForFunction(() => window.requests.length === 1, null, { timeout: 3000 });
+  assert.deepEqual((await f.requests())[0].texts, ['First completed paragraph.']);
+  await f.page.evaluate(() => {
+    window.originalSource.textContent = 'First completed paragraph.\n\nRewritten growing tail';
+  });
+  await f.gate();
+  await f.ui.locator('output').waitFor({ state: 'visible' });
+  assert.equal(await f.ui.locator('output').textContent(),
+    '译文:First completed paragraph.\n\nRewritten growing tail');
+  await f.page.evaluate(() => { window.originalSource.textContent += ' keeps growing'; });
+  await f.tick(850);
+  assert.match(await f.ui.locator('output').textContent(), /Rewritten growing tail keeps growing$/);
+  const runs = await f.page.evaluate(() => window.translateArgs.length);
+  await f.page.evaluate(() => {
+    dispatchEvent(new Event('scroll'));
+    dispatchEvent(new Event('resize'));
+  });
+  await f.tick(4000);
+  assert.equal((await f.requests()).length, 1);
+  assert.equal(await f.page.evaluate(() => window.translateArgs.length), runs);
+  await f.ui.getByLabel('自动翻译可见思考').uncheck();
+  await f.page.evaluate(() => history.pushState({}, '', '/another-synthetic-chat'));
+  await f.page.evaluate(() => dispatchEvent(new Event('popstate')));
+  await f.tick();
+  assert.equal(await f.ui.locator('output').isVisible(), false);
+});
 
 test('worker 429 metadata pauses all Bing jobs until Retry-After expires', async t => {
   const f = await fixture(t, {

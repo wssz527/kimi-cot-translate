@@ -9,7 +9,7 @@ import { stripVTControlCharacters } from 'node:util';
 import { pathToFileURL } from 'node:url';
 import { AcpClient } from './cli-acp.mjs';
 
-const { state, translateText, TARGET_LANGUAGES, prunePending, cancelRequests } = createRequire(import.meta.url)('./kct.js');
+const { state, translateText, TARGET_LANGUAGES, prunePending } = createRequire(import.meta.url)('./kct.js');
 const BUFFER_LIMIT = 128 * 1024;
 const LANGUAGES = ['简体中文', 'English', '日本語', '한국어', 'Español', 'Français', 'Deutsch', 'Русский'];
 const safe = (text) => stripVTControlCharacters(text).replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]/g, '');
@@ -135,7 +135,6 @@ export class TerminalRenderer {
     this.live = false;
     this.buffer = '';
     prunePending();
-    cancelRequests();
   }
 }
 
@@ -185,7 +184,15 @@ export async function run(options, { input = process.stdin, output = process.std
   if (!interactive && options.prompt === undefined) throw new Error('Use --prompt in a non-interactive terminal');
   const readline = interactive ? createInterface({ input, output }) : null;
   const questionAbort = new AbortController();
-  const question = readline ? (text) => readline.question(text, { signal: questionAbort.signal }) : undefined;
+  let questionTail = Promise.resolve();
+  const question = readline ? (text) => {
+    const answer = questionTail.then(() => {
+      if (questionAbort.signal.aborted) throw questionAbort.signal.reason;
+      return readline.question(text, { signal: questionAbort.signal });
+    });
+    questionTail = answer.catch(() => {});
+    return answer;
+  } : undefined;
   let client;
   let renderer;
   let sessionId;
@@ -267,6 +274,7 @@ export async function run(options, { input = process.stdin, output = process.std
     clearTimeout(cancelTimer);
     process.off('SIGINT', cancel);
     process.off('SIGTERM', cancel);
+    questionAbort.abort();
     readline?.close();
     renderer?.cancel();
     await client?.close().catch(() => {});

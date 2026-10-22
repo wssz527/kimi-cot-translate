@@ -10,7 +10,7 @@
   const selector = isCode ? '.think:has(> button.think-head)' : '.toolcall-container.thinking-container';
   let settings = { language: '', consent: false, auto: false };
   let loaded = false;
-  let timer;
+  let scanTimer = 0;
   let epoch = 0;
   const contexts = new Map();
 
@@ -58,11 +58,22 @@
   }
 
   function queueScan() {
-    clearTimeout(timer);
-    timer = setTimeout(() => {
-      timer = 0;
+    if (scanTimer) return;
+    scanTimer = setTimeout(() => {
+      scanTimer = 0;
       scan();
     }, 700);
+  }
+
+  function queueUpdate(ctx) {
+    if (!ctx.updateTimer) ctx.updateTimer = setTimeout(() => {
+      ctx.updateTimer = 0;
+      scan(ctx.block);
+    }, 700);
+  }
+
+  function streaming(ctx) {
+    return ctx.streaming || ctx.block.classList.contains('streaming');
   }
 
   function applySettings(next) {
@@ -81,6 +92,7 @@
         invalidate(ctx);
         if (locate(block) === ctx.source && visible(ctx.source)) ctx.epoch = epoch;
       }
+      core.prunePending();
     }
     scan();
   }
@@ -120,6 +132,7 @@
       auto: shadow.querySelector('input'), button: shadow.querySelector('.translate'),
       status: shadow.querySelector('[role="status"]'), output: shadow.querySelector('output'),
       generation: 0, running: false, last: '', failed: '', result: '', noTranslation: false,
+      observed: source.innerText, streaming: false, streamSince: 0, updateTimer: 0, waitTimer: 0,
       href: location.href,
       epoch,
     };
@@ -155,6 +168,11 @@
     ctx.running = false;
     ctx.last = ctx.failed = ctx.result = '';
     ctx.noTranslation = false;
+    clearTimeout(ctx.updateTimer);
+    clearTimeout(ctx.waitTimer);
+    ctx.updateTimer = ctx.waitTimer = 0;
+    ctx.streaming = false;
+    ctx.streamSince = 0;
     ctx.output.textContent = '';
     ctx.output.hidden = true;
     ctx.button.hidden = false;
@@ -164,10 +182,19 @@
 
   async function run(ctx, retryFailed = false) {
     if (!accepted() || ctx.running || locate(ctx.block) !== ctx.source || !visible(ctx.source)) return;
-    const source = sourceOf(ctx);
-    if (!source.trim()) return;
-    if (source.length > 100000) {
-      ctx.failed = source;
+    const fullSource = sourceOf(ctx);
+    if (streaming(ctx) && !ctx.streamSince) ctx.streamSince = Date.now();
+    const source = streaming(ctx)
+      ? core.stableStreamSource(fullSource, Date.now() - ctx.streamSince >= 3000) : fullSource;
+    if (streaming(ctx) && !ctx.waitTimer && Date.now() - ctx.streamSince < 3000) {
+      ctx.waitTimer = setTimeout(() => {
+        ctx.waitTimer = 0;
+        scan(ctx.block);
+      }, 3000 - (Date.now() - ctx.streamSince));
+    }
+    if (!source.trim() || source === ctx.last) return;
+    if (fullSource.length > 100000) {
+      ctx.failed = fullSource;
       ctx.status.textContent = '思考正文超过 100000 字符，未发送。';
       return;
     }
@@ -178,7 +205,7 @@
     const valid = () => ctx.generation === generation && ctx.epoch === runEpoch && runEpoch === epoch &&
       accepted() && settings.language === language &&
       locate(ctx.block) === ctx.source && visible(ctx.source) && location.href === href &&
-      sourceOf(ctx) === source;
+      sourceOf(ctx).startsWith(source);
     ctx.running = true;
     ctx.status.textContent = '翻译中…';
     try {
@@ -198,40 +225,56 @@
       }
       ctx.result = result;
       ctx.noTranslation = false;
-      ctx.output.textContent = result;
+      ctx.output.textContent = result + sourceOf(ctx).slice(source.length);
       ctx.output.hidden = false;
       ctx.button.hidden = false;
       ctx.button.textContent = '收起译文';
       ctx.status.textContent = '译文（原文保留）';
     } catch (error) {
       if (valid()) {
-        ctx.failed = source;
+        ctx.failed = fullSource;
         ctx.status.textContent = `翻译失败：${error.message}。可点击翻译本段重试。`;
       }
     } finally {
       if (ctx.generation === generation) {
         ctx.running = false;
-        if (!valid()) queueScan();
+        if (!valid()) queueUpdate(ctx);
+        else if (sourceOf(ctx) !== fullSource) queueUpdate(ctx);
       }
     }
   }
 
-  function scan() {
+  function scan(only) {
+    const blocks = only ? [only] : document.querySelectorAll(selector);
     for (const [block, ctx] of contexts) {
+      if (only && block !== only) continue;
       if (locate(block) !== ctx.source || !visible(ctx.source)) {
         invalidate(ctx);
         ctx.host.remove();
         contexts.delete(block);
         continue;
       }
-      if (ctx.href !== location.href || (ctx.last && sourceOf(ctx) !== ctx.last) ||
-          (ctx.failed && sourceOf(ctx) !== ctx.failed)) {
+      const source = sourceOf(ctx);
+      if (ctx.href !== location.href || (ctx.last && !source.startsWith(ctx.last)) ||
+          (ctx.failed && source !== ctx.failed)) {
         invalidate(ctx);
         ctx.href = location.href;
       }
+      if (source !== ctx.observed) {
+        const growing = source.startsWith(ctx.observed);
+        if (growing && !ctx.streamSince) ctx.streamSince = Date.now();
+        ctx.streaming = growing;
+        ctx.observed = source;
+        ctx.noTranslation = false;
+        ctx.button.hidden = false;
+      }
+      if (ctx.result && source.startsWith(ctx.last)) {
+        const text = ctx.result + source.slice(ctx.last.length);
+        if (ctx.output.textContent !== text) ctx.output.textContent = text;
+      }
       ctx.epoch = epoch;
     }
-    for (const block of document.querySelectorAll(selector)) {
+    for (const block of blocks) {
       const source = locate(block);
       if (!source || !visible(source)) continue;
       const ctx = contexts.get(block) || mount(block, source);
@@ -241,8 +284,7 @@
       ctx.consent.disabled = !ctx.language.value || !loaded;
       ctx.button.disabled = ctx.auto.disabled = !accepted() || ctx.noTranslation;
       ctx.auto.checked = accepted() && settings.auto === true;
-      if (accepted() && settings.auto === true && !ctx.last && ctx.failed !== sourceOf(ctx) &&
-          !ctx.running) void run(ctx);
+      if (accepted() && settings.auto === true && ctx.failed !== sourceOf(ctx) && !ctx.running) void run(ctx);
     }
   }
 
@@ -260,7 +302,15 @@
     scan();
   }).catch(() => { loaded = false; scan(); });
   new MutationObserver(records => {
-    if (records.some(record => !record.target.closest?.('[data-kct-browser]'))) queueScan();
+    for (const record of records) {
+      const node = record.target instanceof Element ? record.target : record.target.parentElement;
+      if (!node || node.closest('[data-kct-browser]')) continue;
+      const block = node.closest(selector);
+      const ctx = block && contexts.get(block);
+      if (ctx) queueUpdate(ctx);
+      else queueScan();
+    }
+    core.prunePending();
   }).observe(document.body, {
     subtree: true, childList: true, characterData: true, attributes: true,
     attributeFilter: ['class', 'style', 'hidden', 'inert', 'aria-expanded', 'aria-hidden'],

@@ -12,7 +12,9 @@ const CACHE_BYTES = 2 * 1024 * 1024;
 const MAX_CHARS = 1500;
 const CONCURRENCY = 3;
 const STREAM_DEBOUNCE_MS = 700;
+const STREAM_MAX_WAIT_MS = 3000;
 const REQUEST_TIMEOUT_MS = 15000;
+const CUSTOM_TIMEOUT_MS = 60000;
 const BATCH_CHARS = 4000;
 const FAILURE_TTL_MS = 30000;
 const TARGET_LANGUAGES = ['zh', 'en', 'ja', 'ko', 'es', 'fr', 'de', 'ru'];
@@ -44,9 +46,13 @@ const state = {
 };
 
 const ctxs = new WeakMap();
+const cacheSizes = new WeakMap();
 const scheduled = new Set();
 let rafPending = 0;
 let cacheTimer = 0;
+let cacheFlushTimer = 0;
+let cacheDirty = false;
+let cacheMemoryOnly = false;
 let queueTimer = 0;
 let cacheEpoch = 0;
 let setupPrompted = false;
@@ -100,7 +106,9 @@ function loadCache() {
   } catch (_) {
     state.cache.clear();
   }
+  pruneCache();
   saveCache();
+  persistCache();
 }
 
 function pruneCache(now = Date.now()) {
@@ -112,7 +120,14 @@ function pruneCache(now = Date.now()) {
       continue;
     }
     // Count UTF-16 bytes, including JSON escaping, keys, timestamps and separators.
-    const size = 2 * (JSON.stringify([key, entry.text, entry.usedAt]).length + 1);
+    let measured = cacheSizes.get(entry);
+    const timeLength = String(entry.usedAt).length;
+    if (!measured || measured.key !== key || measured.text !== entry.text || measured.timeLength !== timeLength) {
+      measured = { key, text: entry.text, timeLength,
+        size: 2 * (JSON.stringify([key, entry.text, entry.usedAt]).length + 1) };
+      cacheSizes.set(entry, measured);
+    }
+    const { size } = measured;
     sizes.push([key, size]);
     bytes += size;
   }
@@ -124,24 +139,37 @@ function pruneCache(now = Date.now()) {
 }
 
 function saveCache() {
-  pruneCache();
   clearTimeout(cacheTimer);
   cacheTimer = 0;
   if (state.cache.size) {
     const expires = Math.min(...[...state.cache.values()].map((entry) => entry.usedAt)) + CACHE_TTL_MS;
-    cacheTimer = setTimeout(saveCache, Math.max(0, expires - Date.now()));
+    cacheTimer = setTimeout(() => { pruneCache(); saveCache(); persistCache(); }, Math.max(0, expires - Date.now()));
     cacheTimer.unref?.();
   }
+  cacheDirty = true;
+  if (cacheMemoryOnly || typeof localStorage === 'undefined') return;
+  clearTimeout(cacheFlushTimer);
+  cacheFlushTimer = setTimeout(persistCache, 1000);
+  cacheFlushTimer.unref?.();
+}
+
+function persistCache() {
+  clearTimeout(cacheFlushTimer);
+  cacheFlushTimer = 0;
+  if (!cacheDirty || cacheMemoryOnly) return;
+  pruneCache();
+  const serialize = (entries) => JSON.stringify([...entries].map(([key, entry]) => [key, entry.text, entry.usedAt]));
   try {
-    localStorage.setItem(CACHE_KEY, JSON.stringify(
-      [...state.cache].map(([key, entry]) => [key, entry.text, entry.usedAt]),
-    ));
+    localStorage.setItem(CACHE_KEY, serialize(state.cache));
+    cacheDirty = false;
   } catch (_) {
-    /* quota exceeded — drop the cache rather than break the UI */
+    while (state.cache.size > CACHE_LIMIT / 4) state.cache.delete(state.cache.keys().next().value);
+    pruneCache();
     try {
-      localStorage.removeItem(CACHE_KEY);
+      localStorage.setItem(CACHE_KEY, serialize(state.cache));
+      cacheDirty = false;
     } catch (_) {
-      /* ignore */
+      cacheMemoryOnly = true;
     }
   }
 }
@@ -218,12 +246,16 @@ function hashKey(text) {
 // providers — request shapes mirror DSH's experimental translator
 // ---------------------------------------------------------------------------
 
-async function fetchJSON(url, options) {
+async function fetchJSON(url, options, signal, timeoutMs = REQUEST_TIMEOUT_MS) {
   const controller = new AbortController();
+  const abort = () => controller.abort();
+  signal?.addEventListener('abort', abort, { once: true });
+  if (signal?.aborted) abort();
   requestControllers.add(controller);
-  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const res = await fetch(url, { ...options, signal: controller.signal }).catch((error) => {
+      if (signal?.aborted) throw new Error('翻译已取消');
       if (controller.signal.aborted) {
         throw Object.assign(new Error('请求超时，请重试'), { network: true });
       }
@@ -243,17 +275,19 @@ async function fetchJSON(url, options) {
     try {
       return await res.json();
     } catch (error) {
+      if (signal?.aborted) throw new Error('翻译已取消');
       if (controller.signal.aborted) throw Object.assign(new Error('请求超时，请重试'), { network: true });
       if (error instanceof TypeError) error.network = true;
       throw error;
     }
   } finally {
     clearTimeout(timer);
+    signal?.removeEventListener('abort', abort);
     requestControllers.delete(controller);
   }
 }
 
-async function translateGoogle(text, lang) {
+async function translateGoogle(text, lang, signal) {
   const url = new URL('https://translate.googleapis.com/translate_a/single');
   url.searchParams.set('client', 'gtx');
   url.searchParams.set('sl', 'auto');
@@ -265,13 +299,13 @@ async function translateGoogle(text, lang) {
     headers: { 'content-type': 'application/x-www-form-urlencoded' },
     credentials: 'omit',
     redirect: 'error',
-  });
+  }, signal);
   const first = Array.isArray(payload) ? payload[0] : null;
   if (!Array.isArray(first) || first.length === 0) throw new Error('google bad shape');
   return first.map((seg) => (Array.isArray(seg) && typeof seg[0] === 'string' ? seg[0] : '')).join('');
 }
 
-async function translateBing(texts, lang) {
+async function translateBing(texts, lang, signal) {
   const url = new URL('https://edge.microsoft.com/translate/translatetext');
   url.searchParams.set('to', targetFor('bing', lang));
   url.searchParams.set('isEnterpriseClient', 'false');
@@ -281,12 +315,11 @@ async function translateBing(texts, lang) {
     headers: { 'content-type': 'application/json' },
     credentials: 'omit',
     redirect: 'error',
-  });
+  }, signal);
   if (!Array.isArray(payload) || payload.length !== texts.length) throw new Error('bing bad shape');
   return payload.map((item) => {
     const translated = item?.translations?.[0]?.text;
-    if (typeof translated !== 'string' || !translated.trim()) throw new Error('bing empty translation');
-    return translated;
+    return typeof translated === 'string' && translated.trim() ? translated : null;
   });
 }
 
@@ -301,7 +334,7 @@ function customEndpointURL(endpoint) {
   return url;
 }
 
-async function translateCustom(texts, lang, settings) {
+async function translateCustom(texts, lang, settings, signal) {
   const numbered = texts.length > 1;
   const text = numbered ? texts.map((text, i) => `${i + 1}. ${text}`).join('\n') : texts[0];
   const endpoint = customEndpointURL(settings.customEndpoint.trim()).href;
@@ -326,7 +359,7 @@ async function translateCustom(texts, lang, settings) {
     }),
     credentials: 'omit',
     redirect: 'error',
-  });
+  }, signal, CUSTOM_TIMEOUT_MS);
   const content = payload && payload.choices && payload.choices[0] && payload.choices[0].message
     ? payload.choices[0].message.content
     : undefined;
@@ -359,6 +392,8 @@ function pump() {
       return;
     }
     const [job] = state.queue.splice(index, 1);
+    if (!job.batch.filter(pruneConsumers).length) continue;
+    job.controller = new AbortController();
     state.active += 1;
     void translateBatch(job)
       .catch((error) => {
@@ -389,7 +424,9 @@ function pump() {
 }
 
 function enqueue(batch, provider, lang, settings) {
-  state.queue.push({ batch, provider, lang, settings, readyAt: 0, retries: 0 });
+  const job = { batch, provider, lang, settings, readyAt: 0, retries: 0, controller: null };
+  for (const item of batch) item.job = job;
+  state.queue.push(job);
   pump();
 }
 
@@ -400,6 +437,7 @@ function pruneConsumers(item) {
     consumer.reject(new Error('翻译已取消'));
   }
   if (!item.consumers.size && state.inFlight.get(item.key) === item) state.inFlight.delete(item.key);
+  if (item.job && !item.job.batch.some((entry) => entry.consumers.size)) item.job.controller?.abort();
   return item.consumers.size > 0;
 }
 
@@ -413,34 +451,56 @@ function finishItem(item, error, text) {
 }
 
 function prunePending() {
-  for (const item of state.inFlight.values()) pruneConsumers(item);
+  const jobs = new Set();
+  for (const item of state.inFlight.values()) {
+    if (item.job) jobs.add(item.job);
+    pruneConsumers(item);
+  }
+  for (const job of jobs) {
+    if (!job.batch.some((item) => item.consumers.size)) job.controller?.abort();
+  }
   state.queue = state.queue.filter((job) => job.batch.some((item) => item.consumers.size));
   pump();
 }
 
-async function translateBatch({ batch, provider, lang, settings }) {
+async function translateBatch({ batch, provider, lang, settings, controller }) {
   const live = batch.filter(pruneConsumers);
   if (!live.length) return;
   const results = provider === 'bing'
-    ? await translateBing(live.map((item) => item.text), lang)
+    ? await translateBing(live.map((item) => item.text), lang, controller.signal)
     : provider === 'custom'
-      ? await translateCustom(live.map((item) => item.text), lang, settings)
-      : [await translateGoogle(live[0].text, lang)];
+      ? await translateCustom(live.map((item) => item.text), lang, settings, controller.signal)
+      : [await translateGoogle(live[0].text, lang, controller.signal)];
   if (!results) {
     for (const item of live) enqueue([item], provider, lang, settings);
     return;
   }
-  if (results.some((text) => typeof text !== 'string' || !text.trim())) throw new Error('译文为空，请重试');
+  let saved = false;
   live.forEach((item, i) => {
     if (!pruneConsumers(item)) return;
-    results[i] = preserveFencedCode(item.text, results[i]);
-    if (item.epoch === cacheEpoch && results[i].length * 2 <= CACHE_BYTES) {
-      state.cache.delete(item.key);
-      state.cache.set(item.key, { text: results[i], usedAt: Date.now() });
+    const text = results[i];
+    if (typeof text !== 'string' || !text.trim()) {
+      if (live.length > 1) {
+        enqueue([item], provider, lang, settings);
+      } else {
+        const error = new Error('译文为空，请重试');
+        state.failures.set(item.key, { error, failedAt: Date.now() });
+        finishItem(item, error);
+      }
+      return;
     }
-    finishItem(item, null, results[i]);
+    const translated = preserveFencedCode(item.text, text);
+    if (item.epoch === cacheEpoch && translated.length * 2 <= CACHE_BYTES) {
+      state.cache.delete(item.key);
+      state.cache.set(item.key, { text: translated, usedAt: Date.now() });
+      saved = true;
+    }
+    finishItem(item, null, translated);
   });
-  saveCache();
+  if (saved) {
+    pruneCache();
+    saveCache();
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -526,6 +586,18 @@ function splitParagraphs(text) {
   return parts;
 }
 
+function stableStreamSource(text, waited = false) {
+  const masked = protectedPieces(text).map(({ text, skip }) => skip ? ' '.repeat(text.length) : text).join('');
+  const paragraphs = splitParagraphs(masked);
+  let end = paragraphs.slice(0, -1).reduce((length, { body, sep }) => length + body.length + sep.length, 0);
+  const tail = masked.slice(end);
+  if (tail.length >= MAX_CHARS || waited) {
+    // Keep the final unit growing; protected spans cannot introduce a boundary.
+    end += sentenceUnits(tail).slice(0, -1).reduce((length, unit) => length + unit.length, 0);
+  }
+  return text.slice(0, end);
+}
+
 function translationPieces(source, lang) {
   // Equal-length masks keep sentence context and source offsets without counting code or URLs.
   const masked = protectedPieces(source).map(({ text, skip }) => skip ? ' '.repeat(text.length) : text).join('');
@@ -567,9 +639,20 @@ async function translateText(source, lang, onProgress = () => {}, settings = { .
   const pieces = translationPieces(source, lang);
   const out = pieces.map(({ text }) => text);
   const missing = [];
+  const owned = new Map();
   const tasks = [];
   let completed = 0;
+  let progressTimer = 0;
   const total = pieces.filter(({ skip }) => !skip).length;
+  const frame = typeof requestAnimationFrame === 'function' ? requestAnimationFrame : (fn) => setTimeout(fn, 16);
+  const cancelFrame = typeof cancelAnimationFrame === 'function' ? cancelAnimationFrame : clearTimeout;
+  const notifyProgress = () => {
+    if (progressTimer) return;
+    progressTimer = frame(() => {
+      progressTimer = 0;
+      if (valid()) onProgress(preserveFencedCode(source, out.join('')), completed, total);
+    });
+  };
 
   pruneCache();
   for (const [key, failure] of state.failures) {
@@ -587,40 +670,60 @@ async function translateText(source, lang, onProgress = () => {}, settings = { .
       hit.usedAt = Date.now();
       state.cache.delete(key);
       state.cache.set(key, hit);
-      promise = Promise.resolve(hit.text);
+      out[index] = preserveFencedCode(text, hit.text);
+      completed += 1;
+      continue;
     } else {
       let pending = state.inFlight.get(key);
       if (pending && !pruneConsumers(pending)) pending = null;
       if (!pending) {
         pending = { text, key, consumers: new Set(), epoch: cacheEpoch };
         state.inFlight.set(key, pending);
-        missing.push(pending);
       }
       promise = new Promise((resolve, reject) => pending.consumers.add({ valid, resolve, reject }));
+      if (!pending.job && !owned.has(pending)) {
+        missing.push(pending);
+        owned.set(pending, promise);
+      }
     }
     tasks.push(promise.then((translated) => {
       out[index] = preserveFencedCode(text, translated);
       completed += 1;
-      if (valid()) onProgress(preserveFencedCode(source, out.join('')), completed, total);
+      if (valid()) notifyProgress();
     }));
   }
-  saveCache();
+  if (completed) {
+    saveCache();
+    if (tasks.length && valid()) notifyProgress();
+  }
 
-  while (missing.length) {
-    const batch = [missing.shift()];
+  let next = 0;
+  const enqueueNext = () => {
+    while (next < missing.length && (missing[next].job || !pruneConsumers(missing[next]))) next += 1;
+    if (next >= missing.length) return;
+    const batch = [missing[next++]];
     const numbering = provider === 'custom' ? 4 : 0;
     let chars = batch[0].text.length + (numbering ? 3 : 0);
-    while (provider !== 'google' && missing.length && batch.length < 8 &&
-      chars + missing[0].text.length + numbering <= BATCH_CHARS) {
-      chars += missing[0].text.length + numbering;
-      batch.push(missing.shift());
+    while (provider !== 'google' && next < missing.length && batch.length < 8 &&
+      chars + missing[next].text.length + numbering <= BATCH_CHARS) {
+      const item = missing[next++];
+      if (item.job || !pruneConsumers(item)) continue;
+      chars += item.text.length + numbering;
+      batch.push(item);
     }
     enqueue(batch, provider, lang, settings);
-  }
+    void Promise.allSettled(batch.map((item) => owned.get(item))).then(enqueueNext);
+  };
+  // Bound each caller's queued batches so a newly opened block can take a turn.
+  for (let i = 0; i < CONCURRENCY + 1; i += 1) enqueueNext();
   const results = await Promise.allSettled(tasks);
+  if (progressTimer) cancelFrame(progressTimer);
+  progressTimer = 0;
   const failed = results.find((result) => result.status === 'rejected');
   if (failed) throw failed.reason;
-  return preserveFencedCode(source, out.join(''));
+  const finalText = preserveFencedCode(source, out.join(''));
+  if (valid()) onProgress(finalText, total, total);
+  return finalText;
 }
 
 // ---------------------------------------------------------------------------
@@ -723,6 +826,7 @@ function mount(think) {
     translatedPrefix: '',
     translatedSource: '',
     retryFailed: false,
+    streamSince: 0,
   };
   ctx.sourceNode = ctx.pickedSource;
   ctxs.set(think, ctx);
@@ -813,6 +917,7 @@ function cancelContext(ctx) {
   ctx.running = false;
   clearTimeout(ctx.timer);
   ctx.timer = 0;
+  ctx.streamSince = 0;
   scheduled.delete(ctx);
   if (!scheduled.size && rafPending) {
     cancelAnimationFrame(rafPending);
@@ -905,6 +1010,7 @@ async function maybeRun(ctx) {
   if (source === ctx.source && ctx.done) return;
 
   if (isStreaming(ctx.think)) {
+    if (!ctx.streamSince) ctx.streamSince = Date.now();
     if (!ctx.timer) ctx.timer = window.setTimeout(() => {
       ctx.timer = 0;
       if (ctx.think.isConnected && isOpen(ctx.think) && state.settings.enabled &&
@@ -923,8 +1029,14 @@ async function run(ctx) {
   const fullSource = readSource(ctx);
   let source = fullSource;
   if (isStreaming(ctx.think)) {
-    const paragraphs = splitParagraphs(fullSource);
-    source = paragraphs.slice(0, -1).map(({ body, sep }) => body + sep).join('');
+    source = stableStreamSource(fullSource, Date.now() - ctx.streamSince >= STREAM_MAX_WAIT_MS);
+    if (!source.trim() && Date.now() - ctx.streamSince < STREAM_MAX_WAIT_MS && !ctx.timer) {
+      ctx.timer = setTimeout(() => {
+        ctx.timer = 0;
+        if (ctx.think.isConnected && isOpen(ctx.think) && state.settings.enabled) void run(ctx);
+      },
+        STREAM_MAX_WAIT_MS - (Date.now() - ctx.streamSince));
+    }
   }
   if (!source.trim()) return;
   const lang = resolveTarget();
@@ -934,6 +1046,9 @@ async function run(ctx) {
     ctx.done = !isStreaming(ctx.think);
     ctx.status.dataset.state = 'ok';
     ctx.status.textContent = '';
+    ctx.status.title = '';
+    ctx.status.disabled = true;
+    ctx.toggle.disabled = false;
     return;
   }
   if (source === ctx.source && ctx.rendered) {
@@ -955,6 +1070,7 @@ async function run(ctx) {
   ctx.lastError = '';
   ctx.status.dataset.state = 'loading';
   ctx.status.textContent = '翻译中…';
+  ctx.status.title = '';
   ctx.status.disabled = true;
   ctx.toggle.disabled = false;
 
@@ -976,6 +1092,8 @@ async function run(ctx) {
     ctx.source = source;
     ctx.status.dataset.state = 'ok';
     ctx.status.textContent = ctx.done ? '' : '后续内容待翻译';
+    ctx.status.title = '';
+    ctx.status.disabled = true;
     ctx.toggle.disabled = false;
     ctx.lastError = '';
   } catch (error) {
@@ -1106,6 +1224,17 @@ function openPanel(event) {
 
   panel.appendChild(
     row(
+      '启用翻译',
+      checkbox(state.settings.enabled, (v) => {
+        state.settings.enabled = v;
+        saveSettings();
+        resetAll();
+      }),
+    ),
+  );
+
+  panel.appendChild(
+    row(
       '翻译服务',
       select(['bing', 'google', 'custom'], state.settings.provider, (v) => {
         state.settings.provider = v;
@@ -1213,6 +1342,7 @@ function openPanel(event) {
     cacheEpoch += 1;
     state.cache.clear();
     saveCache();
+    persistCache();
     clear.textContent = '已清空';
   });
   panel.appendChild(row('缓存', clear));
@@ -1313,6 +1443,7 @@ function resetAll() {
     ctx.toggle.disabled = false;
     ctx.status.dataset.state = 'idle';
     ctx.status.textContent = '';
+    ctx.status.title = '';
     ctx.status.disabled = true;
     schedule(ctx);
   }
@@ -1333,13 +1464,9 @@ const observer = typeof document === 'undefined' ? null : new MutationObserver((
     const el = record.target instanceof Element ? record.target : record.target.parentElement;
     if (!el) continue;
 
-    // Ignore our own mutations: the toolbar, the translated node, the view
-    // attribute and the panel all live inside or on the think block.
+    // Ignore our own mutations: the toolbar, the translated node and the
+    // panel all live inside or on the think block.
     if (isOurs(el) || isOurs(record.target)) continue;
-
-    // Our own view attribute is written on the host block; skip it so a
-    // translate/revert cycle cannot re-trigger itself.
-    if (record.type === 'attributes' && record.attributeName === `${NS}-view`) continue;
 
     if (record.type === 'childList') {
       for (const removed of record.removedNodes) {
@@ -1397,6 +1524,10 @@ function leavePage() {
   prunePending();
 }
 
+function flushCache() {
+  if (cacheDirty && !cacheMemoryOnly) persistCache();
+}
+
 // ---------------------------------------------------------------------------
 // boot
 // ---------------------------------------------------------------------------
@@ -1419,7 +1550,9 @@ function boot() {
   window.navigation?.addEventListener('currententrychange', leavePage);
   window.addEventListener('popstate', leavePage);
   window.addEventListener('hashchange', leavePage);
+  window.addEventListener('pagehide', flushCache);
   window.addEventListener('pagehide', leavePage);
+  window.addEventListener('beforeunload', flushCache);
 }
 
 if (typeof document === 'undefined') {

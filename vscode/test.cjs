@@ -99,7 +99,7 @@ test('saved target is restored through Memento, with zh for invalid values', asy
   assert.equal(restoreTarget(engine, globalState, 'kct.targetLanguage'), 'zh');
 });
 
-test('uses shared segmentation/translation with explicit Bing settings and preserves source and global settings', async () => {
+test('fake engine contract forwards completion counts without partial translation text', async () => {
   const source = '  First thought.\n\nAnother thought.  ';
   const messages = [];
   const engine = fakeEngine(async (text, target, progress, settings, valid) => {
@@ -108,14 +108,18 @@ test('uses shared segmentation/translation with explicit Bing settings and prese
     assert.equal(settings.provider, 'bing');
     assert.equal(settings.targetLanguage, 'ja');
     assert(valid());
-    progress('partial');
+    progress('full partial translation', 2, 3);
     return 'translated';
   });
   const before = structuredClone(engine.state);
   const session = createSession(engine, (message) => messages.push(message));
   const input = { type: 'translate', source, target: 'ja' };
   await session.receive(input);
-  assert.deepEqual(messages, [{ type: 'progress', text: 'partial' }, { type: 'done', text: 'translated' }]);
+  assert.deepEqual(messages, [
+    { type: 'progress', done: 2, total: 3 },
+    { type: 'done', text: 'translated' },
+  ]);
+  assert.equal(JSON.stringify(messages).includes('partial translation'), false);
   assert.deepEqual(input, { type: 'translate', source, target: 'ja' });
   assert.deepEqual(engine.state, before);
   session.dispose();
@@ -134,7 +138,7 @@ test('cancel, duplicate clicks and disposal cannot display stale translations', 
   assert.equal(jobs[0].valid(), false);
   assert.equal(engine.pruned, 1);
   const second = session.receive({ type: 'translate', source: 'second', target: 'zh' });
-  jobs[0].progress('stale progress');
+  jobs[0].progress('stale progress', 1, 2);
   jobs[0].resolve('stale result');
   await first;
   assert.equal(jobs[1].valid(), true);
@@ -311,7 +315,11 @@ test('real browser: explicit sending, strict CSP, literal source/result and orig
   const errors = [];
   const external = [];
   page.on('pageerror', (error) => errors.push(error.message));
-  const engine = fakeEngine(async (...args) => { calls.push(args); return output; });
+  const jobs = [];
+  const engine = fakeEngine((...args) => {
+    calls.push(args);
+    return new Promise((resolve, reject) => jobs.push({ resolve, reject, progress: args[2] }));
+  });
   const session = createSession(engine, (message) =>
     page.evaluate((data) => window.dispatchEvent(new MessageEvent('message', { data })), message));
   t.after(() => session.dispose());
@@ -341,6 +349,17 @@ test('real browser: explicit sending, strict CSP, literal source/result and orig
   assert.equal(calls.length, 0, 'opening the preview must not translate');
   await page.getByLabel('Target language').selectOption('ja');
   await page.getByRole('button', { name: 'Translate with Bing', exact: true }).click();
+  assert.equal(jobs.length, 1);
+  jobs[0].progress('partial body must not render', 1, 3);
+  await page.waitForFunction(() =>
+    document.querySelector('#status').textContent === 'Translating with Bing... 1/3');
+  assert.equal(await page.locator('#result').textContent(), '');
+  assert.equal(await page.locator('#result').isHidden(), true);
+  jobs[0].progress('still partial', 2, 3);
+  await page.waitForFunction(() =>
+    document.querySelector('#status').textContent === 'Translating with Bing... 2/3');
+  assert.equal(await page.locator('#result').textContent(), '');
+  jobs[0].resolve(output);
   await page.waitForFunction(() => document.querySelector('#status').textContent.startsWith('Translation complete.'));
   assert.equal(calls.length, 1);
   assert.equal(calls[0][0], source);
@@ -352,6 +371,24 @@ test('real browser: explicit sending, strict CSP, literal source/result and orig
   assert.equal(await page.locator('#source').isVisible(), true);
   await page.locator('#source').fill('edited thought');
   assert.equal(await page.getByRole('button', { name: 'Translation', exact: true }).isDisabled(), true);
+
+  await page.locator('#source').fill('second thought');
+  await page.getByRole('button', { name: 'Translate with Bing', exact: true }).click();
+  assert.equal(jobs.length, 2);
+  jobs[1].progress('partial second translation', 2, 4);
+  await page.waitForFunction(() =>
+    document.querySelector('#status').textContent === 'Translating with Bing... 2/4');
+  await page.getByRole('button', { name: 'Cancel', exact: true }).click();
+  await page.waitForFunction(() =>
+    document.querySelector('#status').textContent.startsWith('Cancelled.'));
+  await page.evaluate(() => window.dispatchEvent(new MessageEvent('message', {
+    data: { type: 'progress', done: 4, total: 4 },
+  })));
+  jobs[1].progress('stale final progress', 4, 4);
+  assert.match(await page.locator('#status').textContent(), /^Cancelled\./);
+  assert.equal(await page.locator('#result').textContent(), '');
+  assert.equal(await page.locator('#result').isHidden(), true);
+  jobs[1].resolve('stale result');
   assert.deepEqual(errors, []);
   assert.deepEqual(external, []);
 });

@@ -47,7 +47,9 @@ function createSession(engine, send) {
       const settings = { ...engine.state.settings, provider: 'bing', targetLanguage: message.target };
       try {
         const translated = await engine.translateText(message.source, message.target,
-          (text) => { if (valid()) send({ type: 'progress', text }); }, settings, valid, true);
+          (text, done, total) => {
+            if (valid()) send({ type: 'progress', done, total });
+          }, settings, valid, true);
         if (valid()) send({ type: 'done', text: translated });
       } catch {
         if (valid()) send({ type: 'error', text: 'Translation failed. The original is unchanged; retry when the service is available.' });

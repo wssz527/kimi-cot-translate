@@ -21,6 +21,49 @@ async function config(t) {
   return join(dir, 'cli.json');
 }
 
+async function waitFor(predicate, deadline, message) {
+  while (!predicate()) {
+    if (Date.now() >= deadline) assert.fail(message);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
+async function startPermissions(t, count) {
+  const input = new PassThrough();
+  input.isTTY = true;
+  const output = new PassThrough();
+  output.isTTY = true;
+  output.columns = 80;
+  let text = '';
+  output.on('data', (chunk) => { text += chunk; });
+  t.after(() => { input.destroy(); output.destroy(); });
+  const answers = [];
+  const titles = ['First', 'Second', 'Third'];
+  class PermissionClient {
+    constructor(options) {
+      this.options = options;
+      this.closed = new Promise((resolve) => { this.resolveClosed = resolve; });
+    }
+    async start() {}
+    async request(method) {
+      if (method === 'initialize') return { protocolVersion: 1 };
+      if (method === 'session/new') return { sessionId: 'permission-fixture' };
+      const asked = titles.slice(0, count).map((title, index) => this.options.onPermission({
+        toolCall: { title },
+        options: [{ optionId: `option-${index + 1}`, name: `${title} option` }],
+      }));
+      answers.push(...await Promise.all(asked));
+      return { stopReason: 'end_turn' };
+    }
+    notify() {}
+    close() { this.resolveClosed({ code: 0, signal: null }); return this.closed; }
+  }
+  const running = run(parseArgs(['--target', 'zh', '-p', 'A synthetic prompt.']), {
+    input, output, error: sink(), Client: PermissionClient, configFile: await config(t),
+  });
+  return { input, text: () => text, answers, running };
+}
+
 function mockBing(t, transform = (text) => `译:${text}`) {
   const requests = [];
   const original = globalThis.fetch;
@@ -109,6 +152,42 @@ test('cancellation drops late translation and releases its pending display memor
   assert.equal(renderer.pending, 0);
 });
 
+test('cancelling one renderer leaves a shared translation alive for the other renderer', { timeout: 3000 }, async (t) => {
+  const signals = [];
+  let release;
+  const output = sink();
+  const original = globalThis.fetch;
+  engine.state.cache.clear();
+  globalThis.fetch = async (url, options) => {
+    signals.push(options.signal);
+    const texts = JSON.parse(options.body);
+    const response = new Promise((resolve) => {
+      release = () => resolve(Response.json(texts.map((text) => ({ translations: [{ text: `译:${text}` }] }))));
+    });
+    return response;
+  };
+  t.after(() => {
+    globalThis.fetch = original;
+    engine.cancelRequests();
+    engine.state.cache.clear();
+  });
+  const first = new TerminalRenderer({ target: 'zh', write: () => {} });
+  const second = new TerminalRenderer({ target: 'zh', write: output.write });
+  first.push(thought('Shared live paragraph.\n\n'));
+  await Promise.resolve();
+  second.push(thought('Shared live paragraph.\n\n'));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(signals.length, 1);
+  first.cancel();
+  assert.equal(signals[0].aborted, false);
+  release();
+  await second.finish();
+  assert.equal(signals.length, 1);
+  assert.equal(signals[0].aborted, false);
+  assert.match(output.text(), /译:Shared live paragraph\./);
+  second.cancel();
+});
+
 test('long output has a fixed pending budget instead of an unbounded promise queue', async () => {
   const renderer = new TerminalRenderer({ target: 'zh', write: () => {} });
   assert.throws(() => renderer.push(thought('A'.repeat(128 * 1024 + 1))), /128 Ki/);
@@ -148,6 +227,39 @@ test('permissions require an explicit advertised option and are denied without a
     { outcome: { outcome: 'selected', optionId: 'once' } });
   assert.deepEqual(await permissionResponse(params, async () => '2'),
     { outcome: { outcome: 'selected', optionId: 'no' } });
+});
+
+test('concurrent permissions are serialized and cancellation also ends a queued permission', { timeout: 3000 }, async (t) => {
+  const { input, text, answers, running } = await startPermissions(t, 3);
+  const deadline = Date.now() + 1000;
+  await waitFor(() => text().includes('First'), deadline, 'First permission prompt was not shown');
+  assert.doesNotMatch(text(), /Second|Third/);
+  input.write('1\n');
+  await waitFor(() => text().includes('Second'), deadline, 'Second permission prompt was not shown');
+  assert.doesNotMatch(text(), /Third/);
+  input.write('\x03');
+  assert.equal(await running, 130);
+  assert.doesNotMatch(text(), /Third/);
+  assert.deepEqual(answers, [
+    { outcome: { outcome: 'selected', optionId: 'option-1' } },
+    { outcome: { outcome: 'cancelled' } },
+    { outcome: { outcome: 'cancelled' } },
+  ]);
+});
+
+test('two concurrent permissions both accept their own real readline answer', { timeout: 3000 }, async (t) => {
+  const { input, text, answers, running } = await startPermissions(t, 2);
+  const deadline = Date.now() + 1000;
+  await waitFor(() => text().includes('First'), deadline, 'First permission prompt was not shown');
+  assert.doesNotMatch(text(), /Second/);
+  input.write('1\n');
+  await waitFor(() => text().includes('Second'), deadline, 'Second permission prompt was not shown');
+  input.write('1\n');
+  assert.equal(await running, 0);
+  assert.deepEqual(answers, [
+    { outcome: { outcome: 'selected', optionId: 'option-1' } },
+    { outcome: { outcome: 'selected', optionId: 'option-2' } },
+  ]);
 });
 
 test('missing first-use language rejects before creating a backend or sending text', async (t) => {

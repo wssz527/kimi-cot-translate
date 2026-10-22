@@ -485,6 +485,9 @@ test('failures wait for explicit retry; no mutation-triggered retry storm', asyn
   await f.page.getByRole('button', { name: '重试', exact: true }).click();
   await f.done();
   assert.equal(f.requests.length, 2);
+  assert.equal(await f.page.locator('.kct-status').getAttribute('title'), '');
+  assert.equal(await f.page.locator('.kct-status').isDisabled(), true);
+  assert.equal(await f.page.locator('.kct-bar > .kct-btn').nth(1).isEnabled(), true);
 });
 
 async function mockFailures(page, mode, retryAfter = null) {
@@ -526,7 +529,8 @@ test('429 pauses only its provider, honors seconds and HTTP-date, and resumes qu
       await f.page.waitForFunction(() => window.__kct.state.cooldowns.size === 1 && window.__kct.state.active === 0);
       const initial = await f.page.evaluate(() => window.translationCalls.length);
       assert.equal(initial, 3, 'only the requests already in flight may reach the limited provider');
-      assert.equal(await f.page.evaluate(() => window.__kct.state.queue.length), 10);
+      assert.equal(await f.page.evaluate(() => window.__kct.state.queue.length), 4,
+        'a single caller only prepares four batches during cooldown');
       await f.page.evaluate(() => {
         window.responseMode = 'ok';
         window.googleResult = window.__kct.translateText('Other provider.', 'zh', () => {}, { provider: 'google' });
@@ -1137,6 +1141,7 @@ test('legacy translations remain reusable and cache hits refresh LRU and the sev
   const clock = '2026-01-01T00:00:00Z';
   const original = await fixture(t, { manual: true, clock });
   await original.page.evaluate(() => window.__kct.translateText('Retained source.', 'zh'));
+  await original.page.clock.runFor(1000);
   const row = await original.page.evaluate(() => JSON.parse(localStorage.getItem('kct:cache:v1'))[0]);
   const entries = [
     [`bing\u0000zh\u0000${row[0].split(':')[1]}`, row[1]],
@@ -1148,6 +1153,7 @@ test('legacy translations remain reusable and cache hits refresh LRU and the sev
   assert.equal(await f.page.evaluate(() => window.__kct.translateText('Retained source.', 'zh')), row[1]);
   assert.equal(f.requests.length, 0, 'migration must retain a usable cache key');
   await f.page.evaluate(() => window.__kct.translateText('A fresh source.', 'zh'));
+  await f.page.clock.runFor(1000);
   const rows = await f.page.evaluate(() => JSON.parse(localStorage.getItem('kct:cache:v1')));
   assert.equal(rows.length, 500);
   assert.equal(rows[0][1], 'untouched 1', 'the least recently used entry must be evicted');
@@ -1181,6 +1187,7 @@ test('cache writes stay within a two-MiB UTF-16 JSON budget including escaping',
   }));
   await f.open();
   await f.done();
+  await f.page.waitForFunction(() => localStorage.getItem('kct:cache:v1') !== null);
   const result = await f.page.evaluate(() => {
     const stored = localStorage.getItem('kct:cache:v1');
     return { bytes: stored.length * 2, rows: JSON.parse(stored), size: window.__kct.state.cache.size };
@@ -1212,7 +1219,8 @@ test('removal, collapse and route changes discard old queued work and cannot ref
       await f.page.waitForFunction(() => window.__kct.state.active === 0);
       assert.equal(f.requests.length, 3);
       assert.equal(await f.page.locator('.kct-translated').count(), 0);
-      assert.equal(await f.page.evaluate(() => localStorage.getItem('kct:cache:v1')), '[]');
+      assert.equal(await f.page.evaluate(() => localStorage.getItem('kct:cache:v1')), null,
+        'cancelled misses do not write an empty cache');
       if (mode !== 'remove') assert.equal(await f.page.locator('.think-text').textContent(), source);
       assert.deepEqual(f.errors, []);
     });
@@ -1238,11 +1246,12 @@ test('invalid consumers settle before held requests finish and queued work is re
     document.body.append(document.createElement('section'));
   });
   assert.match(await settled, /取消/);
+  await f.page.waitForFunction(() => window.__kct.state.active === 0);
   assert.deepEqual(await f.page.evaluate(() => ({
     queued: window.__kct.state.queue.length,
     pending: window.__kct.state.inFlight.size,
     active: window.__kct.state.active,
-  })), { queued: 0, pending: 0, active: 3 });
+  })), { queued: 0, pending: 0, active: 0 });
   f.release();
   await f.page.waitForFunction(() => window.__kct.state.active === 0);
   assert.equal(f.requests.length, 3);
@@ -1290,7 +1299,8 @@ test('a source replaced during translation cannot populate the old cache or over
   await f.page.evaluate(() => {
     document.querySelector('.think-text').textContent = 'New source.';
   });
-  await f.page.waitForFunction(() => window.__kct.state.active === 2);
+  await f.page.waitForFunction(() => window.__kct.state.active === 1 &&
+    [...window.__kct.state.inFlight.values()][0]?.text === 'New source.');
   f.release();
   await f.done();
   await f.page.waitForFunction(() => window.__kct.state.active === 0);
@@ -1366,4 +1376,364 @@ test('removed blocks release pending animation frames and streaming debounce tim
   await g.page.waitForFunction(() => window.debounceTimers.size === 0);
   assert.equal(g.requests.length, 0);
   assert.deepEqual(g.errors, []);
+});
+
+test('cache batches and LRU touches debounce persistence and lifecycle events flush once', async (t) => {
+  const f = await fixture(t, { manual: true, clock: '2026-10-22T00:00:00Z' });
+  await f.page.clock.pauseAt(new Date('2026-10-22T00:00:01Z'));
+  const result = await f.page.evaluate(async () => {
+    const set = Storage.prototype.setItem;
+    window.cacheWrites = [];
+    Storage.prototype.setItem = function (key, value) {
+      if (key === 'kct:cache:v1') window.cacheWrites.push(value);
+      return set.call(this, key, value);
+    };
+    const source = Array.from({ length: 20 }, (_, i) => `Debounced paragraph ${i}.`).join('\n\n');
+    await window.__kct.translateText(source, 'zh');
+    window.cachedSource = source;
+    return { size: window.__kct.state.cache.size, writes: window.cacheWrites.length };
+  });
+  assert.deepEqual(result, { size: 20, writes: 0 });
+  assert.equal(f.requests.length, 3);
+  await f.page.clock.runFor(999);
+  assert.equal(await f.page.evaluate(() => window.cacheWrites.length), 0);
+  await f.page.clock.runFor(1);
+  assert.equal(await f.page.evaluate(() => window.cacheWrites.length), 1);
+  const hits = await f.page.evaluate(async () => {
+    const progress = [];
+    await window.__kct.translateText(window.cachedSource, 'zh', (...args) => progress.push(args));
+    return { writes: window.cacheWrites.length, progress: progress.map(([, done, total]) => [done, total]) };
+  });
+  assert.deepEqual(hits, { writes: 1, progress: [[20, 20]] });
+  assert.equal(f.requests.length, 3);
+  await f.page.evaluate(() => dispatchEvent(new Event('beforeunload')));
+  assert.equal(await f.page.evaluate(() => window.cacheWrites.length), 2);
+  await f.page.evaluate(async () => {
+    await window.__kct.translateText(window.cachedSource, 'zh');
+    dispatchEvent(new Event('pagehide'));
+  });
+  assert.equal(await f.page.evaluate(() => window.cacheWrites.length), 3);
+  await f.page.clock.runFor(2000);
+  assert.equal(await f.page.evaluate(() => window.cacheWrites.length), 3);
+  assert.deepEqual(f.errors, []);
+});
+
+test('quota failure retries with the newest 125 rows, then preserves storage in memory-only mode', async (t) => {
+  for (const alwaysFail of [false, true]) {
+    await t.test(alwaysFail ? 'memory only' : 'trimmed retry succeeds', async (t) => {
+      const f = await fixture(t, { manual: true, cache: '[]', clock: '2026-10-22T00:00:00Z' });
+      await f.page.evaluate((alwaysFail) => {
+        const cache = window.__kct.state.cache;
+        for (let i = 0; i < 500; i += 1) {
+          cache.set(`1-1-1:${i.toString(36)}-1-1`, { text: `Retained ${i}.`, usedAt: Date.now() });
+        }
+        window.quotaWrites = [];
+        window.cacheRemovals = 0;
+        const set = Storage.prototype.setItem;
+        const remove = Storage.prototype.removeItem;
+        Storage.prototype.setItem = function (key, value) {
+          if (key === 'kct:cache:v1') {
+            window.quotaWrites.push(JSON.parse(value));
+            if (alwaysFail || window.quotaWrites.length === 1) throw new DOMException('full', 'QuotaExceededError');
+          }
+          return set.call(this, key, value);
+        };
+        Storage.prototype.removeItem = function (key) {
+          if (key === 'kct:cache:v1') window.cacheRemovals += 1;
+          return remove.call(this, key);
+        };
+      }, alwaysFail);
+      await f.page.evaluate(() => window.__kct.translateText('A fresh quota source.', 'zh'));
+      await f.page.clock.runFor(1000);
+      const result = await f.page.evaluate(() => ({
+        lengths: window.quotaWrites.map((rows) => rows.length),
+        newest: window.quotaWrites[1].at(-1)[1],
+        size: window.__kct.state.cache.size,
+        stored: JSON.parse(localStorage.getItem('kct:cache:v1')).length,
+        removed: window.cacheRemovals,
+      }));
+      assert.deepEqual(result, {
+        lengths: [500, 125], newest: 'zh-Hans:A fresh quota source.',
+        size: 125, stored: alwaysFail ? 0 : 125, removed: 0,
+      });
+      await f.page.evaluate(() => window.__kct.translateText('Another quota source.', 'zh'));
+      await f.page.clock.runFor(1000);
+      await f.page.evaluate(() => dispatchEvent(new Event('beforeunload')));
+      assert.equal(await f.page.evaluate(() => window.quotaWrites.length), alwaysFail ? 2 : 3);
+      assert.equal(await f.page.evaluate(() => window.__kct.state.cache.size), 126);
+      assert.deepEqual(f.errors, []);
+    });
+  }
+});
+
+test('cached 400000-character results merge once instead of notifying for each piece', async (t) => {
+  const f = await fixture(t, { manual: true });
+  const result = await f.page.evaluate(async () => {
+    const source = Array.from({ length: 400 }, (_, i) =>
+      String(i).padStart(3, '0') + 'x'.repeat(997)).join('\n\n');
+    window.fetch = async (url, options) => new Response(JSON.stringify(JSON.parse(options.body)
+      .map((text) => ({ translations: [{ text: `译:${text}` }] }))));
+    const first = await window.__kct.translateText(source, 'zh');
+    const progress = [];
+    const cached = await window.__kct.translateText(source, 'zh', (text, done, total) =>
+      progress.push({ length: text.length, done, total }));
+    return { same: first === cached, progress, cached: window.__kct.state.cache.size };
+  });
+  assert.deepEqual(result, {
+    same: true, progress: [{ length: 401598, done: 400, total: 400 }], cached: 400,
+  });
+  assert.deepEqual(f.errors, []);
+});
+
+test('asynchronous pieces notify once per frame and commit the final result immediately', async (t) => {
+  const f = await fixture(t, { manual: true });
+  await f.page.evaluate(() => {
+    window.frames = new Map();
+    let next = 0;
+    window.requestAnimationFrame = (fn) => { window.frames.set(++next, fn); return next; };
+    window.cancelAnimationFrame = (id) => window.frames.delete(id);
+    window.replies = [];
+    window.progress = [];
+    window.fetch = (url, options) => new Promise((resolve) => window.replies.push(() =>
+      resolve(new Response(JSON.stringify(JSON.parse(options.body)
+        .map((text) => ({ translations: [{ text: `译:${text}` }] })))))));
+    const source = Array.from({ length: 24 }, (_, i) => `Frame paragraph ${i}.`).join('\n\n');
+    window.frameResult = window.__kct.translateText(source, 'zh', (text, done, total) =>
+      window.progress.push({ text, done, total }));
+  });
+  await f.page.evaluate(async () => {
+    window.replies[0]();
+    window.replies[1]();
+    for (let i = 0; i < 20; i += 1) await Promise.resolve();
+  });
+  assert.deepEqual(await f.page.evaluate(() => ({
+    callbacks: window.frames.size, notified: window.progress.length,
+  })), { callbacks: 1, notified: 0 });
+  await f.page.evaluate(() => {
+    const callbacks = [...window.frames.values()];
+    window.frames.clear();
+    callbacks.forEach((fn) => fn());
+  });
+  assert.deepEqual(await f.page.evaluate(() => window.progress.map(({ done, total }) => [done, total])), [[16, 24]]);
+  const result = await f.page.evaluate(async () => {
+    window.replies[2]();
+    const text = await window.frameResult;
+    return { counts: window.progress.map(({ done, total }) => [done, total]),
+      final: window.progress.at(-1).text === text, pending: window.frames.size };
+  });
+  assert.deepEqual(result, { counts: [[16, 24], [24, 24]], final: true, pending: 0 });
+  assert.deepEqual(f.errors, []);
+});
+
+test('Bing keeps successful batch rows and only retries invalid rows as singles', async (t) => {
+  const f = await fixture(t, { manual: true });
+  const result = await f.page.evaluate(async () => {
+    const calls = [];
+    window.fetch = async (url, options) => {
+      const texts = JSON.parse(options.body);
+      calls.push(texts);
+      return new Response(JSON.stringify(texts.map((text, i) =>
+        ({ translations: [{ text: texts.length > 1 && i === 1 ? '' : `译:${text}` }] }))));
+    };
+    const source = 'First success.\n\nInvalid row.\n\nThird success.';
+    const first = await window.__kct.translateText(source, 'zh');
+    const cached = await window.__kct.translateText(source, 'zh');
+    return { calls, first, cached, size: window.__kct.state.cache.size };
+  });
+  assert.deepEqual(result.calls, [['First success.', 'Invalid row.', 'Third success.'], ['Invalid row.']]);
+  assert.equal(result.first, '译:First success.\n\n译:Invalid row.\n\n译:Third success.');
+  assert.equal(result.cached, result.first);
+  assert.equal(result.size, 3);
+  assert.deepEqual(f.errors, []);
+});
+
+test('custom requests get 60 seconds while Bing and Google retain 15 seconds', async (t) => {
+  const f = await fixture(t, { manual: true, clock: '2026-10-22T00:00:00Z' });
+  await f.page.clock.pauseAt(new Date('2026-10-22T00:00:01Z'));
+  await f.page.evaluate(() => {
+    window.timeoutSignals = {};
+    window.timeoutResults = {};
+    window.fetch = (url, options) => {
+      const host = new URL(url).hostname;
+      window.timeoutSignals[host] = options.signal;
+      return new Promise((resolve, reject) => options.signal.addEventListener('abort',
+        () => reject(new DOMException('aborted', 'AbortError')), { once: true }));
+    };
+    Math.random = () => 0.5;
+    for (const provider of ['bing', 'google', 'custom']) {
+      void window.__kct.translateText(`${provider} timeout.`, 'zh', () => {}, {
+        provider, customEndpoint: 'https://custom.test/translate',
+      }).catch((error) => { window.timeoutResults[provider] = error.message; });
+    }
+  });
+  await f.page.clock.runFor(14999);
+  assert.deepEqual(await f.page.evaluate(() => Object.values(window.timeoutSignals).map((signal) => signal.aborted)),
+    [false, false, false]);
+  await f.page.clock.runFor(1);
+  assert.deepEqual(await f.page.evaluate(() => Object.values(window.timeoutSignals).map((signal) => signal.aborted)),
+    [true, true, false]);
+  await f.page.clock.runFor(45000);
+  assert.equal(await f.page.evaluate(() => window.timeoutSignals['custom.test'].aborted), true);
+  assert.deepEqual(f.errors, []);
+});
+
+test('the enable toggle persists, cancels active work, and restores translation when enabled', async (t) => {
+  const f = await fixture(t, { holdResponses: true });
+  await f.open();
+  await f.page.waitForFunction(() => window.__kct.state.active === 1);
+  await f.page.getByRole('button', { name: '思维链翻译设置' }).click();
+  await f.page.getByLabel('启用翻译', { exact: true }).uncheck();
+  await f.page.waitForFunction(() => window.__kct.state.active === 0);
+  assert.equal(await f.page.evaluate(() => JSON.parse(localStorage.getItem('kct:settings:v1')).enabled), false);
+  assert.equal(await f.page.locator('pre:not([data-kct])').isVisible(), true);
+  assert.equal(await f.page.locator('.kct-translated').count(), 0);
+  await f.page.getByLabel('启用翻译', { exact: true }).check();
+  f.release();
+  await f.done();
+  assert.equal(await f.page.evaluate(() => window.__kct.state.settings.enabled), true);
+  assert.equal(await f.page.locator('.kct-status').isDisabled(), true);
+  assert.deepEqual(f.errors, []);
+});
+
+test('streaming single paragraphs translate stable sentences by length or maximum wait and keep their tail', async (t) => {
+  for (const long of [false, true]) {
+    await t.test(long ? '9600 characters without blank lines' : 'short paragraph waits three seconds', async (t) => {
+      const prefix = long ? 'Inspect the next input. '.repeat(400) : 'Dr. Jones checks v1.2.3. Then verify the input. ';
+      const tail = 'A still growing tail';
+      const source = prefix + tail;
+      if (long) assert(source.length >= 9600);
+      const f = await fixture(t, { texts: [source], streaming: true, clock: '2026-10-22T00:00:00Z' });
+      await f.open();
+      await f.page.clock.runFor(800);
+      if (!long) {
+        assert.equal(f.requests.length, 0);
+        await f.page.clock.runFor(2300);
+      }
+      await f.page.waitForFunction(() => !!document.querySelector('.kct-translated'));
+      assert(f.requests.length > 0);
+      if (!long) assert.equal(f.requests.flatMap((request) => request.text).join(' '), prefix.trim());
+      assert.equal(f.requests.some((request) => request.text.some((text) => text.includes(tail))), false);
+      assert((await f.page.locator('.kct-translated').textContent()).endsWith(tail));
+      assert.equal(await f.page.locator('pre:not([data-kct])').textContent(), source);
+      assert.equal((await f.page.locator('.kct-translated').textContent()).replaceAll('zh-Hans:', ''), source);
+      await f.page.evaluate(() => document.querySelector('.think').classList.remove('streaming'));
+      await f.done();
+      assert(f.requests.flatMap((request) => request.text).some((text) => text.includes(tail)));
+      assert.deepEqual(f.errors, []);
+    });
+  }
+});
+
+test('streaming boundaries keep open and closed fences intact, including blank lines inside code', async (t) => {
+  const fence = '```js\nconst literal = "Do not split. ";\n\nconst tail = 2;\n';
+  const f = await fixture(t, {
+    streaming: true, clock: '2026-10-22T00:00:00Z', texts: [`Inspect the input.\n${fence}`],
+  });
+  await f.open();
+  await f.page.clock.runFor(3100);
+  await f.page.waitForFunction(() => !!document.querySelector('.kct-translated'));
+  assert.deepEqual(f.requests.flatMap((request) => request.text), ['Inspect the input.']);
+  assert((await f.page.locator('.kct-translated').textContent()).endsWith(fence));
+  await f.page.evaluate(() => {
+    document.querySelector('.think-text').textContent += '```\n\nThen verify the result.\n\nGrowing tail';
+  });
+  await f.page.clock.runFor(800);
+  await f.page.waitForFunction(() => document.querySelector('.kct-translated')?.textContent.includes('zh-Hans:Then verify'));
+  assert.equal(f.requests.flatMap((request) => request.text).some((text) => /const literal|Do not split|const tail/.test(text)), false);
+  assert((await f.page.locator('.kct-translated').textContent()).includes(`${fence}\`\`\``));
+  assert.deepEqual(f.errors, []);
+});
+
+test('shared batch aborts only after its last live consumer disappears', async (t) => {
+  const f = await fixture(t, { manual: true });
+  await f.page.evaluate(() => {
+    window.liveFirst = window.liveShared = window.liveLast = true;
+    window.signals = [];
+    window.responses = [];
+    window.fetch = (url, options) => {
+      window.signals.push(options.signal);
+      return new Promise((resolve, reject) => {
+        options.signal.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')), { once: true });
+        window.responses.push(() => resolve(new Response(JSON.stringify(JSON.parse(options.body)
+          .map((text) => ({ translations: [{ text: `译:${text}` }] }))))));
+      });
+    };
+    const settings = { provider: 'bing' };
+    window.firstResult = window.__kct.translateText('Abandoned piece.\n\nShared piece.', 'zh',
+      () => {}, settings, () => window.liveFirst).catch((error) => error.message);
+    window.sharedResult = window.__kct.translateText('Shared piece.', 'zh',
+      () => {}, settings, () => window.liveShared);
+    window.liveFirst = false;
+    document.body.append(document.createElement('section'));
+  });
+  assert.match(await f.page.evaluate(() => window.firstResult), /取消/);
+  assert.equal(await f.page.evaluate(() => window.signals[0].aborted), false);
+  const shared = await f.page.evaluate(async () => {
+    window.responses[0]();
+    return window.sharedResult;
+  });
+  assert.equal(shared, '译:Shared piece.');
+  assert.deepEqual(await f.page.evaluate(() => [...window.__kct.state.cache.values()].map(({ text }) => text)), ['译:Shared piece.']);
+  await f.page.evaluate(() => {
+    window.lastResult = window.__kct.translateText('Sole piece.', 'zh', () => {},
+      { provider: 'bing' }, () => window.liveLast).catch((error) => error.message);
+    window.liveLast = false;
+    document.body.append(document.createElement('section'));
+  });
+  assert.match(await f.page.evaluate(() => window.lastResult), /取消/);
+  await f.page.waitForFunction(() => window.__kct.state.active === 0);
+  assert.equal(await f.page.evaluate(() => window.signals[1].aborted), true);
+  assert.deepEqual(await f.page.evaluate(() => ({
+    pending: window.__kct.state.inFlight.size, failures: window.__kct.state.failures.size,
+  })), { pending: 0, failures: 0 });
+  assert.deepEqual(f.errors, []);
+});
+
+test('newly requested blocks get a queue turn before a long history is drained', async (t) => {
+  for (const shared of [false, true]) {
+    await t.test(shared ? 'promotes a shared history fragment' : 'new fragment', async (t) => {
+      const f = await fixture(t, { manual: true });
+      await f.page.evaluate((shared) => {
+        window.historyLive = true;
+        window.fairCalls = [];
+        window.fairReplies = [];
+        window.fetch = (url, options) => {
+          const text = new URLSearchParams(options.body).get('q');
+          window.fairCalls.push(text);
+          return new Promise((resolve, reject) => {
+            options.signal.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')), { once: true });
+            window.fairReplies.push(() => resolve(new Response(JSON.stringify([[['译:' + text]]]))));
+          });
+        };
+        const history = Array.from({ length: 80 }, (_, i) => `History ${i}.`).join('\n\n');
+        window.historyResult = window.__kct.translateText(history, 'zh', () => {},
+          { provider: 'google' }, () => window.historyLive).catch((error) => error.message);
+        window.newSource = shared ? 'History 79.' : 'Newly expanded block.';
+        window.newBlockResult = window.__kct.translateText(window.newSource, 'zh', () => {}, { provider: 'google' });
+      }, shared);
+      assert.deepEqual(await f.page.evaluate(() => ({
+        active: window.__kct.state.active, queued: window.__kct.state.queue.length,
+      })), { active: 3, queued: 2 });
+      await f.page.evaluate(async () => {
+        window.fairReplies[0]();
+        for (let i = 0; i < 20; i += 1) await Promise.resolve();
+        window.fairReplies[1]();
+        for (let i = 0; i < 20; i += 1) await Promise.resolve();
+      });
+      await f.page.waitForFunction(() => window.fairCalls.includes(window.newSource));
+      const result = await f.page.evaluate(async () => {
+        const index = window.fairCalls.indexOf(window.newSource);
+        window.fairReplies[index]();
+        const translated = await window.newBlockResult;
+        window.historyLive = false;
+        document.body.append(document.createElement('section'));
+        return { index, translated };
+      });
+      assert(result.index <= 4, 'new work runs after at most one already queued history batch');
+      assert.equal(result.translated, shared ? '译:History 79.' : '译:Newly expanded block.');
+      assert.match(await f.page.evaluate(() => window.historyResult), /取消/);
+      await f.page.waitForFunction(() => window.__kct.state.active === 0 && window.__kct.state.queue.length === 0);
+      assert.deepEqual(f.errors, []);
+    });
+  }
 });
