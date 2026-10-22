@@ -73,10 +73,18 @@ function assertInstallPlatform({
   if (!/^24\./.test(nodeVersion)) throw new Error(`Installation requires Node 24; found ${nodeVersion}`);
 }
 
-export function parseProcess(text) {
-  const fields = /^\s*(\d+)\s+(\d+)\s+(\w{3}\s+\w{3}\s+\d+\s+\d{2}:\d{2}:\d{2}\s+\d{4})\s+(.*?)\s*$/.exec(text);
-  if (!fields) throw new Error('Cannot identify the Kimi main process');
-  return { pid: Number(fields[1]), uid: Number(fields[2]), started: fields[3], executable: fields[4] };
+const PROCESS_START_RE = /^\s*(\d+)\s+(\d+)\s+(\w{3})\s+(\w{3})\s+(\d+)\s+(\d{2}):(\d{2}):(\d{2})\s+(\d{4})\s+(.*?)\s*$/;
+const MONTHS = { Jan: 0, Feb: 1, Mar: 2, Apr: 3, May: 4, Jun: 5, Jul: 6, Aug: 7, Sep: 8, Oct: 9, Nov: 10, Dec: 11 };
+
+export function parseProcess(text, parseStarted = Date.parse) {
+  const fields = PROCESS_START_RE.exec(text);
+  if (!fields || !(fields[4] in MONTHS)) throw new Error('Cannot identify the Kimi main process');
+  const started = `${fields[3]} ${fields[4]} ${fields[5]} ${fields[6]}:${fields[7]}:${fields[8]} ${fields[9]}`;
+  return {
+    pid: Number(fields[1]), uid: Number(fields[2]), started,
+    // ps lstart is wall-clock local time; the caller decides how it maps to an epoch.
+    startedAt: parseStarted(started), executable: fields[10],
+  };
 }
 
 export async function processIdentity(pid) {
@@ -426,7 +434,7 @@ export async function tick(deps = {}) {
     if (args.includes('--user-data-dir') || args.includes('--remote-debugging') || args.includes('--inspect')) {
       return persist(waiting('A test or debugging instance is running; skipped', {}, now()));
     }
-    if (now() - Date.parse(info.started) < 5000) return persist(waiting('Kimi is starting', {}, now()));
+    if (now() - info.startedAt < 5000) return persist(waiting('Kimi is starting', {}, now()));
     // Persist before attachment so a crashed loader cannot blindly repeat its signal.
     await persist(state);
     const app = await verify();

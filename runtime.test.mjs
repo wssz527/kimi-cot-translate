@@ -9,14 +9,21 @@ import { assertIdentity, assertRendererContract, attachInspector, deploy, inspec
   inspectFuses, parseProcess, permanentError, portOpen, rendererBootstrap, readBundle, saveState,
   stageBundle, switchBundle, tick, verifyApp } from './runtime.mjs';
 
+const startedUTC = (text) => {
+  const [, month, day, time, year] = /\w{3} (\w{3}) (\d+) (\d{2}:\d{2}:\d{2}) (\d{4})/.exec(text);
+  const months = { Jan: 0, Feb: 1, Mar: 2, Apr: 3, May: 4, Jun: 5, Jul: 6, Aug: 7, Sep: 8, Oct: 9, Nov: 10, Dec: 11 };
+  const [h, m, sec] = time.split(':').map(Number);
+  return Date.UTC(Number(year), months[month], Number(day), h, m, sec);
+};
 const INFO = parseProcess(
-  `85123 ${process.getuid()} Wed Oct 21 21:58:18 2026 /Applications/Kimi Code.app/Contents/MacOS/Kimi Code`,
+  `85123 ${process.getuid()} Wed Oct 21 13:58:18 2026 /Applications/Kimi Code.app/Contents/MacOS/Kimi Code`,
+  startedUTC,
 );
 const CORE_FILES = ['runtime.mjs', 'runtime-hook.mjs', 'supported-runtimes.json', 'kct.js'];
 
 function tickFixture() {
   let previous = {}, found = [INFO], installed = 0, verified = 0, saves = 0;
-  let time = Date.parse('Wed Oct 21 21:58:30 2026');
+  let time = Date.UTC(2026, 9, 21, 13, 58, 30);
   const deps = {
     saveState: async (state) => { previous = structuredClone(state); saves++; },
     readState: async () => structuredClone(previous),
@@ -34,12 +41,12 @@ function tickFixture() {
 }
 
 test('only an unchanged main process owned by this user is eligible for a signal', () => {
-  const info = parseProcess(`85123 ${process.getuid()} Wed Oct 21 21:58:18 2026 /Applications/Kimi Code.app/Contents/MacOS/Kimi Code`);
+  const info = parseProcess(`85123 ${process.getuid()} Wed Oct 21 13:58:18 2026 /Applications/Kimi Code.app/Contents/MacOS/Kimi Code`, startedUTC);
   assert.equal(info.pid, 85123);
-  assert.equal(info.started, 'Wed Oct 21 21:58:18 2026');
+  assert.equal(info.started, 'Wed Oct 21 13:58:18 2026');
   assertIdentity(info);
   for (const changed of [
-    { ...info, pid: info.pid + 1 }, { ...info, started: 'Wed Oct 21 21:58:19 2026' },
+    { ...info, pid: info.pid + 1 }, { ...info, started: 'Wed Oct 21 13:58:19 2026' },
     { ...info, uid: info.uid + 1 },
     { ...info, executable: '/Applications/Kimi Code.app/Contents/MacOS/Kimi Code Helper' },
   ]) assert.throws(() => assertIdentity(changed, info));
@@ -109,7 +116,7 @@ test('a settled attempt survives the multi-instance round trip without a second 
     portOpen: async () => false,
     verifyApp: async () => ({ version: '1.1.1', electron: '43.1.1', executable: 'app-fingerprint' }),
     installIntoProcess: async () => { installed += 1; return { loaded: 1 }; },
-    now: () => Date.parse('Wed Oct 21 21:58:30 2026'),
+    now: () => Date.UTC(2026, 9, 21, 13, 58, 30),
   };
   const second = { ...INFO, pid: INFO.pid + 1 };
 
@@ -146,7 +153,7 @@ test('a supported-runtime allowlist change retries the same process', async () =
     portOpen: async () => false,
     verifyApp: async () => ({ version: '1.1.1', electron: '43.1.1', executable: 'app-fingerprint' }),
     installIntoProcess: async () => { installed += 1; return { loaded: 1 }; },
-    now: () => Date.parse('Wed Oct 21 21:58:30 2026'),
+    now: () => Date.UTC(2026, 9, 21, 13, 58, 30),
   };
   await tick({ ...base, findProcesses: async () => [INFO], output: async () => '' });
   const firstRevision = previous.revision;
@@ -215,7 +222,7 @@ test('signature rejection, unknown runtime hashes and fuse mismatches are perman
 
 test('PID and process start changes each reset the retry budget', async () => {
   for (const changed of [{ ...INFO, pid: INFO.pid + 1 },
-    { ...INFO, started: 'Wed Oct 21 21:58:19 2026' }]) {
+    { ...INFO, started: 'Wed Oct 21 13:58:19 2026' }]) {
     const f = tickFixture();
     f.deps.verifyApp = async () => { throw new Error('temporary IO failure'); };
     assert.equal((await tick(f.deps)).attempts, 1);
