@@ -25,7 +25,7 @@ code --extensionDevelopmentPath="$PWD/vscode"
 
 构建必需，会把主仓库当前的 `kct.js` 复制到 `vscode/vendor/kct.cjs`。`vendor/` 不入库，源码和 VSIX 依赖构建产物。运行时调用共享的 `translateText(source, target, onProgress, settings, valid)` 和 `prunePending()`，复用分段、语言判断、队列、缓存与请求超时。需要 Node 导出 `{ translateText, state, TARGET_LANGUAGES, prunePending }`；没有此入口时构建失败，不生成假的翻译器。更新共享引擎后重新构建。
 
-源码使用 VS Code 官方的扩展开发入口。若已有 Microsoft 官方 `@vscode/vsce` 工具，可先执行 `node build.cjs`，再在 `vscode/` 执行 `vsce package --no-dependencies --skip-license --allow-missing-repository` 打包，生成包后会包含 `vendor/kct.cjs`，再用 VS Code 的 `Extensions: Install from VSIX...` 安装。当前未安装或激活第三方扩展、未自动安装本扩展。
+源码使用 VS Code 官方的扩展开发入口。若已有 Microsoft 官方 `@vscode/vsce` 工具，可先执行 `node build.cjs`，再在 `vscode/` 执行 `vsce package --no-dependencies` 打包，生成包后会包含 `vendor/kct.cjs`，再用 VS Code 的 `Extensions: Install from VSIX...` 安装。当前未安装或激活第三方扩展、未自动安装本扩展。
 
 ## 数据与失败行为
 

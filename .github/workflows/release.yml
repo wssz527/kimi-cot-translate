@@ -1,0 +1,69 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-node@v7.1.0
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npx playwright install chromium
+      - name: Verify version consistency
+        run: |
+          node scripts/version-sync.mjs
+          git diff --exit-code -- browser/manifest.json vscode/package.json cli.mjs
+      - name: Run test suites
+        run: |
+          npm test
+          npm run test:browser
+          npm run test:vscode
+          npm run test:windows
+          npm run test:macos
+      - name: Build distributables
+        run: |
+          npm run build:browser
+          npm run build:vscode
+      - name: Package artifacts
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME}"
+          STAGE="release-stage"
+          rm -rf "$STAGE" && mkdir -p "$STAGE/kimi-cot-translate-${VERSION}"
+          git archive --format=tar HEAD | tar -x -C "$STAGE/kimi-cot-translate-${VERSION}"
+          # Ensure generated entry points are present for out-of-box use.
+          cp -r browser/dist "$STAGE/kimi-cot-translate-${VERSION}/browser/dist"
+          mkdir -p "$STAGE/kimi-cot-translate-${VERSION}/vscode/vendor"
+          cp vscode/vendor/kct.cjs "$STAGE/kimi-cot-translate-${VERSION}/vscode/vendor/"
+          (cd "$STAGE" && zip -qr "../kimi-cot-translate-${VERSION}.zip" "kimi-cot-translate-${VERSION}")
+          (cd browser/dist && zip -qr "../../../kct-browser-${VERSION}.zip" .)
+          (cd "$STAGE/kimi-cot-translate-${VERSION}/vscode" && zip -qr "../../../kct-copied-thinking-${VERSION}.vsix" .)
+          shasum -a 256 "kimi-cot-translate-${VERSION}.zip" "kct-browser-${VERSION}.zip" "kct-copied-thinking-${VERSION}.vsix" > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+      - name: Smoke test packaged source
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME}"
+          rm -rf smoke && mkdir smoke
+          (cd smoke && unzip -q "../kimi-cot-translate-${VERSION}.zip")
+          (cd "smoke/kimi-cot-translate-${VERSION}" && node --test runtime-hook.test.mjs)
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file RELEASE_NOTES.md \
+            "kimi-cot-translate-${GITHUB_REF_NAME}.zip" \
+            "kct-browser-${GITHUB_REF_NAME}.zip" \
+            "kct-copied-thinking-${GITHUB_REF_NAME}.vsix" \
+            SHA256SUMS.txt

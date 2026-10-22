@@ -8,9 +8,13 @@
   "engines": {
     "vscode": "^1.100.0"
   },
-  "extensionKind": ["ui"],
+  "extensionKind": [
+    "ui"
+  ],
   "main": "./extension.cjs",
-  "categories": ["Other"],
+  "categories": [
+    "Other"
+  ],
   "contributes": {
     "commands": [
       {
@@ -23,5 +27,6 @@
     "build": "node build.cjs",
     "vscode:prepublish": "node build.cjs",
     "test": "node --test test.cjs"
-  }
+  },
+  "license": "MIT"
 }

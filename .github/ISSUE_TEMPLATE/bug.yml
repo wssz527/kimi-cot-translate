@@ -1,0 +1,41 @@
+name: Bug 报告
+description: 某个入口不工作、行为异常或报错
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        > **请勿粘贴**：会话/思考正文、`kct:settings:v1`、`kct:cache:v1`、API key、`#token=` 链接、`runtime.log` 全文。详见 SECURITY.md。
+  - type: dropdown
+    id: surface
+    attributes:
+      label: 出问题的入口
+      options:
+        - 桌面端 macOS
+        - 桌面端 Windows
+        - CLI 翻译终端
+        - 浏览器扩展（Kimi Code Web）
+        - 浏览器扩展（kimi.com）
+        - VS Code 预览
+    validations:
+      required: true
+  - type: input
+    id: env
+    attributes:
+      label: 环境
+      description: OS 及架构、node --version、Kimi Code 版本
+      placeholder: macOS 15 arm64 / Node v24.19.0 / Kimi Code 1.1.1
+    validations:
+      required: true
+  - type: textarea
+    id: check
+    attributes:
+      label: 检查输出
+      description: 桌面端请贴 `runtime.mjs --check`（或 Windows 对应命令）输出中的 status 与 detail 两个字段，不要贴整个文件
+      placeholder: '"status": "error", "detail": "..."'
+  - type: textarea
+    id: repro
+    attributes:
+      label: 复现步骤与预期/实际行为
+    validations:
+      required: true

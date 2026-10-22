@@ -1,0 +1,31 @@
+name: 兼容性报告（宿主更新后失效）
+description: Kimi Code 更新后翻译消失或拒绝挂载
+labels: [compatibility]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        宿主更新导致失效是预期内的 fail-closed 行为，本模板用于收集适配所需信息。
+        **不要**按任何指引手工修改 `supported-runtimes.json` 或添加未知哈希。
+        请勿粘贴会话正文、API key 或日志全文（见 SECURITY.md）。
+  - type: input
+    id: versions
+    attributes:
+      label: 新旧版本
+      description: 更新前后的 Kimi Code 版本与 Electron 版本（关于页或 `--check` 输出）
+      placeholder: 1.1.1 (Electron 43.1.1) → 1.2.0 (Electron ??)
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: 平台
+      placeholder: macOS arm64 / Windows x64
+    validations:
+      required: true
+  - type: textarea
+    id: detail
+    attributes:
+      label: 现象与 --check 输出的 status/detail 字段
+    validations:
+      required: true

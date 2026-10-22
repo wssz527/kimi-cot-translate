@@ -1,7 +1,6 @@
 {
   "name": "kimi-cot-translate",
   "version": "0.1.0",
-  "private": true,
   "engines": {
     "node": "24.x"
   },
@@ -12,7 +11,8 @@
     "test:browser": "node --test --test-timeout=30000 browser/browser.test.mjs",
     "build:browser": "node browser/build.mjs",
     "test:vscode": "node --test vscode/test.cjs",
-    "build:vscode": "node vscode/build.cjs"
+    "build:vscode": "node vscode/build.cjs",
+    "version:sync": "node scripts/version-sync.mjs"
   },
   "devDependencies": {
     "playwright": "1.63.0"
@@ -22,5 +22,20 @@
     "type": "git",
     "url": "https://github.com/wssz527/kimi-cot-translate.git"
   },
-  "homepage": "https://github.com/wssz527/kimi-cot-translate#readme"
+  "homepage": "https://github.com/wssz527/kimi-cot-translate#readme",
+  "private": true,
+  "license": "MIT",
+  "author": "wssz527",
+  "bugs": {
+    "url": "https://github.com/wssz527/kimi-cot-translate/issues"
+  },
+  "keywords": [
+    "kimi-code",
+    "thinking",
+    "chain-of-thought",
+    "translation",
+    "i18n",
+    "electron",
+    "browser-extension"
+  ]
 }
