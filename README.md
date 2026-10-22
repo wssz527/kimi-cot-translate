@@ -235,6 +235,7 @@ node runtime-windows.mjs --disable
 ## 已知限制
 
 - 仅验证 Kimi Code 1.1.1 / Electron 43.1.1；跨版本升级、睡眠唤醒、长期运行尚未验收。
+- 不支持 Kimi 桌面端（Kimi.app，com.moonshot.kimichat）：官方在其 Electron 二进制中关闭了 Node inspector fuse，本项目的运行时注入机制在技术上无法挂载，且本项目不会通过修改官方二进制绕过。Kimi 网页版（kimi.com）用户请使用浏览器扩展入口。
 - kimi.com 普通聊天页未在登录会话验收；VS Code 入口未在真实扩展宿主验收。
 - 翻译使用公共免鉴权端点（Bing / Google），无 SLA，可能限流、变更或受服务方条款约束；长期或大量使用建议使用自带凭据的自定义服务。
 - 自定义服务的 API key 明文保存在本机 localStorage。

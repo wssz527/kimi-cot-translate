@@ -20,3 +20,7 @@
 ## 尚未验收
 
 真实跨版本升级（旧版安装 → 宿主更新 → 自动恢复）、睡眠唤醒、长期运行、另一台实机。
+
+## 不适配的宿主
+
+**Kimi 桌面端（Kimi.app，com.moonshot.kimichat，3.2.15 验证）**：与本项目机制不兼容，无适配计划。本项目的挂载依赖 Electron 的 Node inspector fuse（`EnableNodeCliInspectArguments`）；Kimi Code 的 fuse 串为 `101100001`（开启），而 Kimi.app 官方二进制为 `100011001`（关闭）。打开它需要修改官方 Electron Framework 二进制，会破坏签名并违背本项目「不修改、不重签官方 App」的原则，因此不予考虑。Kimi 网页版（kimi.com）用户可使用浏览器扩展入口（实验性）。

@@ -233,6 +233,7 @@ During attachment, a localhost-only Node inspector is opened briefly (about 12 s
 ## Known limitations
 
 - Only Kimi Code 1.1.1 / Electron 43.1.1 is verified; cross-version upgrades, sleep/wake and long-running sessions are not yet accepted.
+- The Kimi desktop app (Kimi.app, com.moonshot.kimichat) is not supported: the official Electron binary ships with the Node inspector fuse disabled, so this project's runtime injection mechanism cannot attach, and this project will not patch official binaries to work around it. Kimi web (kimi.com) users should use the browser extension entry instead.
 - The kimi.com general chat page has not been verified in a logged-in session; the VS Code entry has not been verified inside a real extension host.
 - Translation uses public unauthenticated endpoints (Bing / Google) with no SLA; they may be rate-limited, change, or be governed by the providers' terms. For heavy or long-term use, prefer a custom service with your own credentials.
 - Custom-service API keys are stored unencrypted in local localStorage.

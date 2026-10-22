@@ -33,6 +33,7 @@ shasum -a 256 -c SHA256SUMS.txt
 ## 已知限制
 
 - 仅验证 Kimi Code 1.1.1 / Electron 43.1.1；宿主更新后可能停用并等待适配（见 `docs/compat.md`），**请勿手工添加未知哈希**。
+- 不支持 Kimi 桌面端（Kimi.app）：官方二进制关闭了 Node inspector fuse，运行时注入机制无法挂载；Kimi 网页版用户请使用浏览器扩展。
 - 翻译使用公共免鉴权端点（Bing / Google），无 SLA，可能限流或变更；待翻译的思考文本会发往所选第三方端点。
 - 自定义服务的 API key 明文保存在本机 localStorage。
 - 跨版本升级、睡眠唤醒、长期运行尚未验收。
