@@ -14,7 +14,7 @@
 
 | 平台 | 状态 | 当前验证版本 |
 | --- | --- | --- |
-| 桌面端 macOS Apple Silicon | 已验证真实翻译、启动恢复、页面刷新恢复 | Kimi Code 1.1.1 / Electron 43.1.1 |
+| 桌面端 macOS Apple Silicon | 已验证真实翻译、启动恢复、页面刷新恢复 | Kimi Code 1.1.2 / 1.1.1 / Electron 43.1.1 |
 | 桌面端 Windows x64 | 预览适配，CI runner 已验证挂载与安全停用 | 同上 |
 | CLI / 浏览器扩展 / VS Code | 预览（各入口验证边界见下表） | CLI 2.1.1 / Chromium MV3 |
 
@@ -234,7 +234,7 @@ node runtime-windows.mjs --disable
 
 ## 已知限制
 
-- 仅验证 Kimi Code 1.1.1 / Electron 43.1.1；跨版本升级、睡眠唤醒、长期运行尚未验收。
+- 已验证 Kimi Code 1.1.1 与 1.1.2 / Electron 43.1.1；跨版本升级、睡眠唤醒、长期运行尚未验收。
 - 不支持 Kimi 桌面端（Kimi.app，com.moonshot.kimichat）：官方在其 Electron 二进制中关闭了 Node inspector fuse，本项目的运行时注入机制在技术上无法挂载，且本项目不会通过修改官方二进制绕过。Kimi 网页版（kimi.com）用户请使用浏览器扩展入口。
 - kimi.com 普通聊天页未在登录会话验收；VS Code 入口未在真实扩展宿主验收。
 - 翻译使用公共免鉴权端点（Bing / Google），无 SLA，可能限流、变更或受服务方条款约束；长期或大量使用建议使用自带凭据的自定义服务。
