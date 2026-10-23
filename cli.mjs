@@ -236,7 +236,7 @@ export async function run(options, { input = process.stdin, output = process.std
     process.on('SIGINT', cancel);
     process.on('SIGTERM', cancel);
     const initialized = await client.request('initialize', {
-      protocolVersion: 1, clientInfo: { name: 'kimi-cot-translate', version: '0.2.0' },
+      protocolVersion: 1, clientInfo: { name: 'kimi-cot-translate', version: '0.2.1' },
       clientCapabilities: {},
     });
     if (initialized?.protocolVersion !== 1) throw new Error('Unsupported ACP protocol version');

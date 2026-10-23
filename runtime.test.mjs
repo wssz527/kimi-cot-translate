@@ -816,3 +816,59 @@ test('a helper process whose identity does not match stays excluded', async () =
   });
   assert.deepEqual(found, []);
 });
+
+test('no network access happens while Kimi is not running', async () => {
+  const { tick } = await import('./runtime.mjs');
+  let resolved = 0;
+  const deps = {
+    findProcesses: async () => [],
+    readState: async () => ({}),
+    saveState: async () => {},
+    readFile: async () => 'source',
+    fingerprint: async () => 'fp',
+    portOpen: async () => false,
+    output: async () => '',
+    installIntoProcess: async () => ({ loaded: 1 }),
+    now: () => Date.UTC(2026, 9, 24, 12, 0, 0),
+    update: {
+      version: '0.2.0', dataDir: '/tmp/kct-update-test', updateCheck: true,
+      resolveUpdateFn: async () => { resolved += 1; return { available: false, current: '0.2.0', remote: '0.2.0' }; },
+      applyUpdate: async () => true,
+    },
+  };
+  const state = await tick(deps);
+  assert.equal(state.status, 'waiting');
+  assert.equal(resolved, 0, 'a stopped Kimi must never trigger an update check');
+});
+
+test('one Kimi launch checks for updates once, not on every tick', async () => {
+  const { tick } = await import('./runtime.mjs');
+  let resolved = 0;
+  let previous = {};
+  const deps = {
+    findProcesses: async () => [INFO],
+    readState: async () => structuredClone(previous),
+    saveState: async (state) => { previous = structuredClone(state); },
+    readFile: async () => 'source',
+    fingerprint: async () => 'fp',
+    portOpen: async () => false,
+    output: async () => '',
+    verifyApp: async () => ({ version: '1.1.2', electron: '43.1.1', executable: 'fp' }),
+    installIntoProcess: async () => ({ loaded: 1 }),
+    now: () => Date.UTC(2026, 9, 24, 12, 0, 0),
+    update: {
+      version: '0.2.0', dataDir: '/tmp/kct-update-test', updateCheck: true,
+      resolveUpdateFn: async () => { resolved += 1;
+        return { available: false, current: '0.2.0', remote: '0.2.0' }; },
+      applyUpdate: async () => true,
+    },
+  };
+  await tick(deps);
+  await tick(deps);
+  await tick(deps);
+  assert.equal(resolved, 1, 'the same process must not re-check on later ticks');
+
+  const restarted = { ...INFO, pid: INFO.pid + 1, started: 'Sat Oct 24 12:05:00 2026' };
+  await tick({ ...deps, findProcesses: async () => [restarted] });
+  assert.equal(resolved, 2, 'a fresh Kimi launch checks again');
+});

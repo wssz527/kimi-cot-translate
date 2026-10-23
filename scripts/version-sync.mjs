@@ -30,3 +30,14 @@ if (next !== source) {
   await writeFile(cli, next);
   console.log(`synced cli.mjs clientInfo -> ${version}`);
 }
+
+// The deployed runtime bundle has no package.json, so the version is embedded
+// in runtime-update.mjs; a self-update replaces that file along with the rest.
+const update = join(root, '..', 'runtime-update.mjs');
+const updateSource = await readFile(update, 'utf8');
+const updateNext = updateSource.replace(
+  /(export const RUNTIME_VERSION = ')[^']+(')/, `$1${version}$2`);
+if (updateNext !== updateSource) {
+  await writeFile(update, updateNext);
+  console.log(`synced runtime-update.mjs RUNTIME_VERSION -> ${version}`);
+}

@@ -2,7 +2,7 @@
   "name": "kct-copied-thinking",
   "displayName": "KCT: Translate Copied Thinking",
   "description": "Translate explicitly copied reasoning in a separate preview. Does not modify the official Kimi webview.",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "publisher": "kct-local",
   "private": true,
   "engines": {

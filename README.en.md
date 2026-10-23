@@ -221,13 +221,13 @@ The extension files live outside the official app, so a normal app update never 
 - If `.think`, `.think-head`, `.think-body`, `.think-body-inner` and `.think-text` are all still present after an official update, and the signature, the debugging capability and the Electron major are unchanged, translation simply keeps working — no waiting for a release, no reinstall.
 - Only when one of those five really changes does translation stop and wait for adaptation. That is the "upstream broke, the author must fix it" case.
 
-The extension also follows its own releases: the background task checks the published update manifest every 6 hours, downloads the runtime files when a newer version exists, verifies each SHA-256, and swaps them in atomically (rolling back on failure). It happens in the background and does not disturb translation in the running app. You can also trigger it manually:
+The extension also follows its own releases, but **only while Kimi Code is running**: after each Kimi launch it checks the published update manifest once, downloads the runtime files when a newer version exists, verifies each SHA-256, and swaps them in atomically (rolling back on failure). The same Kimi process is never checked twice, and nothing touches the network while Kimi is closed. You can also trigger it manually:
 
 ```sh
 node runtime.mjs --update
 ```
 
-The outcome lands in the `updateStatus` / `updateVersion` fields of `--check` (`up-to-date` / `installed` / `available` / `failed`).
+The outcome lands in the `updateStatus` / `updateVersion` fields of `--check` (`up-to-date` / `installed` / `available` / `failed`); `updateCheckedFor` records which launch was already checked.
 
 Why the hash allowlist still exists: a fully verified kernel takes the fast path and skips extra probing. An unknown hash no longer trips a hard stop; it falls through to the structural checks above. That is what keeps an official point release from breaking translation.
 

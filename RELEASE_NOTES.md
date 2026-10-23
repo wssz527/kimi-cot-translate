@@ -1,4 +1,4 @@
-# kimi-cot-translate v0.2.0
+# kimi-cot-translate v0.2.1
 
 这个版本的主题是「不用再跟着升级了」。
 
@@ -10,13 +10,13 @@
 
 签名、inspector fuse、Electron 主版本、思考区块结构（`.think` / `.think-head` / `.think-body` / `.think-body-inner` / `.think-text`）四项同时成立就放行。只要官方没动这套 DOM，升级后翻译照常工作。
 
-**组件会自己跟版。** 后台任务每 6 小时检查一次发布的更新清单，有新版本就下载运行时文件、逐个校验 SHA-256、原子替换（失败回滚）。也可以手动触发：
+**组件会自己跟版，但只在你用 Kimi Code 的时候。** 每次 Kimi 启动后检查一次更新清单，有新版本就下载运行时文件、逐个校验 SHA-256、原子替换（失败回滚）。同一个 Kimi 进程只查一次；Kimi 关闭期间不发任何网络请求。也可以手动触发：
 
 ```sh
 node runtime.mjs --update
 ```
 
-**修了一个会导致完全不挂载的 bug。** macOS 的 `pgrep -x` 匹配不到含空格的进程名（`Kimi Code`），后台任务因此误判「Kimi 未运行」。改为扫描进程表并按完整可执行路径精确匹配。
+**修了两个会导致异常的问题。** macOS 的 `pgrep -x` 匹配不到含空格的进程名（`Kimi Code`），后台任务因此误判「Kimi 未运行」，改为扫描进程表并按完整可执行路径精确匹配；另外版本号改为内置于运行时脚本，部署目录缺少 `package.json` 时不再每次运行都写一条错误日志。
 
 ## 安装与校验 / Install & verify
 
@@ -26,9 +26,9 @@ shasum -a 256 -c SHA256SUMS.txt
 
 | 附件 | 用途 |
 | --- | --- |
-| `kimi-cot-translate-v0.2.0.zip` | 完整源码 + 预构建产物（桌面端 `node runtime.mjs --install` 入口） |
-| `kct-browser-v0.2.0.zip` | Chromium 浏览器扩展（解压后「加载已解压的扩展程序」） |
-| `kct-copied-thinking-v0.2.0.vsix` | VS Code 复制预览（`Extensions: Install from VSIX...`） |
+| `kimi-cot-translate-v0.2.1.zip` | 完整源码 + 预构建产物（桌面端 `node runtime.mjs --install` 入口） |
+| `kct-browser-v0.2.1.zip` | Chromium 浏览器扩展（解压后「加载已解压的扩展程序」） |
+| `kct-copied-thinking-v0.2.1.vsix` | VS Code 复制预览（`Extensions: Install from VSIX...`） |
 | `SHA256SUMS.txt` | 上述附件的 SHA-256 校验 |
 
 需要 Node.js 24。从 0.1.0 升级：解压新包后重新执行 `node runtime.mjs --install` 即可，设置与缓存保留。详细步骤见 [README](README.md) / [README.en](README.en.md)。

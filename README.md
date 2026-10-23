@@ -223,13 +223,13 @@ node runtime-windows.mjs --disable
 - 官方更新后如果 `.think` / `.think-head` / `.think-body` / `.think-body-inner` / `.think-text` 这五个结构仍在，且签名、调试能力、Electron 主版本都没变，翻译会直接继续工作，不必等新版、也不必重装。
 - 只有这五项之一真的变了，翻译才会停用并等待适配——这才是「上游坏了、需要我修」的情况。
 
-组件自身也会自动跟版：后台任务每 6 小时检查一次仓库发布的更新清单，发现新版本就下载运行时文件、逐个校验 SHA-256，通过后原子替换（失败自动回滚）。整个过程在后台完成，Kimi 里的翻译不受影响。也可以手动触发：
+组件自身也会自动跟版，但**只在 Kimi Code 运行时**：每次 Kimi 启动后检查一次仓库发布的更新清单，发现新版本就下载运行时文件、逐个校验 SHA-256，通过后原子替换（失败自动回滚）。同一个 Kimi 进程不会重复检查；Kimi 关闭期间不发任何网络请求。也可以手动触发：
 
 ```sh
 node runtime.mjs --update
 ```
 
-停用状态会写在 `--check` 输出的 `updateStatus` / `updateVersion` 字段里（`up-to-date` / `installed` / `available` / `failed`）。
+停用状态会写在 `--check` 输出的 `updateStatus` / `updateVersion` 字段里（`up-to-date` / `installed` / `available` / `failed`），`updateCheckedFor` 记录已检查过的那次启动。
 
 为什么仍然保留哈希允许列表：完全验证过的内核走快速路径，跳过额外探测。未知哈希不再直接熔断，而是转入上面的结构校验——这是「不因官方小版本升级而中断」的关键改动。
 

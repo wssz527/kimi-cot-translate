@@ -387,8 +387,6 @@ function runtimeRevision(source, supported,
   return hash(source + hookSource + loaderSource + supported);
 }
 
-export const UPDATE_INTERVAL_MS = 6 * 60 * 60 * 1000;
-
 // Fetch and install a newer runtime bundle when one is published. Returns
 // { updated: true, from, to } after a successful atomic deploy, or
 // { updated: false, reason } leaving the current deployment untouched.
@@ -411,6 +409,8 @@ export async function selfUpdate({
   return { updated: true, from: check.current, to: check.remote };
 }
 
+// Update once per Kimi launch, not on a timer. `seenProcess` is the launch
+// identity that already triggered a check; a fresh Kimi start has a new one.
 async function maybeUpdate(state, {
   now = Date.now(),
   dataDir = DATA,
@@ -418,10 +418,11 @@ async function maybeUpdate(state, {
   updateCheck,
   resolveUpdateFn,
   applyUpdate,
+  processKey,
 } = {}) {
-  if (!updateCheck || !resolveUpdateFn) return state;
-  const last = state.lastUpdateCheckAt ? Date.parse(state.lastUpdateCheckAt) : 0;
-  if (now - last < UPDATE_INTERVAL_MS) return state;
+  if (!updateCheck || !resolveUpdateFn || !processKey) return state;
+  if (state.updateCheckedFor === processKey) return state;
+  state.updateCheckedFor = processKey;
   state.lastUpdateCheckAt = new Date(now).toISOString();
   try {
     const result = await resolveUpdateFn(version);
@@ -460,18 +461,16 @@ export async function tick(deps = {}) {
   const processes = await find();
   let beforeWait = await previousState().catch(() => ({}));
   const diskState = structuredClone(beforeWait);
-  if (update) {
-    beforeWait = await maybeUpdate({ ...beforeWait }, { now: now(), ...update });
-  }
   // Update bookkeeping lives outside the attachment state, so carry it forward.
-  const updateFields = update ? {
+  const updateFields = () => ({
     ...(beforeWait.lastUpdateCheckAt ? { lastUpdateCheckAt: beforeWait.lastUpdateCheckAt } : {}),
+    ...(beforeWait.updateCheckedFor ? { updateCheckedFor: beforeWait.updateCheckedFor } : {}),
     ...(beforeWait.updateStatus ? { updateStatus: beforeWait.updateStatus } : {}),
     ...(beforeWait.updateVersion ? { updateVersion: beforeWait.updateVersion } : {}),
     ...(beforeWait.updateError ? { updateError: beforeWait.updateError } : {}),
-  } : {};
+  });
   const persist = async (state) => {
-    Object.assign(state, updateFields);
+    Object.assign(state, updateFields());
     const fields = (value) => JSON.stringify({ ...value, checkedAt: undefined });
     if (fields(state) === fields(diskState)) return beforeWait;
     state.checkedAt = new Date(now()).toISOString();
@@ -495,6 +494,12 @@ export async function tick(deps = {}) {
   }
   const info = processes[0];
   const processKey = `${info.pid}:${info.started}`;
+  // Kimi is running (exactly one instance): this is the only point where the
+  // extension may reach the network. A launch checks once; later ticks for the
+  // same process are silent.
+  if (update) {
+    beforeWait = await maybeUpdate({ ...beforeWait }, { now: now(), processKey, ...update });
+  }
   const sameProcess = preserved?.pid === info.pid
     && (preserved.started === info.started || preserved.identity?.startsWith(`${processKey}:`));
   if (sameProcess && preserved.status !== 'active' && preserved.failureKind !== 'permanent') {

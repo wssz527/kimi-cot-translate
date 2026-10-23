@@ -3,9 +3,6 @@
 // existing atomic deploy path. Nothing is fetched or written unless the remote
 // version is newer than the local one.
 import { createHash } from 'node:crypto';
-import { readFile } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
 
 export const RUNTIME_FILES = ['runtime.mjs', 'runtime-hook.mjs', 'runtime-update.mjs', 'supported-runtimes.json', 'kct.js'];
 export const DEFAULT_MANIFEST = 'https://raw.githubusercontent.com/wssz527/kimi-cot-translate/main/runtime-manifest.json';
@@ -66,18 +63,21 @@ export async function downloadBundle(manifest, { fetchImpl = fetch, timeoutMs = 
   return files;
 }
 
-export async function localVersion(read = readFile, root = dirname(fileURLToPath(import.meta.url))) {
-  const manifest = JSON.parse(await read(join(root, 'package.json'), 'utf8'));
-  return manifest.version;
+// The deployed bundle has no package.json, so the version travels inside this
+// file. scripts/version-sync.mjs keeps it aligned with the root manifest, and a
+// self-update replaces this file wholesale, carrying the new version with it.
+export const RUNTIME_VERSION = '0.2.1';
+
+export async function localVersion() {
+  return RUNTIME_VERSION;
 }
 
 export async function resolveUpdate({
   current,
   manifestUrl = DEFAULT_MANIFEST,
   fetchImpl = fetch,
-  read = readFile,
 } = {}) {
-  const from = current ?? await localVersion(read);
+  const from = current ?? await localVersion();
   const manifest = await fetchManifest(manifestUrl, { fetchImpl });
   if (!isNewer(manifest.version, from)) return { available: false, current: from, remote: manifest.version };
   return { available: true, current: from, remote: manifest.version, manifest };
