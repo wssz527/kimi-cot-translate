@@ -19,7 +19,7 @@ const INFO = parseProcess(
   `85123 ${process.getuid()} Wed Oct 21 13:58:18 2026 /Applications/Kimi Code.app/Contents/MacOS/Kimi Code`,
   startedUTC,
 );
-const CORE_FILES = ['runtime.mjs', 'runtime-hook.mjs', 'supported-runtimes.json', 'kct.js'];
+const CORE_FILES = ['runtime.mjs', 'runtime-hook.mjs', 'runtime-update.mjs', 'supported-runtimes.json', 'kct.js'];
 
 function tickFixture() {
   let previous = {}, found = [INFO], installed = 0, verified = 0, saves = 0;
@@ -662,4 +662,157 @@ test('a failed plist restore keeps its backup and leaves the job stopped', async
   }), (error) => error.message === 'bootstrap failed' && !!error.plistRestoreError);
   assert.equal(await readFile(join(fixture.dataDir, '.runtime-plist.backup'), 'utf8'), 'original plist');
   assert.deepEqual(calls, ['print', 'bootout', 'bootstrap']);
+});
+
+// ---------------------------------------------------------------------------
+// self-update
+// ---------------------------------------------------------------------------
+
+test('update manifest validation rejects malformed descriptors', async () => {
+  const { validateManifest, isNewer, parseVersion } = await import('./runtime-update.mjs');
+  const good = {
+    version: '0.2.0', base: 'https://example.test',
+    files: Object.fromEntries(['runtime.mjs', 'runtime-hook.mjs', 'runtime-update.mjs',
+      'supported-runtimes.json', 'kct.js'].map((name) => [name, 'a'.repeat(64)])),
+  };
+  assert.doesNotThrow(() => validateManifest(good));
+  assert.throws(() => validateManifest({ ...good, version: 'latest' }), /valid version/);
+  assert.throws(() => validateManifest({ ...good, base: 'http://insecure.test' }), /https/);
+  assert.throws(() => validateManifest({ ...good, files: { 'runtime.mjs': 'nope' } }), /valid hash/);
+  assert.throws(() => validateManifest(null), /not an object/);
+  assert.deepEqual(parseVersion('1.2.3'), [1, 2, 3]);
+  assert.equal(parseVersion('1.2'), null);
+  assert.equal(isNewer('0.2.0', '0.1.0'), true);
+  assert.equal(isNewer('0.1.0', '0.2.0'), false);
+  assert.equal(isNewer('0.1.0', '0.1.0'), false);
+});
+
+test('a download whose bytes do not match the manifest hash is refused', async () => {
+  const { downloadBundle } = await import('./runtime-update.mjs');
+  const manifest = {
+    version: '0.2.0', base: 'https://example.test',
+    files: Object.fromEntries(['runtime.mjs', 'runtime-hook.mjs', 'runtime-update.mjs',
+      'supported-runtimes.json', 'kct.js'].map((name) => [name, 'b'.repeat(64)])),
+  };
+  const fetchImpl = async () => ({ ok: true, arrayBuffer: async () => Buffer.from('tampered') });
+  await assert.rejects(() => downloadBundle(manifest, { fetchImpl }), /hash mismatch/);
+});
+
+test('a newer published version is fetched and handed to the atomic deploy path', async () => {
+  const { selfUpdate } = await import('./runtime.mjs');
+  const { createHash } = await import('node:crypto');
+  const bodies = Object.fromEntries(['runtime.mjs', 'runtime-hook.mjs', 'runtime-update.mjs',
+    'supported-runtimes.json', 'kct.js'].map((name) => [name, `content of ${name}`]));
+  const files = Object.fromEntries(Object.entries(bodies)
+    .map(([name, text]) => [name, createHash('sha256').update(Buffer.from(text)).digest('hex')]));
+  const seen = [];
+  const fetchImpl = async (url) => ({
+    ok: true,
+    json: async () => ({ version: '0.2.0', base: 'https://example.test', files }),
+    arrayBuffer: async () => Buffer.from(bodies[url.split('/').pop()]),
+  });
+  const result = await selfUpdate({
+    currentVersion: '0.1.0',
+    fetchImpl,
+    deployFn: async ({ files: downloaded }) => { seen.push(downloaded.size); },
+  });
+  assert.equal(result.updated, true);
+  assert.equal(result.from, '0.1.0');
+  assert.equal(result.to, '0.2.0');
+  assert.deepEqual(seen, [5]);
+});
+
+test('an up-to-date install performs no download and no deployment', async () => {
+  const { selfUpdate } = await import('./runtime.mjs');
+  let deployed = 0;
+  const files = Object.fromEntries(['runtime.mjs', 'runtime-hook.mjs', 'runtime-update.mjs',
+    'supported-runtimes.json', 'kct.js'].map((name) => [name, 'c'.repeat(64)]));
+  const result = await selfUpdate({
+    currentVersion: '0.2.0',
+    fetchImpl: async () => ({ ok: true, json: async () => ({
+      version: '0.2.0', base: 'https://example.test', files }) }),
+    deployFn: async () => { deployed += 1; },
+  });
+  assert.equal(result.updated, false);
+  assert.equal(result.reason, 'up-to-date');
+  assert.equal(deployed, 0);
+});
+
+test('an unknown runtime hash is accepted when signature, fuses and the renderer contract hold', async () => {
+  const css = ['.think', '.think-head', '.think-body', '.think-body-inner', '.think-text']
+    .map((name) => `${name}{}`).join('');
+  const binary = Buffer.concat([Buffer.from('prefixdL7pKGdnNz796PbbjQWNKmHXBZaB9tsX'),
+    Buffer.from([1, 9]), Buffer.from('101100001')]);
+  const deps = {
+    fingerprint: async () => 'file',
+    output: async (_cmd, args) => {
+      const electron = args?.some((a) => a.includes(':CFBundleVersion'));
+      return electron ? '43.1.1\n' : '1.1.3\n';
+    },
+    run: async () => ({ stderr: 'Identifier=com.kimi.code.desktop\nTeamIdentifier=2J9472RW75\n' }),
+    readFile: async (file) => {
+      if (String(file).endsWith('supported-runtimes.json')) return JSON.stringify([
+        { electron: '43.1.1', sha256: 'a'.repeat(64), validatedWithApp: '1.1.1' }]);
+      if (String(file).endsWith('Electron Framework')) return binary;
+      if (String(file).endsWith('index.html')) return '<link href="/assets/main.css">';
+      return css;
+    },
+  };
+  const result = await verifyApp(deps);
+  assert.equal(result.verified, 'contract');
+  assert.equal(result.electron, '43.1.1');
+  assert.equal(result.version, '1.1.3');
+});
+
+test('a new Electron major or a changed reasoning DOM still stops the extension', async () => {
+  const css = ['.think', '.think-head', '.think-body', '.think-body-inner', '.think-text']
+    .map((name) => `${name}{}`).join('');
+  const binary = Buffer.concat([Buffer.from('prefixdL7pKGdnNz796PbbjQWNKmHXBZaB9tsX'),
+    Buffer.from([1, 9]), Buffer.from('101100001')]);
+  const make = (electron, style) => ({
+    fingerprint: async () => 'file',
+    output: async (_cmd, args) => {
+      const isElectron = args?.some((a) => a.includes(':CFBundleVersion'));
+      return `${isElectron ? electron : '1.1.3'}\n`;
+    },
+    run: async () => ({ stderr: 'Identifier=com.kimi.code.desktop\nTeamIdentifier=2J9472RW75\n' }),
+    readFile: async (file) => {
+      if (String(file).endsWith('supported-runtimes.json')) return '[]';
+      if (String(file).endsWith('Electron Framework')) return binary;
+      if (String(file).endsWith('index.html')) return '<link href="/assets/main.css">';
+      return style;
+    },
+  });
+  await assert.rejects(() => verifyApp(make('44.0.0', css)), { failureKind: 'permanent' });
+  await assert.rejects(() => verifyApp(make('43.2.0', '.think{}.renamed{}.think-head{}')), /reasoning UI/);
+});
+
+test('process discovery matches the executable path despite spaces in the name', async () => {
+  const { findProcesses } = await import('./runtime.mjs');
+  const listing = [
+    '  100 /Applications/Kimi Code.app/Contents/MacOS/Kimi Code',
+    '  101 /Applications/Kimi Code.app/Contents/Frameworks/Kimi Code Helper.app/Contents/MacOS/Kimi Code Helper',
+    '  102 /Applications/Other.app/Contents/MacOS/Kimi Code',
+    '  not-a-pid whatever',
+  ].join('\n');
+  const seen = [];
+  const found = await findProcesses({
+    listProcesses: async () => listing,
+    identify: async (pid) => {
+      seen.push(pid);
+      return { pid, uid: process.getuid(),
+        executable: pid === 100 ? '/Applications/Kimi Code.app/Contents/MacOS/Kimi Code' : '/elsewhere' };
+    },
+  });
+  assert.deepEqual(found.map((item) => item.pid), [100]);
+  assert.deepEqual(seen, [100], 'only the exact main executable is identified');
+});
+
+test('a helper process whose identity does not match stays excluded', async () => {
+  const { findProcesses } = await import('./runtime.mjs');
+  const found = await findProcesses({
+    listProcesses: async () => '  100 /Applications/Kimi Code.app/Contents/MacOS/Kimi Code',
+    identify: async (pid) => ({ pid, uid: process.getuid(), executable: '/Applications/Kimi Code.app/Contents/MacOS/Kimi Code Helper' }),
+  });
+  assert.deepEqual(found, []);
 });

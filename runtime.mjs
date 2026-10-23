@@ -10,18 +10,21 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { promisify } from 'node:util';
 import { installRuntimeHook } from './runtime-hook.mjs';
+import { downloadBundle, localVersion, resolveUpdate } from './runtime-update.mjs';
 
 const run = promisify(execFile);
 const HERE = dirname(fileURLToPath(import.meta.url));
 export const APP = '/Applications/Kimi Code.app';
 const EXECUTABLE = join(APP, 'Contents/MacOS/Kimi Code');
 const FRAMEWORK = join(APP, 'Contents/Frameworks/Electron Framework.framework/Versions/A/Electron Framework');
+const ELECTRON_INFO = join(APP, 'Contents/Frameworks/Electron Framework.framework/Versions/A/Resources/Info.plist');
+const SUPPORTED_ELECTRON_MAJOR = '43';
 export const DATA = join(homedir(), 'Library/Application Support/kimi-cot-translate');
 const STATE = join(DATA, 'runtime-state.json');
 const LABEL = 'com.user.kimi-cot-translate.runtime';
 const PLIST = join(homedir(), 'Library/LaunchAgents', `${LABEL}.plist`);
 const hash = (bytes) => createHash('sha256').update(bytes).digest('hex');
-const CORE_FILES = ['runtime.mjs', 'runtime-hook.mjs', 'supported-runtimes.json', 'kct.js'];
+const CORE_FILES = ['runtime.mjs', 'runtime-hook.mjs', 'runtime-update.mjs', 'supported-runtimes.json', 'kct.js'];
 const SETTLED = new Set(['active', 'error', 'blocked-inspector', 'checking']);
 export const MAX_ATTEMPTS = 8;
 export const retryDelay = (attempts) => [30000, 120000, 600000, 1800000][
@@ -98,14 +101,18 @@ export function assertIdentity(processInfo, expected = processInfo) {
   }
 }
 
-export async function findProcesses() {
-  const pids = await output('/usr/bin/pgrep', ['-x', 'Kimi Code']).catch((error) => {
-    if (error.code === 1) return '';
-    throw error;
-  });
+export async function findProcesses({
+  listProcesses = () => output('/bin/ps', ['-A', '-o', 'pid=,comm=']),
+  identify = processIdentity,
+} = {}) {
+  // `pgrep -x` cannot match a name containing a space on macOS, so scan the
+  // process table and keep entries whose executable path is exactly ours.
+  const listing = await listProcesses();
   const found = [];
-  for (const id of pids.trim().split(/\s+/).filter(Boolean)) {
-    const info = await processIdentity(Number(id)).catch(() => null);
+  for (const line of listing.split('\n')) {
+    const match = /^\s*(\d+)\s+(.*)$/.exec(line);
+    if (!match || match[2].trim() !== EXECUTABLE) continue;
+    const info = await identify(Number(match[1])).catch(() => null);
     if (info?.uid === process.getuid() && info.executable === EXECUTABLE) found.push(info);
   }
   return found;
@@ -138,6 +145,10 @@ export function assertRendererContract(css) {
   }
 }
 
+// The hash allowlist is the fast path for a fully validated runtime. An unknown
+// hash is still allowed when the official signature, the inspector fuse, the
+// Electron major and the renderer contract all hold: a host patch that leaves
+// the reasoning DOM untouched then needs no manual allowlist entry.
 export async function verifyApp(deps = {}) {
   const identify = deps.fingerprint ?? fingerprint;
   const command = deps.output ?? output;
@@ -155,10 +166,18 @@ export async function verifyApp(deps = {}) {
     throw permanentError('Application does not have the expected official signing identity');
   }
   const binary = await read(FRAMEWORK);
-  const supported = JSON.parse(await read(join(HERE, 'supported-runtimes.json'), 'utf8'));
-  const runtime = supported.find((item) => item.sha256 === hash(binary));
-  if (!runtime) throw permanentError('New Electron runtime needs an isolated compatibility check; Kimi is left untouched');
   inspectFuses(binary);
+  const supported = JSON.parse(await read(join(HERE, 'supported-runtimes.json'), 'utf8'));
+  const known = supported.find((item) => item.sha256 === hash(binary));
+  const electron = known?.electron ?? (await command('/usr/libexec/PlistBuddy', [
+    '-c', 'Print :CFBundleVersion', ELECTRON_INFO,
+  ])).trim();
+  if (!/^\d+\.\d+\.\d+$/.test(electron)) {
+    throw permanentError('Cannot read the Electron version of this Kimi build');
+  }
+  if (electron.split('.')[0] !== SUPPORTED_ELECTRON_MAJOR) {
+    throw permanentError(`Electron ${electron} is outside the supported major ${SUPPORTED_ELECTRON_MAJOR}; translation is disabled until compatibility is checked`);
+  }
   const version = (await command('/usr/libexec/PlistBuddy', [
     '-c', 'Print :CFBundleShortVersionString', join(APP, 'Contents/Info.plist'),
   ])).trim();
@@ -167,7 +186,7 @@ export async function verifyApp(deps = {}) {
   const assets = [...index.matchAll(/href="(\/assets\/[A-Za-z0-9_-]+\.css)"/g)].map((item) => item[1]);
   assertRendererContract((await Promise.all(assets.map((name) => read(join(dist, name), 'utf8')))).join('\n'));
   if (before !== await identify(EXECUTABLE)) throw new Error('Application changed during verification');
-  return { version, electron: runtime.electron, executable: before };
+  return { version, electron, executable: before, verified: known ? 'exact' : 'contract' };
 }
 
 async function verifyLiveProcess(info, app) {
@@ -368,6 +387,64 @@ function runtimeRevision(source, supported,
   return hash(source + hookSource + loaderSource + supported);
 }
 
+export const UPDATE_INTERVAL_MS = 6 * 60 * 60 * 1000;
+
+// Fetch and install a newer runtime bundle when one is published. Returns
+// { updated: true, from, to } after a successful atomic deploy, or
+// { updated: false, reason } leaving the current deployment untouched.
+export async function selfUpdate({
+  dataDir = DATA,
+  currentVersion,
+  manifestUrl,
+  fetchImpl = fetch,
+  resolve,
+  deployFn,
+  lock,
+} = {}) {
+  const check = await (resolve ?? (() => resolveUpdate({
+    current: currentVersion, manifestUrl, fetchImpl,
+  })))();
+  if (!check?.available) return { updated: false, reason: 'up-to-date', current: check?.current, remote: check?.remote };
+  if (!deployFn) return { updated: false, reason: 'no-deploy', available: true, remote: check.remote };
+  const files = await downloadBundle(check.manifest, { fetchImpl });
+  await deployFn({ files, dataDir, acquire: lock });
+  return { updated: true, from: check.current, to: check.remote };
+}
+
+async function maybeUpdate(state, {
+  now = Date.now(),
+  dataDir = DATA,
+  version,
+  updateCheck,
+  resolveUpdateFn,
+  applyUpdate,
+} = {}) {
+  if (!updateCheck || !resolveUpdateFn) return state;
+  const last = state.lastUpdateCheckAt ? Date.parse(state.lastUpdateCheckAt) : 0;
+  if (now - last < UPDATE_INTERVAL_MS) return state;
+  state.lastUpdateCheckAt = new Date(now).toISOString();
+  try {
+    const result = await resolveUpdateFn(version);
+    if (!result.available) {
+      state.updateStatus = 'up-to-date';
+      state.updateVersion = result.remote;
+      return state;
+    }
+    if (!applyUpdate) {
+      state.updateStatus = 'available';
+      state.updateVersion = result.remote;
+      return state;
+    }
+    const applied = await applyUpdate(result.manifest, dataDir);
+    state.updateStatus = applied ? 'installed' : 'deferred';
+    state.updateVersion = result.remote;
+  } catch (error) {
+    state.updateStatus = 'failed';
+    state.updateError = error.message;
+  }
+  return state;
+}
+
 export async function tick(deps = {}) {
   const find = deps.findProcesses ?? findProcesses;
   const save = deps.saveState ?? saveState;
@@ -378,12 +455,25 @@ export async function tick(deps = {}) {
   const checkPort = deps.portOpen ?? portOpen;
   const verify = deps.verifyApp ?? verifyApp;
   const install = deps.installIntoProcess ?? installIntoProcess;
+  const update = deps.update ?? null;
   const now = deps.now ?? Date.now;
   const processes = await find();
   let beforeWait = await previousState().catch(() => ({}));
+  const diskState = structuredClone(beforeWait);
+  if (update) {
+    beforeWait = await maybeUpdate({ ...beforeWait }, { now: now(), ...update });
+  }
+  // Update bookkeeping lives outside the attachment state, so carry it forward.
+  const updateFields = update ? {
+    ...(beforeWait.lastUpdateCheckAt ? { lastUpdateCheckAt: beforeWait.lastUpdateCheckAt } : {}),
+    ...(beforeWait.updateStatus ? { updateStatus: beforeWait.updateStatus } : {}),
+    ...(beforeWait.updateVersion ? { updateVersion: beforeWait.updateVersion } : {}),
+    ...(beforeWait.updateError ? { updateError: beforeWait.updateError } : {}),
+  } : {};
   const persist = async (state) => {
+    Object.assign(state, updateFields);
     const fields = (value) => JSON.stringify({ ...value, checkedAt: undefined });
-    if (fields(state) === fields(beforeWait)) return beforeWait;
+    if (fields(state) === fields(diskState)) return beforeWait;
     state.checkedAt = new Date(now()).toISOString();
     await save(state);
     beforeWait = structuredClone(state);
@@ -688,11 +778,17 @@ export async function deploy({
 
 async function main() {
   const arg = process.argv[2];
-  if (process.argv.length !== 3 || !['--once', '--check', '--install', '--disable'].includes(arg)) {
-    throw new Error('Use --install, --check, --once or --disable');
+  if (process.argv.length !== 3 || !['--once', '--check', '--install', '--disable', '--update'].includes(arg)) {
+    throw new Error('Use --install, --check, --once, --update or --disable');
   }
   if (arg === '--install') return deploy();
   if (arg === '--check') return console.log(JSON.stringify(await readState(), null, 2));
+  if (arg === '--update') {
+    const result = await selfUpdate({ currentVersion: await localVersion(), deployFn: deploy });
+    console.log(JSON.stringify(result, null, 2));
+    if (result.updated) console.log(`Updated ${result.from} -> ${result.to}`);
+    return;
+  }
   if (arg === '--disable') {
     const domain = `gui/${process.getuid()}/${LABEL}`;
     try {
@@ -709,7 +805,17 @@ async function main() {
   const lock = await acquireLock();
   if (!lock) return;
   try {
-    await tick();
+    await tick({ update: { version: await localVersion(), dataDir: DATA, updateCheck: true,
+      resolveUpdateFn: (current) => resolveUpdate({ current }),
+      applyUpdate: async (manifest, dataDir) => {
+        await deploy({
+          files: await downloadBundle(manifest),
+          dataDir,
+          // The periodic run already holds the lock; deploy must not re-acquire it.
+          acquire: async () => ({ async release() {} }),
+        });
+        return true;
+      } } });
   } finally { await lock.release(); }
 }
 

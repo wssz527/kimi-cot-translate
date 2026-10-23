@@ -33,6 +33,8 @@ jobs:
         run: |
           npm run build:browser
           npm run build:vscode
+      - name: Verify update manifest
+        run: node scripts/runtime-manifest.mjs --check
       - name: Package artifacts
         run: |
           set -euo pipefail

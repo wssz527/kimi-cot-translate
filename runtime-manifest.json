@@ -1,0 +1,11 @@
+{
+  "version": "0.2.0",
+  "base": "https://raw.githubusercontent.com/wssz527/kimi-cot-translate/v0.2.0",
+  "files": {
+    "runtime.mjs": "ae6b7af16caa27c85ca54d9c0644ce119f102d9549e7260913967022e905f92c",
+    "runtime-hook.mjs": "7bda813d0bd0e7397619cae77f8e7abbd29629e1f793652e86fe5c560de10018",
+    "runtime-update.mjs": "9616ecfe4f1bb5fa5a147064c5088b85fc06840fbe4bac6490d3f5f7b394e1d3",
+    "supported-runtimes.json": "a9d9f4ca217eeaec168934351766b3912a9d8e5ad89ae8506937453de179a91a",
+    "kct.js": "becc9e143ce40666722ac88fae91a8f7fb2e71e7dbe3cd1a66fbb935aaad7877"
+  }
+}

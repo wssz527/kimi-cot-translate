@@ -6,7 +6,14 @@
 
 ## [Unreleased]
 
+### 新增
+
+- 运行时自更新：后台任务每 6 小时检查一次仓库发布的更新清单（`runtime-manifest.json`），发现新版本时下载运行时文件、逐个校验 SHA-256，再通过既有的原子部署路径替换（失败自动回滚）。新增 `node runtime.mjs --update` 手动入口；`--check` 输出新增 `updateStatus` / `updateVersion` / `lastUpdateCheckAt` 字段。
+- 未知内核哈希不再直接熔断：改为在官方签名、inspector fuse、Electron 主版本与思考区块结构四项同时成立时放行，并记 `verified: "contract"`。官方小版本升级只要不改思考区块结构即可继续工作，无需等待新版或重装。
+
 ### 修复
+
+- macOS 进程发现改用进程表精确匹配：`pgrep -x "Kimi Code"` 无法匹配含空格的进程名，会导致「Kimi Code is not running」的误判，后台任务因此不再挂载。
 
 - 翻译失败治理：429 按 `Retry-After` 冷却并暂停对应服务队列；5xx/网络错误指数退避（上限 2 次、带抖动）；失败按片段做 30 秒负缓存，流式期间不再重复轰炸已失败段落；浏览器扩展透传错误状态码与冷却时间。
 - 自定义端点切换 origin 时清除旧 API key，防止旧凭据被带往新服务；远程自定义端点要求 HTTPS（本机地址除外）；自定义请求禁止重定向。

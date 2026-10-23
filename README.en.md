@@ -214,21 +214,35 @@ The already-loaded translation layer disappears the next time Kimi quits normall
 
 ## After Kimi updates
 
-The extension files live outside the official app, so a normal app update never overwrites them. After a new process starts, the background task re-checks the signature, the actually running files, the verified Electron kernel hashes, the inspector fuse and the thinking-block structure before attaching again.
+The extension files live outside the official app, so a normal app update never overwrites them. After a new process starts, the background task re-checks the signature, the actually running files, the Electron major version, the inspector fuse and the thinking-block structure before attaching again.
 
-Compatible updates need no manual reinstall. If an official update changes the Electron kernel, disables the relevant debugging capability, or changes the thinking-block structure, translation stops and waits for the extension to catch up. **Never bypass verification by hand-adding unknown hashes** — file a "compatibility report" issue on GitHub (with old and new version numbers); adaptations ship as verified commits in this repository.
+**Routine follow-up needs nothing from you.** What decides whether translation keeps working is the thinking-block structure, not version numbers:
+
+- If `.think`, `.think-head`, `.think-body`, `.think-body-inner` and `.think-text` are all still present after an official update, and the signature, the debugging capability and the Electron major are unchanged, translation simply keeps working — no waiting for a release, no reinstall.
+- Only when one of those five really changes does translation stop and wait for adaptation. That is the "upstream broke, the author must fix it" case.
+
+The extension also follows its own releases: the background task checks the published update manifest every 6 hours, downloads the runtime files when a newer version exists, verifies each SHA-256, and swaps them in atomically (rolling back on failure). It happens in the background and does not disturb translation in the running app. You can also trigger it manually:
+
+```sh
+node runtime.mjs --update
+```
+
+The outcome lands in the `updateStatus` / `updateVersion` fields of `--check` (`up-to-date` / `installed` / `available` / `failed`).
+
+Why the hash allowlist still exists: a fully verified kernel takes the fast path and skips extra probing. An unknown hash no longer trips a hard stop; it falls through to the structural checks above. That is what keeps an official point release from breaking translation.
 
 Symptom cheat sheet:
 
 | Symptom | Likely cause | What to do |
 | --- | --- | --- |
-| Translation gone after update; `--check` shows `error` with `New Electron runtime` in detail | New kernel not yet verified | File a compatibility report and wait for an adaptation release |
+| Translation gone after update; detail says `reasoning UI changed` | Thinking-block structure changed | File a compatibility report and wait for an adaptation release |
+| detail says `outside the supported major` | Electron crossed a major version | Same as above |
 | detail mentions signature or structure verification failure | Official package structure changed | Same as above; never bypass manually |
 | `blocked-inspector` | Debugging interface not confirmed closed | Quit Kimi normally, then read the log |
 
 This is not an officially supported stable extension API, and compatibility with future versions cannot be guaranteed. Only normal-restart recovery and page-refresh recovery have been verified so far; real cross-version upgrade acceptance has not been done. Static structure checks cannot prove that every interaction of a new version stays compatible.
 
-During attachment, a localhost-only Node inspector is opened briefly (about 12 seconds at most, and the port is confirmed closed afterwards); after verifying the owning PID, an in-memory hook is installed. Unknown kernels never receive the signal that opens the inspector.
+During attachment, a localhost-only Node inspector is opened briefly (about 12 seconds at most, and the port is confirmed closed afterwards); after verifying the owning PID, an in-memory hook is installed. Kernels that fail verification never receive the signal that opens the inspector.
 
 ## Known limitations
 
