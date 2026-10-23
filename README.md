@@ -81,7 +81,7 @@ node runtime.mjs --install
 ~/Library/LaunchAgents/com.user.kimi-cot-translate.runtime.plist
 ```
 
-登录时及每 10 秒检查一次现有进程。正常打开 Kimi Code 后，通常十几秒内自动挂载。Kimi 未运行时只等待；加载器不会启动或退出 Kimi，也不会创建第二个 Kimi 应用。
+登录时运行一次，之后只在 Kimi Code 的用户数据目录发生变化（即 Kimi 正在运行）时被唤醒。正常打开 Kimi Code 后，通常十几秒内自动挂载。Kimi 关闭后该目录静止，后台任务完全不被唤醒：不轮询、不驻留、不联网。加载器不会启动或退出 Kimi，也不会创建第二个 Kimi 应用。
 
 运行副本独立于解压目录，安装后移动源码不会影响它。后台任务使用安装时 Node 的绝对路径；如果移除或移动该 Node，请重新执行安装命令。
 

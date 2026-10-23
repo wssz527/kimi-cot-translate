@@ -20,6 +20,11 @@ const FRAMEWORK = join(APP, 'Contents/Frameworks/Electron Framework.framework/Ve
 const ELECTRON_INFO = join(APP, 'Contents/Frameworks/Electron Framework.framework/Versions/A/Resources/Info.plist');
 const SUPPORTED_ELECTRON_MAJOR = '43';
 export const DATA = join(homedir(), 'Library/Application Support/kimi-cot-translate');
+// launchd watches these directories instead of polling on a timer. The Kimi
+// profile directory changes continuously while the app runs and goes quiet
+// once it exits, so the job only wakes for real Kimi activity.
+const KIMI_PROFILE = join(homedir(), 'Library/Application Support/kimi-code-app');
+const WATCH_PATHS = [KIMI_PROFILE, join(KIMI_PROFILE, 'Local Storage'), join(KIMI_PROFILE, 'Session Storage')];
 const STATE = join(DATA, 'runtime-state.json');
 const LABEL = 'com.user.kimi-cot-translate.runtime';
 const PLIST = join(homedir(), 'Library/LaunchAgents', `${LABEL}.plist`);
@@ -735,7 +740,9 @@ export async function deploy({
 <plist version="1.0"><dict>
 <key>Label</key><string>${label}</string>
 <key>ProgramArguments</key><array><string>${xml(process.execPath)}</string><string>${xml(join(dataDir, 'runtime.mjs'))}</string><string>--once</string></array>
-<key>RunAtLoad</key><true/><key>StartInterval</key><integer>10</integer>
+<key>WatchPaths</key><array>${WATCH_PATHS.map((path) => `<string>${xml(path)}</string>`).join('')}</array>
+<key>RunAtLoad</key><true/>
+<key>ThrottleInterval</key><integer>5</integer>
 <key>ProcessType</key><string>Background</string>
 <key>StandardOutPath</key><string>${xml(log)}</string>
 <key>StandardErrorPath</key><string>${xml(log)}</string>

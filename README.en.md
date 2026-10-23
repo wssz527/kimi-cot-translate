@@ -79,7 +79,7 @@ The background task lives at:
 ~/Library/LaunchAgents/com.user.kimi-cot-translate.runtime.plist
 ```
 
-It checks for existing processes at login and every 10 seconds. After opening Kimi Code normally, attachment usually completes within a dozen seconds. When Kimi is not running it simply waits; the loader never starts or quits Kimi, and never creates a second Kimi instance.
+It runs once at login and afterwards is woken only when Kimi Code's user-data directory changes — that is, while Kimi is running. After opening Kimi Code normally, attachment usually completes within a dozen seconds. Once Kimi quits, that directory goes quiet and the background task is not woken at all: no polling, no resident process, no network access. The loader never starts or quits Kimi, and never creates a second Kimi instance.
 
 The installed copy is independent of this directory — moving the source afterwards does not affect it. The background task uses the absolute path of the Node that installed it; if you remove or move that Node, run the install command again.
 

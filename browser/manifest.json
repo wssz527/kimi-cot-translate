@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Kimi visible thinking translator (experimental)",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Translate only expanded, visible thinking in Kimi Code Web and kimi.com. Requires language confirmation.",
   "permissions": ["storage"],
   "host_permissions": ["https://edge.microsoft.com/*"],

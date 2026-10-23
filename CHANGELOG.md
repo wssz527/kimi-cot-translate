@@ -8,6 +8,7 @@
 
 ### 新增
 
+- 后台任务改为事件驱动：LaunchAgent 不再每 10 秒轮询，改为 `WatchPaths` 监听 Kimi Code 的用户数据目录，Kimi 关闭期间完全不被唤醒。
 - 运行时自更新：每次 Kimi Code 启动后检查一次仓库发布的更新清单（`runtime-manifest.json`），发现新版本时下载运行时文件、逐个校验 SHA-256，再通过既有的原子部署路径替换（失败自动回滚）。同一 Kimi 进程只检查一次，Kimi 未运行时不发起任何网络请求。新增 `node runtime.mjs --update` 手动入口；`--check` 输出新增 `updateStatus` / `updateVersion` / `updateCheckedFor` 字段。
 - 未知内核哈希不再直接熔断：改为在官方签名、inspector fuse、Electron 主版本与思考区块结构四项同时成立时放行，并记 `verified: "contract"`。官方小版本升级只要不改思考区块结构即可继续工作，无需等待新版或重装。
 

@@ -872,3 +872,16 @@ test('one Kimi launch checks for updates once, not on every tick', async () => {
   await tick({ ...deps, findProcesses: async () => [restarted] });
   assert.equal(resolved, 2, 'a fresh Kimi launch checks again');
 });
+
+test('the installed LaunchAgent wakes on Kimi activity, never on a timer', async (t) => {
+  const fixture = await deployFixture();
+  t.after(() => rm(fixture.root, { recursive: true, force: true }));
+  const calls = [];
+  await deploy(deployDeps(fixture, calls));
+  const plist = await readFile(fixture.plistPath, 'utf8');
+  assert.doesNotMatch(plist, /StartInterval/, 'polling would wake the job while Kimi is closed');
+  assert.doesNotMatch(plist, /KeepAlive/, 'a resident job is not what this installs');
+  assert.match(plist, /<key>WatchPaths<\/key>/);
+  assert.match(plist, /kimi-code-app/);
+  assert.match(plist, /<key>RunAtLoad<\/key><true\/>/);
+});
