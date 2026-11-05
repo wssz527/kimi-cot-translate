@@ -22,6 +22,10 @@
 
 **装完还要有人接替。** 计划任务设置了 `-MultipleInstances IgnoreNew`，而 watcher 自己调用安装时正处在运行中：`Install` 会等自己退出（必然超时），`Start` 会被直接丢弃。现在 watcher 跳过这个自等待，并交给新增的 `Restart` 动作——由延迟助手在本进程退出后拉起新任务。
 
+**安装原本会卡 24 秒然后失败。** `Install` 会等旧 watcher 退出，但 watcher 是常驻进程（`-ExecutionTimeLimit 0`），永远等不到——实测 24.4 秒后抛错，超过 bridge 的 20 秒超时。这段等待已移除。
+
+**装完任务还指着旧 bundle。** 之前的 `Restart` 只是启动了旧任务，执行体没有更新，于是新版本装了但跑的还是老版本。现在由延迟助手读取 `enabled.json`，用其中的路径重新注册任务并启动。
+
 **顺带修复了两个会让更新"看起来装好了、其实没启动"的缺陷。** 一是 `install` 从暂存目录运行时，bridge 脚本路径也落在那里，而该目录安装后即被删除，紧接着的 `Start` 必然失败；二是 Task Scheduler 接受启动请求是异步的，刚注册的任务会拒绝第一次请求。前者改为从已部署的 bundle 取路径，后者改为短暂重试。
 
 **顺带修复了 Windows 生命周期锁的并发竞争。** 两个加载器同时抢锁时，Windows 对「正在创建或正在删除」的目录返回 `EPERM` / `EACCES` / `ENOTEMPTY`，而代码此前只认 `EEXIST`，其余直接上抛。CI 上的表现是 `EPERM: operation not permitted, mkdir .runtime-lock.reclaim`；实机则可能让计划任务在输掉一次竞争后写出 error 状态。现在这几种都按「别人拿着锁」处理。

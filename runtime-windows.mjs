@@ -69,7 +69,7 @@ export function bridgeRequest(action, request = {}, options = {}) {
     args: ['-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
       '-File', join(options.bundleDir ?? HERE, 'windows-bridge.ps1'), '-Action', action],
     options: {
-      encoding: 'utf8', timeout: 20000, windowsHide: true, maxBuffer: 1024 * 1024,
+      encoding: 'utf8', timeout: 45000, windowsHide: true, maxBuffer: 1024 * 1024,
       env: { ...process.env, ...(options.localAppData ? { LOCALAPPDATA: options.localAppData } : {}),
         KCT_WINDOWS_REQUEST: JSON.stringify(request) },
     },
@@ -781,14 +781,11 @@ export async function install(options = {}) {
     await atomicJSON(join(dataDir, 'enabled.json'),
       { entry: join(deployed, 'runtime-windows.mjs'), generation: randomUUID() });
     await rm(join(dataDir, 'stop'), { force: true });
-    // A watcher installing its own update is still the running instance of the
-    // task, so it must not wait for that task to stop and must not try to start
-    // a second instance: `IgnoreNew` would drop it. It registers the new bundle
-    // and lets a delayed helper start the replacement after it exits.
-    const selfHosted = options.fromWatcher === true;
+    // Registering the new bundle stops any still-running instance and replaces
+    // the task in place; it never waits for that instance to exit, because a
+    // watcher lives until it is stopped.
     const request = taskRequest(deployed, process.execPath, dataDir, taskName(options));
-    await callBridge(options, 'Install', { ...request, skipWait: selfHosted },
-      { ...options, bundleDir: deployed });
+    await callBridge(options, 'Install', request, { ...options, bundleDir: deployed });
     committed = true;
     await pruneBundles(dataDir, deployed, oldEnabled?.entry).catch((error) => {
       console.warn(`[kct-windows] Old bundle cleanup failed: ${error.message}`);
@@ -816,27 +813,18 @@ export async function install(options = {}) {
       await callBridge(options, 'Start', { taskName: taskName(options) }, bridgeOptions(deployed, options)).catch(() => {});
     }
   }
-  if (options.fromWatcher === true) {
-    await callBridge(options, 'Restart', { taskName: taskName(options), delaySeconds: 5 },
-      bridgeOptions(deployed, options));
-    return { status: 'installed', dataDir, restartScheduled: true };
-  }
-  // Task Scheduler accepts a start request asynchronously, so a task that was
-  // registered moments ago can refuse the first one. Retry briefly instead of
-  // reporting a failure for an install that is actually complete.
-  let started;
-  for (let attempt = 0; attempt < 5 && !started; attempt++) {
-    try {
-      await callBridge(options, 'Start', { taskName: taskName(options) }, bridgeOptions(deployed, options));
-      started = true;
-    } catch (error) {
-      if (attempt === 4) {
-        throw new Error('Runtime installed, but the scheduled watcher could not start; retry at next logon', { cause: error });
-      }
-      await (options.sleep ?? sleep)(500);
-    }
-  }
-  return { status: 'installed', dataDir };
+  // Always hand the start to the delayed helper. The previous watcher learns
+  // about the new generation from `enabled.json` and exits on its own; starting
+  // the task while it is still winding down is silently dropped by
+  // `-MultipleInstances IgnoreNew`. Stopping it by force is not an option: that
+  // would kill the attachment the user is currently looking at.
+  await callBridge(options, 'Restart', {
+    taskName: taskName(options),
+    dataDir,
+    nodePath: process.execPath,
+    delaySeconds: 8,
+  }, bridgeOptions(deployed, options));
+  return { status: 'installed', dataDir, restartScheduled: true };
 }
 
 export async function disable(options = {}) {

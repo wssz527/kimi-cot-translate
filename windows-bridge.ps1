@@ -1,6 +1,6 @@
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet('Discover', 'Signature', 'PortOwner', 'Install', 'Start', 'Restart', 'Disable', 'Watch')]
+    [ValidateSet('Discover', 'Signature', 'PortOwner', 'Install', 'Start', 'Restart', 'Reload', 'Disable', 'Watch')]
     [string]$Action,
     [string]$NodePath,
     [string]$RuntimePath,
@@ -56,21 +56,11 @@ switch ($Action) {
         ConvertTo-Json -InputObject $listeners -Compress
     }
     'Install' {
-        # The Node watcher releases its lock just before its parent PowerShell exits.
-        # `skipWait` means the caller *is* that running watcher: it cannot wait for
-        # itself, and the task must be restarted once this process is gone.
-        $skipWait = $false
-        if ($null -ne $request -and $request.PSObject.Properties['skipWait']) { $skipWait = [bool]$request.skipWait }
-        if (-not $skipWait) {
-            for ($attempt = 0; $attempt -lt 50; $attempt++) {
-                $existing = Get-ScheduledTask -TaskName $request.taskName -ErrorAction SilentlyContinue
-                if ($null -eq $existing -or $existing.State -ne 'Running') { break }
-                Start-Sleep -Milliseconds 100
-            }
-            if ($null -ne $existing -and $existing.State -eq 'Running') {
-                throw 'Previous scheduled watcher is still exiting; retry installation later'
-            }
-        }
+        # The previous watcher is a long-lived process (`-ExecutionTimeLimit 0`),
+        # so waiting for it to stop can only ever time out — that wait used to
+        # burn 24 seconds and fail the install. `-Force` replaces the registration
+        # regardless; the caller stops the old watcher by writing the stop file,
+        # which happens before this runs.
         $user = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
         $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited
         $trigger = New-ScheduledTaskTrigger -AtLogOn -User $user
@@ -87,21 +77,57 @@ switch ($Action) {
         '{"started":true}'
     }
     'Restart' {
-        # The task is `-MultipleInstances IgnoreNew`, so starting it while the
-        # caller is still running does nothing. A delayed helper waits for the
-        # caller to exit, then starts the freshly registered task. It is a
-        # separate process, so it outlives the one that scheduled it.
+        # A watcher cannot replace the task it is running in: `-MultipleInstances
+        # IgnoreNew` drops a start issued while it is alive, and stopping it by
+        # force would kill the attachment the user is looking at. A delayed helper
+        # waits for it to exit on its own, then re-registers the task against
+        # whatever `enabled.json` points at and starts it. Doing the registration
+        # in the helper (rather than trusting the earlier Install) keeps the task
+        # and the deployed bundle in step even if that registration did not take.
         $delay = 10
         if ($null -ne $request -and $request.PSObject.Properties['delaySeconds'] -and $request.delaySeconds) {
             $delay = [int]$request.delaySeconds
         }
-        $script = "Start-Sleep -Seconds $delay; Start-ScheduledTask -TaskName '$($request.taskName)'"
-        $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($script))
+        $taskName = $request.taskName
+        $dataDir = if ($null -ne $request -and $request.PSObject.Properties['dataDir']) { $request.dataDir } else { '' }
+        $node = $request.nodePath
+        $helper = @"
+Start-Sleep -Seconds $delay
+`$enabled = Join-Path '$dataDir' 'enabled.json'
+if (-not (Test-Path `$enabled)) { exit 0 }
+`$entry = (Get-Content `$enabled -Raw | ConvertFrom-Json).entry
+if (-not `$entry -or -not (Test-Path `$entry)) { exit 1 }
+`$bridge = Join-Path (Split-Path `$entry -Parent) 'windows-bridge.ps1'
+`$env:KCT_WINDOWS_REQUEST = (@{ taskName = '$taskName' } | ConvertTo-Json -Compress)
+& `$bridge -Action Reload -NodePath '$node' -RuntimePath `$entry -DataDir '$dataDir'
+"@
+        $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($helper))
         Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') `
             -ArgumentList @('-NoLogo', '-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-EncodedCommand', $encoded) `
             -WindowStyle Hidden | Out-Null
         '{"restartScheduled":true}'
     }
+    'Reload' {
+        # Registers this task against the bundle named by -RuntimePath, then starts
+        # it. Called by the delayed helper once the old watcher has exited.
+        $taskName = $request.taskName
+        $user = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+        $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited
+        $trigger = New-ScheduledTaskTrigger -AtLogOn -User $user
+        $shell = Join-Path $PSHOME 'powershell.exe'
+        $run = "& '$RuntimePath' -Action Watch -NodePath '$NodePath' -RuntimePath '$RuntimePath'" +
+            $(if ($DataDir) { " -DataDir '$DataDir'" } else { '' }) + '; exit $LASTEXITCODE'
+        $taskAction = New-ScheduledTaskAction -Execute $shell -Argument (
+            '-NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -EncodedCommand ' +
+            [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($run)))
+        $settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew `
+            -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+        Register-ScheduledTask -TaskName $taskName -Action $taskAction -Trigger $trigger `
+            -Principal $principal -Settings $settings -Force | Out-Null
+        Start-ScheduledTask -TaskName $taskName
+        '{"reloaded":true}'
+    }
+
     'Disable' {
         $taskName = if ($null -ne $request -and $request.PSObject.Properties['taskName']) { $request.taskName } else { $null }
         $task = if ($taskName) { Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue } else { $null }

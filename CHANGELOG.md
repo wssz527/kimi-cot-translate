@@ -19,7 +19,9 @@
 - **watcher 暂存后必须继续安装**：`--watch` 在暂存更新后直接返回，而 `main()` 只打印结果——计划任务模式下每次只下载、永不安装，Windows 自动更新实际上仍是坏的。现在 `--watch` 返回后由同一进程继续执行安装。
 - **watcher 安装后要能接替**：计划任务是 `-MultipleInstances IgnoreNew`，watcher 自己调 `install()` 时又处在运行中，`Install` 会等自己退出（必然超时），`Start` 也会被丢弃。现在 watcher 走 `skipWait` 跳过自等待，并由新增的 `Restart` 动作安排一个延迟助手，在本进程退出后启动新任务。
 - **bridge 失败信息不再被吞掉**：`execFile` 只给「Command failed」，PowerShell 的真实 stderr 丢失。现在把 stderr 最后一行带入错误信息。
-- PowerShell 侧改用 `PSObject.Properties` 读取可选字段：`Set-StrictMode -Version Latest` 下访问缺失属性会抛错，导致 `skipWait` 这类新字段无法安全缺省。
+- PowerShell 侧改用 `PSObject.Properties` 读取可选字段：`Set-StrictMode -Version Latest` 下访问缺失属性会抛错，新增的可选字段因此无法安全缺省。
+- **安装不再等待旧 watcher 退出**：计划任务是 `-ExecutionTimeLimit 0`，watcher 常驻，等待只会超时。实测这段等待耗掉 24.4 秒并超过 bridge 的 20 秒超时，导致每次更新都失败。已移除；`-Force` 注册本身会覆盖旧任务。bridge 超时同时放宽到 45 秒。
+- **更新后任务要重新注册**：此前 `Restart` 只是启动了旧任务，任务执行体仍指向旧 bundle，于是「装好了但跑的还是老版本」。现在延迟助手读取 `enabled.json`，用其中的路径重新注册任务并启动（新增 `Reload` 动作）。
 
 ## [0.2.7] - 2026-11-05
 

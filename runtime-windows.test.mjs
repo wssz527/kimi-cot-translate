@@ -527,7 +527,9 @@ test('installation stages and verifies files before task registration; failure r
     }
     return {};
   } });
-  assert.deepEqual(calls, ['Install', 'Start']);
+  // A start is always scheduled rather than issued directly: the previous
+  // watcher is still winding down and `IgnoreNew` would drop it.
+  assert.deepEqual(calls, ['Install', 'Restart']);
   const enabled = await readFile(join(dataDir, 'enabled.json'), 'utf8');
   await assert.rejects(install({ ...options, bridge: async (action) => {
     if (action === 'Install') throw new Error('registration failed');
@@ -802,7 +804,7 @@ test('the bridge runs from the deployed bundle, never from a staged copy', async
     bridge: async (action, _request, options) => { used.push({ action, bundleDir: options?.bundleDir }); return { installed: true }; },
     sleep: async () => {},
   });
-  const runs = used.filter((call) => call.action === 'Install' || call.action === 'Start');
+  const runs = used.filter((call) => call.action === 'Install' || call.action === 'Restart');
   assert.ok(runs.length >= 2);
   for (const call of runs) {
     // The stage is deleted as soon as the install returns, so a bridge script
@@ -862,8 +864,8 @@ test('a watcher-run install hands the restart to a delayed helper', async (t) =>
   assert.ok(names.includes('Install'));
   assert.ok(names.includes('Restart'), 'the watcher cannot start its own replacement');
   assert.ok(!names.includes('Start'), 'IgnoreNew would drop a start issued by the running instance');
-  assert.equal(calls.find((call) => call.action === 'Install').request.skipWait, true,
-    'waiting for a task that is this very process can only time out');
+  assert.ok(calls.find((call) => call.action === 'Install'),
+    'the bundle still has to be registered before the restart is scheduled');
   assert.equal(result.restartScheduled, true);
 });
 
@@ -873,11 +875,18 @@ test('the PowerShell bridge skips a self-wait and offers a delayed restart', asy
   // task is the very process asking.
   // Read through PSObject.Properties: under Set-StrictMode a plain property
   // access on a missing member throws instead of returning $null.
-  assert.match(script, /\$request\.PSObject\.Properties\['skipWait'\]/);
-  assert.match(script, /if \(-not \$skipWait\)/);
+  // The previous watcher lives until stopped, so `Install` must never wait for
+  // it: that wait used to burn 24 seconds and fail the whole install.
+  assert.doesNotMatch(script, /still exiting/);
+  assert.match(script, /-Force \| Out-Null/);
+  // The restart has to re-register the task from `enabled.json`, otherwise the
+  // task keeps pointing at the bundle it started from.
+  assert.match(script, /'Reload' \{/);
+  assert.match(script, /Register-ScheduledTask[\s\S]*?-Force/);
   // `IgnoreNew` drops a start issued while the caller still runs, so the bridge
   // needs its own way to start the replacement afterwards.
   assert.match(script, /'Restart' \{/);
-  assert.match(script, /Start-Sleep -Seconds \$delay; Start-ScheduledTask/);
+  assert.match(script, /Start-Sleep -Seconds \$delay/);
+  assert.match(script, /Start-ScheduledTask -TaskName \$taskName/);
   assert.match(script, /ValidateSet\([^)]*'Restart'/);
 });
