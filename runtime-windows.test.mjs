@@ -6,8 +6,8 @@ import { tmpdir } from 'node:os';
 import { basename, dirname, join, win32 } from 'node:path';
 import {
   acquireLock, applyStagedUpdate, assertPlatform, bridgeRequest, commandLineArgs, disable,
-  findProcesses, install, readState, selectProcesses, taskRequest, tick, updateWindows,
-  verifyApp, verifyBinary, watch, windowsPaths,
+  findProcesses, finishStagedUpdate, install, readState, selectProcesses, taskRequest, tick,
+  updateWindows, verifyApp, verifyBinary, watch, windowsPaths,
 } from './runtime-windows.mjs';
 
 const localAppData = "C:\\Users\\Test O'Brien\\AppData\\Local";
@@ -811,4 +811,73 @@ test('the bridge runs from the deployed bundle, never from a staged copy', async
       `${call.action} used ${call.bundleDir}`);
     assert.ok(call.bundleDir.includes('bundle-'));
   }
+});
+
+test('a watcher that staged an update goes on to install it', async () => {
+  // The watcher cannot install from inside its loop (it holds the bundle lock
+  // and runs the bundle being replaced), so it hands the stage to whoever ran
+  // it. If that caller forgets to install, the scheduled task downloads every
+  // release and silently stays on the old one.
+  const installed = [];
+  const result = await finishStagedUpdate(
+    { status: 'updating', stage: 'C:\\Data\\.update-stage-x' },
+    { apply: async (stage) => { installed.push(stage); return { status: 'installed' }; } },
+  );
+  assert.deepEqual(installed, ['C:\\Data\\.update-stage-x']);
+  assert.equal(result.updateStatus, 'installed');
+  assert.equal(result.installed, 'installed');
+  assert.equal(result.version, '0.2.8');
+});
+
+test('a finished watcher, or a stage that fails, is handled without a crash', async () => {
+  assert.deepEqual(await finishStagedUpdate({ status: 'disabled' }), { status: 'disabled' });
+  assert.deepEqual(await finishStagedUpdate(undefined), undefined);
+  const previous = process.exitCode;
+  try {
+    const failed = await finishStagedUpdate({ status: 'updating', stage: 'X' }, {
+      apply: async () => { throw new Error('scheduled task still busy'); },
+    });
+    assert.equal(failed.updateStatus, 'failed');
+    assert.match(failed.updateError, /still busy/);
+    assert.equal(process.exitCode, 1, 'the watcher process reports the failure to the task');
+  } finally { process.exitCode = previous; }
+});
+
+test('a watcher-run install hands the restart to a delayed helper', async (t) => {
+  const dataDir = await temporary(t);
+  const stage = join(dataDir, '.update-stage-fixture');
+  await mkdir(stage, { recursive: true });
+  for (const name of FILES) await writeFile(join(stage, name), `staged:${name}`);
+  const calls = [];
+  const result = await applyStagedUpdate(stage, {
+    localAppData,
+    dataDir,
+    platformCheck: () => {},
+    verifyApp: async () => ({ version: '1.1.1', electron: '43.1.1', executable: 'fp' }),
+    bridge: async (action, request) => { calls.push({ action, request }); return {}; },
+    sleep: async () => {},
+    fromWatcher: true,
+  });
+  const names = calls.map((call) => call.action);
+  assert.ok(names.includes('Install'));
+  assert.ok(names.includes('Restart'), 'the watcher cannot start its own replacement');
+  assert.ok(!names.includes('Start'), 'IgnoreNew would drop a start issued by the running instance');
+  assert.equal(calls.find((call) => call.action === 'Install').request.skipWait, true,
+    'waiting for a task that is this very process can only time out');
+  assert.equal(result.restartScheduled, true);
+});
+
+test('the PowerShell bridge skips a self-wait and offers a delayed restart', async () => {
+  const script = await readFile(join(import.meta.dirname, 'windows-bridge.ps1'), 'utf8');
+  // A watcher installing its own update must not wait for the task to stop: that
+  // task is the very process asking.
+  // Read through PSObject.Properties: under Set-StrictMode a plain property
+  // access on a missing member throws instead of returning $null.
+  assert.match(script, /\$request\.PSObject\.Properties\['skipWait'\]/);
+  assert.match(script, /if \(-not \$skipWait\)/);
+  // `IgnoreNew` drops a start issued while the caller still runs, so the bridge
+  // needs its own way to start the replacement afterwards.
+  assert.match(script, /'Restart' \{/);
+  assert.match(script, /Start-Sleep -Seconds \$delay; Start-ScheduledTask/);
+  assert.match(script, /ValidateSet\([^)]*'Restart'/);
 });

@@ -12,7 +12,7 @@ import {
   recordFailure, rendererBootstrap, retryDelay, reusableAttempt, stageBundle,
 } from './runtime.mjs';
 import {
-  DEFAULT_WINDOWS_MANIFEST, downloadBundle, resolveUpdate, WINDOWS_RUNTIME_FILES,
+  DEFAULT_WINDOWS_MANIFEST, downloadBundle, localVersion, resolveUpdate, WINDOWS_RUNTIME_FILES,
 } from './runtime-update.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -78,8 +78,16 @@ export function bridgeRequest(action, request = {}, options = {}) {
 
 export async function bridge(action, request = {}, options = {}) {
   const command = bridgeRequest(action, request, options);
-  const { stdout } = await (options.execFile ?? run)(command.command, command.args, command.options);
-  return JSON.parse(stdout.replace(/^\uFEFF/, '').trim());
+  try {
+    const { stdout } = await (options.execFile ?? run)(command.command, command.args, command.options);
+    return JSON.parse(stdout.replace(/^\uFEFF/, '').trim());
+  } catch (error) {
+    // PowerShell writes the real cause to stderr; the execFile message carries
+    // only "Command failed", which leaves a user with nothing to act on.
+    const detail = String(error.stderr ?? '').trim();
+    if (detail) throw new Error(`${action} failed: ${detail.split(/\r?\n/).filter(Boolean).pop()}`, { cause: error });
+    throw error;
+  }
 }
 
 function callBridge(options, action, request = {}, bridgeOpts = options) {
@@ -773,7 +781,13 @@ export async function install(options = {}) {
     await atomicJSON(join(dataDir, 'enabled.json'),
       { entry: join(deployed, 'runtime-windows.mjs'), generation: randomUUID() });
     await rm(join(dataDir, 'stop'), { force: true });
-    await callBridge(options, 'Install', taskRequest(deployed, process.execPath, dataDir, taskName(options)),
+    // A watcher installing its own update is still the running instance of the
+    // task, so it must not wait for that task to stop and must not try to start
+    // a second instance: `IgnoreNew` would drop it. It registers the new bundle
+    // and lets a delayed helper start the replacement after it exits.
+    const selfHosted = options.fromWatcher === true;
+    const request = taskRequest(deployed, process.execPath, dataDir, taskName(options));
+    await callBridge(options, 'Install', { ...request, skipWait: selfHosted },
       { ...options, bundleDir: deployed });
     committed = true;
     await pruneBundles(dataDir, deployed, oldEnabled?.entry).catch((error) => {
@@ -795,9 +809,17 @@ export async function install(options = {}) {
     if (staged) await rm(staged, { recursive: true, force: true });
     if (lock) await lock.release();
     await lifecycle.release();
-    if (!committed && controlChanged && oldEnabled && !oldStop) {
+    // Restoring a failed install. A watcher-run install must not start a second
+    // instance of the task it is itself running, so it leaves the restart to the
+    // delayed helper as well.
+    if (!committed && controlChanged && oldEnabled && !oldStop && options.fromWatcher !== true) {
       await callBridge(options, 'Start', { taskName: taskName(options) }, bridgeOptions(deployed, options)).catch(() => {});
     }
+  }
+  if (options.fromWatcher === true) {
+    await callBridge(options, 'Restart', { taskName: taskName(options), delaySeconds: 5 },
+      bridgeOptions(deployed, options));
+    return { status: 'installed', dataDir, restartScheduled: true };
   }
   // Task Scheduler accepts a start request asynchronously, so a task that was
   // registered moments ago can refuse the first one. Retry briefly instead of
@@ -829,6 +851,23 @@ export async function disable(options = {}) {
   } finally { await lock.release(); }
 }
 
+// The watcher breaks out of its loop when it has staged an update, because it
+// holds the bundle lock and is running the bundle being replaced. This same
+// process then installs the stage: `watch` has released the lock on return, and
+// `install` writes the stop file so any peer watcher exits too. Without this the
+// scheduled task would download every release and never install one.
+export async function finishStagedUpdate(result, { apply = applyStagedUpdate, installOptions } = {}) {
+  if (result?.status !== 'updating' || !result.stage) return result;
+  try {
+    const installed = await apply(result.stage, installOptions);
+    return { ...result, updateStatus: 'installed', installed: installed?.status, version: await localVersion() };
+  } catch (error) {
+    console.error(`[kct-windows] Staged update could not be installed: ${error.message}`);
+    process.exitCode = 1;
+    return { ...result, updateStatus: 'failed', updateError: error.message };
+  }
+}
+
 async function main() {
   assertPlatform();
   const command = process.argv[2];
@@ -846,6 +885,9 @@ async function main() {
       updateCheck: true,
       applyUpdate: async (files, dir) => ({ staged: await stageWindowsUpdate(files, dir) }),
     });
+    // This process is the running scheduled task, so the install has to hand the
+    // replacement over to a delayed start instead of starting one itself.
+    result = await finishStagedUpdate(result, { installOptions: { fromWatcher: true } });
   }
   if (command === '--update') {
     const { dataDir } = windowsPaths();

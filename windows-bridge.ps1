@@ -1,6 +1,6 @@
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet('Discover', 'Signature', 'PortOwner', 'Install', 'Start', 'Disable', 'Watch')]
+    [ValidateSet('Discover', 'Signature', 'PortOwner', 'Install', 'Start', 'Restart', 'Disable', 'Watch')]
     [string]$Action,
     [string]$NodePath,
     [string]$RuntimePath,
@@ -57,13 +57,19 @@ switch ($Action) {
     }
     'Install' {
         # The Node watcher releases its lock just before its parent PowerShell exits.
-        for ($attempt = 0; $attempt -lt 50; $attempt++) {
-            $existing = Get-ScheduledTask -TaskName $request.taskName -ErrorAction SilentlyContinue
-            if ($null -eq $existing -or $existing.State -ne 'Running') { break }
-            Start-Sleep -Milliseconds 100
-        }
-        if ($null -ne $existing -and $existing.State -eq 'Running') {
-            throw 'Previous scheduled watcher is still exiting; retry installation later'
+        # `skipWait` means the caller *is* that running watcher: it cannot wait for
+        # itself, and the task must be restarted once this process is gone.
+        $skipWait = $false
+        if ($null -ne $request -and $request.PSObject.Properties['skipWait']) { $skipWait = [bool]$request.skipWait }
+        if (-not $skipWait) {
+            for ($attempt = 0; $attempt -lt 50; $attempt++) {
+                $existing = Get-ScheduledTask -TaskName $request.taskName -ErrorAction SilentlyContinue
+                if ($null -eq $existing -or $existing.State -ne 'Running') { break }
+                Start-Sleep -Milliseconds 100
+            }
+            if ($null -ne $existing -and $existing.State -eq 'Running') {
+                throw 'Previous scheduled watcher is still exiting; retry installation later'
+            }
         }
         $user = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
         $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited
@@ -80,8 +86,25 @@ switch ($Action) {
         Start-ScheduledTask -TaskName $request.taskName
         '{"started":true}'
     }
+    'Restart' {
+        # The task is `-MultipleInstances IgnoreNew`, so starting it while the
+        # caller is still running does nothing. A delayed helper waits for the
+        # caller to exit, then starts the freshly registered task. It is a
+        # separate process, so it outlives the one that scheduled it.
+        $delay = 10
+        if ($null -ne $request -and $request.PSObject.Properties['delaySeconds'] -and $request.delaySeconds) {
+            $delay = [int]$request.delaySeconds
+        }
+        $script = "Start-Sleep -Seconds $delay; Start-ScheduledTask -TaskName '$($request.taskName)'"
+        $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($script))
+        Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') `
+            -ArgumentList @('-NoLogo', '-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-EncodedCommand', $encoded) `
+            -WindowStyle Hidden | Out-Null
+        '{"restartScheduled":true}'
+    }
     'Disable' {
-        $task = Get-ScheduledTask -TaskName $request.taskName -ErrorAction SilentlyContinue
+        $taskName = if ($null -ne $request -and $request.PSObject.Properties['taskName']) { $request.taskName } else { $null }
+        $task = if ($taskName) { Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue } else { $null }
         if ($null -ne $task) {
             Unregister-ScheduledTask -TaskName $request.taskName -Confirm:$false
         }

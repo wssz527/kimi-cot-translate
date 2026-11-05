@@ -10,12 +10,16 @@
 
 ### 修复
 
-- **Windows 补上自动更新**：此前只有 macOS 的 `--once` 会检查更新清单，`runtime-windows.mjs` 完全没有更新代码，`runtime-manifest.json` 也只列了 5 个 macOS 核心文件、不含 Windows 加载器本身。Windows 安装因此永远不会跟版。现新增 `runtime-manifest-windows.json`（8 个文件，含 `runtime-windows.mjs` 与 `windows-bridge.ps1`），Windows 在每次 Kimi 启动后检查一次，下载后逐文件校验 SHA-256，暂存到数据目录，再由独立进程 `--apply-update` 完成安装并重新注册计划任务。新增手动入口 `node runtime-windows.mjs --update`。为支撑两端差异，`runtime-update.mjs` 的清单校验与下载改为接受文件列表参数。
+- **Windows 补上自动更新**：此前只有 macOS 的 `--once` 会检查更新清单，`runtime-windows.mjs` 完全没有更新代码，`runtime-manifest.json` 也只列了 5 个 macOS 核心文件、不含 Windows 加载器本身。Windows 安装因此永远不会跟版。现新增 `runtime-manifest-windows.json`（8 个文件，含 `runtime-windows.mjs` 与 `windows-bridge.ps1`），Windows 在每次 Kimi 启动后检查一次，下载后逐文件校验 SHA-256，暂存到数据目录，再在释放锁后由同一进程完成安装并重新注册计划任务。新增手动入口 `node runtime-windows.mjs --update`。为支撑两端差异，`runtime-update.mjs` 的清单校验与下载改为接受文件列表参数。
 - 更新改为「暂存 → 释放锁 → 原地安装」，不再 spawn 独立进程：计划任务 watcher 整场持有 bundle 锁，独立安装进程会一直等不到锁；而在 SSH 会话里启动的 detached 进程还会随会话结束被终止。现在 `--once` / `--update` 先暂存到 `.update-stage-*`，释放锁后由同一进程调用 `install`（它会先写 stop 文件让 watcher 自行退出并让出锁）。
 - **bridge 脚本改从已部署的 bundle 取路径**：`install` 从暂存目录运行时，`windows-bridge.ps1` 的默认路径也落在暂存目录；安装返回后该目录即被删除，紧接着的 `Start`（以及 `Disable`）必然报「找不到 .ps1 文件」，此前会误报为「已安装但无法启动」。现在 `Install` 直接指向新 bundle，后续 `Start` 也使用已部署路径。
 - 安装后清除 `.update-stage-*` 暂存目录，避免每次更新留下整份运行时副本。
 - **更新源增加国内可直连镜像**：真实 Windows 机器上 `raw.githubusercontent.com` 的 TCP 443 能连上但 HTTPS 请求超时（典型的大陆网络情况），自动更新因此一直失败。现在清单与每个运行时文件都先试官方域名，失败后自动改用 jsDelivr（`cdn.jsdelivr.net/gh/wssz527/kimi-cot-translate@<ref>/...`），下载内容仍逐个校验 SHA-256。
 - 计划任务启动改为短暂重试：Task Scheduler 接受启动请求是异步的，刚注册的任务可能拒绝第一次请求，此前会被误报为「已安装但无法启动」。
+- **watcher 暂存后必须继续安装**：`--watch` 在暂存更新后直接返回，而 `main()` 只打印结果——计划任务模式下每次只下载、永不安装，Windows 自动更新实际上仍是坏的。现在 `--watch` 返回后由同一进程继续执行安装。
+- **watcher 安装后要能接替**：计划任务是 `-MultipleInstances IgnoreNew`，watcher 自己调 `install()` 时又处在运行中，`Install` 会等自己退出（必然超时），`Start` 也会被丢弃。现在 watcher 走 `skipWait` 跳过自等待，并由新增的 `Restart` 动作安排一个延迟助手，在本进程退出后启动新任务。
+- **bridge 失败信息不再被吞掉**：`execFile` 只给「Command failed」，PowerShell 的真实 stderr 丢失。现在把 stderr 最后一行带入错误信息。
+- PowerShell 侧改用 `PSObject.Properties` 读取可选字段：`Set-StrictMode -Version Latest` 下访问缺失属性会抛错，导致 `skipWait` 这类新字段无法安全缺省。
 
 ## [0.2.7] - 2026-11-05
 
