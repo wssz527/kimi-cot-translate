@@ -18,8 +18,12 @@ const targets = [
 for (const target of targets) {
   const json = JSON.parse(await readFile(target, 'utf8'));
   if (json.version === version) continue;
-  json.version = version;
-  await writeFile(target, `${JSON.stringify(json, null, 2)}\n`);
+  // Only the version field is rewritten: serialising the parsed object would
+  // reformat the whole file and bury the real change in noise.
+  const original = await readFile(target, 'utf8');
+  const updated = original.replace(/("version":\s*")[^"]+(")/, `$1${version}$2`);
+  if (updated === original) throw new Error(`cannot locate version field in ${target}`);
+  await writeFile(target, updated);
   console.log(`synced ${target} -> ${version}`);
 }
 
