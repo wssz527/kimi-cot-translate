@@ -109,7 +109,7 @@ export async function downloadBundle(manifest,
 // The deployed bundle has no package.json, so the version travels inside this
 // file. scripts/version-sync.mjs keeps it aligned with the root manifest, and a
 // self-update replaces this file wholesale, carrying the new version with it.
-export const RUNTIME_VERSION = '0.2.8';
+export const RUNTIME_VERSION = '0.2.9';
 
 export async function localVersion() {
   return RUNTIME_VERSION;

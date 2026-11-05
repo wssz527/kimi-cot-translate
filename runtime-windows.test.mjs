@@ -828,7 +828,10 @@ test('a watcher that staged an update goes on to install it', async () => {
   assert.deepEqual(installed, ['C:\\Data\\.update-stage-x']);
   assert.equal(result.updateStatus, 'installed');
   assert.equal(result.installed, 'installed');
-  assert.equal(result.version, '0.2.8');
+  // Read the deployed version instead of hard-coding it: this assertion has to
+  // keep holding across releases.
+  const { localVersion } = await import('./runtime-update.mjs');
+  assert.equal(result.version, await localVersion());
 });
 
 test('a finished watcher, or a stage that fails, is handled without a crash', async () => {
