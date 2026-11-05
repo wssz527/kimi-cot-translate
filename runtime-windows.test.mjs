@@ -787,3 +787,28 @@ test('a Windows update reaches the CDN when the canonical host is unreachable', 
   assert.ok(asked.some((url) => url.startsWith('https://cdn.jsdelivr.net/gh/wssz527/kimi-cot-translate@v0.2.8/')),
     'the same tagged files have to be reachable through the mirror');
 });
+
+test('the bridge runs from the deployed bundle, never from a staged copy', async (t) => {
+  const dataDir = await temporary(t);
+  const stage = join(dataDir, '.update-stage-fixture');
+  await mkdir(stage, { recursive: true });
+  for (const name of FILES) await writeFile(join(stage, name), `staged:${name}`);
+  const used = [];
+  await applyStagedUpdate(stage, {
+    localAppData,
+    dataDir,
+    platformCheck: () => {},
+    verifyApp: async () => ({ version: '1.1.1', electron: '43.1.1', executable: 'fp' }),
+    bridge: async (action, _request, options) => { used.push({ action, bundleDir: options?.bundleDir }); return { installed: true }; },
+    sleep: async () => {},
+  });
+  const runs = used.filter((call) => call.action === 'Install' || call.action === 'Start');
+  assert.ok(runs.length >= 2);
+  for (const call of runs) {
+    // The stage is deleted as soon as the install returns, so a bridge script
+    // path pointing into it would break the very next call.
+    assert.ok(call.bundleDir && !call.bundleDir.includes('.update-stage-'),
+      `${call.action} used ${call.bundleDir}`);
+    assert.ok(call.bundleDir.includes('bundle-'));
+  }
+});

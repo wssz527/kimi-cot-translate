@@ -82,8 +82,15 @@ export async function bridge(action, request = {}, options = {}) {
   return JSON.parse(stdout.replace(/^\uFEFF/, '').trim());
 }
 
-function callBridge(options, action, request = {}) {
-  return (options.bridge ?? bridge)(action, request, options);
+function callBridge(options, action, request = {}, bridgeOpts = options) {
+  return (options.bridge ?? bridge)(action, request, bridgeOpts);
+}
+
+// `install` runs from a staged copy that is deleted when it returns, so the
+// bridge script has to be looked up in the bundle it just deployed rather than
+// in whatever directory the caller happened to run from.
+function bridgeOptions(bundleDir, options) {
+  return bundleDir ? { ...options, bundleDir } : options;
 }
 
 // Windows command lines quote backslashes differently from a shell.
@@ -766,7 +773,8 @@ export async function install(options = {}) {
     await atomicJSON(join(dataDir, 'enabled.json'),
       { entry: join(deployed, 'runtime-windows.mjs'), generation: randomUUID() });
     await rm(join(dataDir, 'stop'), { force: true });
-    await callBridge(options, 'Install', taskRequest(deployed, process.execPath, dataDir, taskName(options)));
+    await callBridge(options, 'Install', taskRequest(deployed, process.execPath, dataDir, taskName(options)),
+      { ...options, bundleDir: deployed });
     committed = true;
     await pruneBundles(dataDir, deployed, oldEnabled?.entry).catch((error) => {
       console.warn(`[kct-windows] Old bundle cleanup failed: ${error.message}`);
@@ -788,7 +796,7 @@ export async function install(options = {}) {
     if (lock) await lock.release();
     await lifecycle.release();
     if (!committed && controlChanged && oldEnabled && !oldStop) {
-      await callBridge(options, 'Start', { taskName: taskName(options) }).catch(() => {});
+      await callBridge(options, 'Start', { taskName: taskName(options) }, bridgeOptions(deployed, options)).catch(() => {});
     }
   }
   // Task Scheduler accepts a start request asynchronously, so a task that was
@@ -797,7 +805,7 @@ export async function install(options = {}) {
   let started;
   for (let attempt = 0; attempt < 5 && !started; attempt++) {
     try {
-      await callBridge(options, 'Start', { taskName: taskName(options) });
+      await callBridge(options, 'Start', { taskName: taskName(options) }, bridgeOptions(deployed, options));
       started = true;
     } catch (error) {
       if (attempt === 4) {
