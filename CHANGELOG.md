@@ -6,11 +6,27 @@
 
 ## [Unreleased]
 
+## [0.2.7] - 2026-11-05
+
+### 修复
+
+- **macOS 不再要求官方签名**：与 Windows 对齐，`codesign` 结果只记入 `signature` 字段供诊断，不再作为放行条件。此前官方轮换证书、或宿主被重签后，即使 inspector fuse 与思考区块结构都完好，插件也会永久停用。真正保护挂载的仍是注入前的进程身份校验（PID、启动时间、可执行文件路径）。
+- **删除 Windows 侧已失效的 inspector 代码**：`triggerInspector`、`inspectorOperations` 与 `blocked-inspector` 状态标记在改用 CDP 后已无调用方，一并移除，避免状态字段与文档互相矛盾。
+- **Windows 实机测试脚本对齐 CDP 语义**：此前仍断言 `inspectorClosed` 与 9229 端口，改为以 `--remote-debugging-port=9222` 启动并断言 9222 的释放，同时避免测试进程被误当成用户实例。
+
+### 文档
+
+- 中英 README、`SECURITY.md`、`docs/windows.md` 同步：校验流程改为「进程身份 → inspector fuse → 渲染结构」，说明签名与版本号只记录、不参与放行；Windows 补上 `--remote-debugging-port=9222` 的一次性设置方式（快捷方式「目标」追加参数），并说明终端直接启动时不会带该参数。
+
+## [0.2.6] - 2026-11-05
+
+0.2.3–0.2.6 的改动此前未单独归档，一并记在此版本下。
+
 ### 新增
 
 - 后台任务改为事件驱动：LaunchAgent 不再每 10 秒轮询，改为 `WatchPaths` 监听 Kimi Code 的用户数据目录，Kimi 关闭期间完全不被唤醒。
 - 运行时自更新：每次 Kimi Code 启动后检查一次仓库发布的更新清单（`runtime-manifest.json`），发现新版本时下载运行时文件、逐个校验 SHA-256，再通过既有的原子部署路径替换（失败自动回滚）。同一 Kimi 进程只检查一次，Kimi 未运行时不发起任何网络请求。新增 `node runtime.mjs --update` 手动入口；`--check` 输出新增 `updateStatus` / `updateVersion` / `updateCheckedFor` 字段。
-- 未知内核哈希不再直接熔断：改为在官方签名、inspector fuse 与思考区块结构三项同时成立时放行，并记 `verified: "contract"`。官方升级只要不改思考区块结构即可继续工作，无需等待新版或重装。
+- 未知内核哈希不再直接熔断：改为在 inspector fuse 与思考区块结构同时成立时放行，并记 `verified: "contract"`（0.2.6 及以前还要求官方签名，0.2.7 起不再要求）。官方升级只要不改思考区块结构即可继续工作，无需等待新版或重装。
 
 ### 修复
 
@@ -20,7 +36,7 @@
 - **Windows 允许非标准安装路径**：安装器可指向其他盘符，加载器按实际目录识别，进程发现使用同一路径。
 - **Windows 不再误判自身子进程**：Kimi Code 通过同一可执行文件启动 `./bin/kimi-datasource.mjs` 等辅助脚本，它们此前被计为第二个主实例，导致拒绝挂载。
 - 移除 Electron 主版本白名单：此前即使结构与注入能力都成立，只要宿主的 Electron 主版本不在硬编码列表（如 43 → 45）就永久停用。版本号现在只用于状态展示，不再参与放行判断。
-- Windows 二进制校验同样改为按能力放行：不再要求哈希必须在允许列表内，也不再限定 `Electron/43.1.1`；未知构建按签名、PE、fuse 与结构判定，记 `verified: "contract"`。
+- Windows 二进制校验同样改为按能力放行：不再要求哈希必须在允许列表内，也不再限定 `Electron/43.1.1`；未知构建按 PE、fuse 与结构判定，记 `verified: "contract"`。
 - macOS 进程发现改用进程表精确匹配：`pgrep -x "Kimi Code"` 无法匹配含空格的进程名，会导致「Kimi Code is not running」的误判，后台任务因此不再挂载。
 - 版本号内置于 `runtime-update.mjs`：部署目录没有 `package.json`，原实现每次运行都会因读取失败在日志里留下错误。
 

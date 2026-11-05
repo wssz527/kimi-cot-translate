@@ -59,7 +59,7 @@ shasum -a 256 -c SHA256SUMS.txt
 
 安装只设置扩展的后台加载器，不会强制退出或重启 Kimi，也不修改官方安装包。首次安装会向符合校验条件的现有进程加载翻译界面。更新扩展时，已经加载旧脚本的页面在下次正常刷新或重开后使用新版，安装命令不会擅自刷新页面。
 
-机器需要先安装对应架构的 Node.js 24。执行安装前，建议先阅读 `runtime.mjs` 的校验流程（签名 → 内核哈希 → inspector fuse → 渲染结构）。
+机器需要先安装对应架构的 Node.js 24。执行安装前，建议先阅读 `runtime.mjs` 的校验流程（进程身份 → inspector fuse → 渲染结构）。签名与版本号只记录，不参与放行。
 
 ### macOS
 
@@ -92,6 +92,8 @@ node runtime.mjs --install
 ```powershell
 node runtime-windows.mjs --install
 ```
+
+**Windows 需要让 Kimi Code 带 `--remote-debugging-port=9222` 启动**：这个端口只监听本机回环地址，是 Windows 端注入的唯一入口。给桌面和开始菜单快捷方式的「目标」末尾补上该参数即可，从这些快捷方式启动就会生效；直接在终端敲 `kimi` 或运行其他副本时不会带这个参数，加载器会写明原因并等待。Linux/macOS 的桌面端不需要这个参数。
 
 Windows 的静态证据、动态测试和运行约束见 [Windows 适配记录](docs/windows.md)。后台使用当前用户的登录计划任务观察现有实例，不会自行启动 Kimi；停用会等待本次挂载收尾，不终止 Kimi。重复安装只保留当前及上一份完整扩展副本，不会无限堆积旧版本。
 
@@ -193,10 +195,10 @@ node runtime-windows.mjs --check
 
 状态是最近一次后台检查的记录：
 
-- `active`、`loaded: 1`、`inspectorClosed: true`：所记录的 PID 已完成挂载，调试接口已关闭。
+- `active`、`loaded: 1`：所记录的 PID 已完成挂载。
 - `waiting`：等待正常实例启动，或等待多个实例、端口占用等条件解除。
-- `error`：校验或挂载失败，读取 `detail`；瞬时失败会退避后自动重试，永久不兼容（未知哈希/签名不符）不会重试。
-- `blocked-inspector`：调试接口未能确认关闭，请正常退出 Kimi，再查看日志。
+- `error`：校验或挂载失败，读取 `detail`；瞬时失败会退避后自动重试，永久不兼容（inspector fuse 被禁用、思考区块结构变化）不会重试。
+- `blocked-inspector`（仅 macOS）：调试接口未能确认关闭，请正常退出 Kimi，再查看日志。
 
 状态保存在对应用户数据目录的 `runtime-state.json`，macOS 另有 `runtime.log`。Windows 数据目录为 `%LOCALAPPDATA%\kimi-cot-translate\windows`。这些诊断记录不包含会话正文或服务密钥。
 
@@ -216,11 +218,11 @@ node runtime-windows.mjs --disable
 
 ## Kimi 更新后的行为
 
-扩展文件位于官方 App 以外，正常 App 更新不会覆盖这些文件。新进程启动后，后台任务会重新检查签名、实际运行文件、inspector fuse 和思考区块结构，再自动挂载。
+扩展文件位于官方 App 以外，正常 App 更新不会覆盖这些文件。新进程启动后，后台任务会重新检查实际运行的进程与文件、注入能力和思考区块结构，再自动挂载。
 
 **日常跟随不需要你做任何事。** 判断能否继续用的不是版本号，而是注入能力与思考区块的界面结构：
 
-- 官方更新后如果 `.think` / `.think-head` / `.think-body` / `.think-body-inner` / `.think-text` 这五个结构仍在，且签名与调试能力没变，翻译会直接继续工作，不必等新版、也不必重装。
+- 官方更新后如果 `.think` / `.think-head` / `.think-body` / `.think-body-inner` / `.think-text` 这五个结构仍在，且注入能力还在，翻译会直接继续工作，不必等新版、也不必重装。
 - 跨 Electron 大版本同样如此：版本号本身不参与判断，只用于状态展示。Kimi Code 1.3.1 从 Electron 43 升到 45 时就是这种情况，结构没变、翻译照常。
 - 只有注入能力或结构真的变了，翻译才会停用并等待适配——这才是「上游坏了、需要我修」的情况。
 
@@ -239,7 +241,7 @@ node runtime.mjs --update
 | 现象 | 可能原因 | 处理 |
 | --- | --- | --- |
 | 更新后翻译消失，detail 含 `reasoning UI changed` | 思考区块结构变了 | 提兼容性报告，等待适配版本 |
-| detail 含签名或结构校验失败 | 官方包结构变化 | 同上；不要手工绕过 |
+| detail 含 `reasoning UI changed` 或 fuse 被禁用 | 官方包结构或调试能力变化 | 同上；不要手工绕过 |
 | `blocked-inspector` | 调试接口未确认关闭 | 正常退出 Kimi 后查看日志 |
 
 这不是官方承诺稳定的扩展 API，不能保证所有未来版本都兼容。当前只验证过正常重启恢复和页面刷新恢复，尚未完成真实跨版本升级验收。静态结构检查也无法证明所有新版交互都兼容。
@@ -249,7 +251,7 @@ node runtime.mjs --update
 ## 已知限制
 
 - 已验证 Kimi Code 1.3.1 / Electron 45.1.0 与 1.1.1 / 1.1.2 / Electron 43.1.1（均为 macOS arm64）；Electron 45 的 Windows 分支、真实跨版本升级链路、睡眠唤醒、长期运行尚未验收。
-- 宿主版本号不参与放行判断：只要签名、inspector fuse 与思考区块结构三项成立，跨 Electron 大版本也会继续挂载；三者之一失效则停用并写出具体原因。
+- 宿主版本号不参与放行判断：只要进程身份、inspector fuse 与思考区块结构三项成立，跨 Electron 大版本也会继续挂载；三者之一失效则停用并写出具体原因。
 - 不支持 Kimi 桌面端（Kimi.app，com.moonshot.kimichat）：官方在其 Electron 二进制中关闭了 Node inspector fuse，本项目的运行时注入机制在技术上无法挂载，且本项目不会通过修改官方二进制绕过。Kimi 网页版（kimi.com）用户请使用浏览器扩展入口。
 - kimi.com 普通聊天页未在登录会话验收；VS Code 入口未在真实扩展宿主验收。
 - 翻译使用公共免鉴权端点（Bing / Google），无 SLA，可能限流、变更或受服务方条款约束；长期或大量使用建议使用自带凭据的自定义服务。
@@ -283,9 +285,9 @@ node docs/create-screenshots.mjs
 
 GitHub Actions 运行共享 UI、hook、ACP 协议、浏览器、VS Code 预览和 Windows 加载器模拟回归；macOS 另运行对应的系统加载器单元测试。测试环境与具体入口的实际安装支持分别列在前面的表格中。
 
-手动触发的 [Windows 官方 App smoke](https://github.com/wssz527/kimi-cot-translate/actions/workflows/windows-live.yml) 覆盖真实签名校验、调试触发、两个冷启动进程、挂载、接口关闭、计划任务安装不重启及安全停用；该工作流在官方安装包更新后会按设计失败（哈希熔断），需要人工完成离线兼容核查后更新哈希，**失败不代表本仓库代码损坏**。它使用未登录的全新环境，没有验证真实用户会话中的 Bing 翻译或官方升级。CI 成功不能替代这些缺失的验收。
+手动触发的 [Windows 官方 App smoke](https://github.com/wssz527/kimi-cot-translate/actions/workflows/windows-live.yml) 覆盖安装包哈希与 Authenticode 校验、CDP 注入、两个冷启动进程、挂载、计划任务安装不重启及安全停用；该工作流在官方安装包更新后会按设计失败（哈希熔断），需要人工完成离线兼容核查后更新哈希，**失败不代表本仓库代码损坏**。它使用未登录的全新环境，没有验证真实用户会话中的 Bing 翻译或官方升级。CI 成功不能替代这些缺失的验收。
 
-2026-10-21 的 macOS 部署验收覆盖了真实 Bing 翻译、原文切换、正常启动后自动加载、页面刷新恢复、官方签名和资源哈希保持不变。真实升级、睡眠唤醒和长期运行尚未验证。
+2026-10-21 的 macOS 部署验收覆盖了真实 Bing 翻译、原文切换、正常启动后自动加载、页面刷新恢复、官方 App 与资源哈希保持不变。真实升级、睡眠唤醒和长期运行尚未验证。
 
 ## 许可与贡献
 

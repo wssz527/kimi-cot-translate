@@ -234,26 +234,6 @@ export async function verifyApp(options = {}) {
     signature: runtime.signature, verified: runtime.verified, executable: before };
 }
 
-export async function triggerInspector(info, {
-  execFile = run, timeout = 5000, platformCheck = assertPlatform,
-} = {}) {
-  if (!Number.isSafeInteger(info.pid) || info.pid <= 0) throw new Error('Invalid target PID');
-  platformCheck();
-  try {
-    await execFile(process.execPath, ['--input-type=commonjs', '-e',
-      'const pid=Number(process.argv[1]);if(!Number.isSafeInteger(pid)||pid<=0)throw Error("Invalid PID");process._debugProcess(pid);',
-      String(info.pid)], { timeout, killSignal: 'SIGKILL', windowsHide: true, maxBuffer: 65536,
-      env: { ...process.env, NODE_OPTIONS: '', NODE_PATH: '' } });
-  } catch (error) {
-    if (error.killed || error.code === 'ETIMEDOUT' || typeof error.code === 'number' || error.signal) {
-      throw Object.assign(new Error('Windows inspector helper did not complete; trigger state is uncertain'), {
-        cause: error, failureKind: 'inspector-uncertain',
-      });
-    }
-    throw error;
-  }
-}
-
 // Windows attaches through the Chromium DevTools Protocol rather than
 // `process._debugProcess`. That Node API needs the host to register a
 // `node-debug-handler` event, which a real Kimi Code 1.3.1 install does not do,
@@ -392,35 +372,6 @@ export async function installIntoRenderers(source, revision, {
   return { loaded: injected.filter((entry) => entry.loaded).length, renderers: injected };
 }
 
-export function inspectorOperations(options = {}) {
-  const checkIdentity = async (expected) => {
-    const found = await (options.findProcesses ?? findProcesses)(options);
-    if (found.length !== 1) throw new Error('Kimi main process is no longer unique');
-    assertIdentity(found[0], expected);
-  };
-  return {
-    checkIdentity,
-    verifyLiveProcess: async (info, app) => {
-      await checkIdentity(info);
-      if (await (options.fingerprint ?? fingerprint)(windowsPaths(options).executable) !== app.executable) {
-        throw new Error('Kimi executable changed during attachment');
-      }
-    },
-    triggerInspector: async (info) => {
-      await checkIdentity(info);
-      await (options.triggerInspector ?? triggerInspector)(info, options);
-    },
-    verifyPortOwner: async (info) => {
-      await checkIdentity(info);
-      const listeners = await callBridge(options, 'PortOwner', { port: 9229 });
-      if (!Array.isArray(listeners) || !listeners.length || listeners.some((listener) =>
-        listener.pid !== info.pid || listener.address !== '127.0.0.1')) {
-        throw new Error('Inspector socket is not owned exclusively by the expected Kimi process');
-      }
-    },
-  };
-}
-
 async function readJSON(file, missing = {}, read = readFile) {
   try { return JSON.parse(await read(file, 'utf8')); }
   catch (error) { if (error.code === 'ENOENT') return missing; throw error; }
@@ -520,7 +471,6 @@ export async function tick(options = {}) {
       { port: options.debugPort ?? DEBUG_PORT, ...options.cdp });
     state.status = 'active';
     state.loaded = result.loaded;
-    state.inspectorClosed = true;
   } catch (error) {
     recordFailure(state, error, now());
   }
@@ -753,7 +703,7 @@ async function main() {
     try { result = await tick(); } finally { await lock.release(); }
   }
   console.log(JSON.stringify(result));
-  if (['error', 'blocked-inspector'].includes(result?.status)) process.exitCode = 1;
+  if (result?.status === 'error') process.exitCode = 1;
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {

@@ -6,8 +6,8 @@ import { tmpdir } from 'node:os';
 import { basename, join, win32 } from 'node:path';
 import {
   acquireLock, assertPlatform, bridgeRequest, commandLineArgs, disable, findProcesses,
-  install, inspectorOperations, readState, selectProcesses, taskRequest, tick,
-  triggerInspector, verifyApp, verifyBinary, watch, windowsPaths,
+  install, readState, selectProcesses, taskRequest, tick,
+  verifyApp, verifyBinary, watch, windowsPaths,
 } from './runtime-windows.mjs';
 
 const localAppData = "C:\\Users\\Test O'Brien\\AppData\\Local";
@@ -195,27 +195,6 @@ test('application verification checks the renderer contract and detects a concur
   await assert.rejects(verifyApp(options), /changed during verification/);
 });
 
-test('identity and port owner operations fail before a trigger on PID changes', async () => {
-  let found = [INFO], triggered = 0, listeners = [{ pid: INFO.pid, address: '127.0.0.1' }];
-  const operations = inspectorOperations({
-    localAppData, findProcesses: async () => found, fingerprint: async () => 'file',
-    triggerInspector: async () => { triggered++; }, bridge: async () => listeners,
-  });
-  await operations.verifyLiveProcess(INFO, { executable: 'file' });
-  await operations.verifyPortOwner(INFO);
-  found = [{ ...INFO, started: '2026-10-22T00:00:01Z' }];
-  await assert.rejects(operations.triggerInspector(INFO), /identity changed/);
-  assert.equal(triggered, 0);
-  found = [INFO, { ...INFO, pid: 43 }];
-  await assert.rejects(operations.triggerInspector(INFO), /unique/);
-  found = [INFO];
-  for (const invalid of [[], [{ pid: 99, address: '127.0.0.1' }],
-    [{ pid: INFO.pid, address: '0.0.0.0' }]]) {
-    listeners = invalid;
-    await assert.rejects(operations.verifyPortOwner(INFO), /owned exclusively/);
-  }
-});
-
 test('one attempt survives absence and multiple processes; a new start or source revision retries', async () => {
   const f = tickFixture();
   assert.equal((await tick(f.options)).status, 'active');
@@ -280,61 +259,23 @@ test('a closed debugging port is a retryable failure and nothing is injected', a
   assert.equal(f.installs(), 1);
 });
 
-test('the helper uses a bounded separate Node process with an argument-safe PID', async () => {
-  let calls = 0;
-  const error = await triggerInspector(INFO, {
-    platformCheck: () => {},
-    timeout: 123,
-    execFile: async (command, args, options) => {
-      calls++;
-      assert.equal(command, process.execPath);
-      assert.equal(args.at(-1), String(INFO.pid));
-      assert.match(args[2], /process\._debugProcess\(pid\)/);
-      assert.equal(options.timeout, 123);
-      assert.equal(options.windowsHide, true);
-      assert.equal(options.env.NODE_OPTIONS, '');
-      const failure = new Error('terminated'); failure.killed = true; throw failure;
-    },
-  }).catch((failure) => failure);
-  assert.match(error.message, /helper did not complete/);
-  assert.equal(error.failureKind, 'inspector-uncertain');
-  assert.equal(calls, 1);
-  const exited = await triggerInspector(INFO, {
-    platformCheck: () => {},
-    execFile: async () => { const failure = new Error('exited'); failure.code = 1; throw failure; },
-  }).catch((failure) => failure);
-  assert.equal(exited.failureKind, 'inspector-uncertain');
-  await assert.rejects(triggerInspector(INFO, {
-    platformCheck: () => {},
-    execFile: async () => { const failure = new Error('missing'); failure.code = 'ENOENT'; throw failure; },
-  }), { code: 'ENOENT' });
-  await assert.rejects(triggerInspector({ pid: '42;bad' }, {
-    execFile: async () => { throw new Error('must not execute'); },
-  }), /Invalid target PID/);
-});
-
-test('helper timeout stays blocked until its port is released, then retries after backoff', async () => {
+test('a failed attach backs off and reattaches once the renderer is reachable', async () => {
   const f = tickFixture();
   let calls = 0;
   f.options.installIntoRenderers = async () => {
     calls++;
-    if (calls === 1) {
-      return triggerInspector(INFO, {
-        platformCheck: () => {},
-        execFile: async () => { const error = new Error('timeout'); error.killed = true; throw error; },
-      });
-    }
-    return { loaded: 1 };
+    if (calls === 1) throw new Error('No Kimi renderer page is available for translation yet');
+    return { loaded: 1, renderers: [] };
   };
   const failed = await tick(f.options);
-  assert.equal(failed.status, 'blocked-inspector');
-  assert.equal(failed.failureKind, 'inspector-uncertain');
-  assert.equal(failed.nextRetryAt, '2026-10-22T00:00:40.000Z');
-  f.options.portOpen = async () => true;
-  f.options.now = () => Date.parse('2026-10-22T03:00:00Z');
+  assert.equal(failed.status, 'error');
+  assert.ok(failed.nextRetryAt, 'a failure must schedule a retry rather than stop for good');
+  // Before the backoff elapses the attach is not attempted again.
+  f.options.now = () => Date.parse('2026-10-22T00:00:20Z');
   await tick(f.options);
   assert.equal(calls, 1);
-  f.options.portOpen = async () => false;
+  // After it elapses, the page is reachable and the tick succeeds.
+  f.options.now = () => Date.parse('2026-10-22T03:00:00Z');
   assert.equal((await tick(f.options)).status, 'active');
   assert.equal(calls, 2);
 });
@@ -389,28 +330,24 @@ test('a changed PID or start resets attempts without waiting for the old deadlin
   }
 });
 
-test('interrupted checking probes the port before retrying and respects backoff after release', async () => {
+test('an interrupted attempt retries after backoff instead of attaching immediately', async () => {
   const f = tickFixture();
   await tick(f.options);
   const interrupted = { ...f.state(), status: 'checking' };
   const read = f.options.readState;
   f.options.readState = async () => interrupted;
-  let probes = 0;
-  f.options.portOpen = async () => { probes++; return true; };
   const blocked = await tick(f.options);
+  // A previous attempt whose outcome is unknown is not retried on the spot.
   assert.equal(blocked.status, 'blocked-inspector');
   assert.equal(blocked.failureKind, 'inspector-uncertain');
-  assert.equal(probes, 1);
   assert.equal(f.installs(), 1);
   f.options.readState = read;
-  f.options.portOpen = async () => false;
-  f.options.now = () => Date.parse('2026-10-22T00:00:39Z');
+  f.options.now = () => Date.parse('2026-10-22T00:00:20Z');
   assert.deepEqual(await tick(f.options), blocked);
-  f.options.now = () => Date.parse('2026-10-22T00:00:40Z');
+  f.options.now = () => Date.parse('2026-10-22T03:00:00Z');
   assert.equal((await tick(f.options)).status, 'active');
   assert.equal(f.installs(), 2);
 });
-
 test('preflight file IO failures use backoff before any installation', async () => {
   const f = tickFixture();
   const read = f.options.readFile;

@@ -57,7 +57,7 @@ You can also `git clone` this repository; the browser extension and VS Code arti
 
 Installation only sets up the extension's background loader. It does not force-quit or restart Kimi, and it does not modify the official installation package. The first install loads the translation layer into any already-running process that passes verification. When the extension is updated, pages that already loaded an older script pick up the new one on their next normal refresh or reopen; the installer never refreshes pages on its own.
 
-Node.js 24 for your architecture is required. Before running the installer, consider reading the verification flow in `runtime.mjs` (signature → kernel hash → inspector fuse → renderer structure).
+Node.js 24 for your architecture is required. Before running the installer, consider reading the verification flow in `runtime.mjs` (process identity → inspector fuse → renderer structure). The signature and the version number are recorded only and never gate attachment.
 
 ### macOS
 
@@ -90,6 +90,8 @@ In PowerShell, enter this repository directory and run:
 ```powershell
 node runtime-windows.mjs --install
 ```
+
+**On Windows, Kimi Code must be started with `--remote-debugging-port=9222`**: that loopback-only port is the only entry point this platform can inject through. Append the flag to the "Target" of the desktop and Start-menu shortcuts and launch from them; typing `kimi` in a terminal or starting another copy does not carry the flag, and the loader then reports why it is waiting. The macOS desktop app does not need the flag.
 
 See [Windows adaptation notes](docs/windows.md) for static evidence, dynamic tests and runtime constraints. The background login scheduled task observes existing instances and never starts Kimi itself; disabling waits for the current attachment to finish without terminating Kimi. Reinstalling keeps only the current and previous complete copies of the extension.
 
@@ -191,10 +193,10 @@ node runtime-windows.mjs --check
 
 The status is the record of the most recent background check:
 
-- `active`, `loaded: 1`, `inspectorClosed: true`: the recorded PID finished attachment and the debugging interface is closed.
+- `active`, `loaded: 1`: the recorded PID finished attachment.
 - `waiting`: waiting for a normal instance to start, or for conditions such as multiple instances or a busy port to clear.
-- `error`: verification or attachment failed — read `detail`. Transient failures retry automatically with backoff; permanent incompatibility (unknown hash / signature mismatch) is never retried.
-- `blocked-inspector`: the debugging interface could not be confirmed closed — quit Kimi normally and check the log.
+- `error`: verification or attachment failed — read `detail`. Transient failures retry automatically with backoff; permanent incompatibility (the inspector fuse is disabled, the thinking-block structure changed) is never retried.
+- `blocked-inspector` (macOS only): the debugging interface could not be confirmed closed — quit Kimi normally and check the log.
 
 Status is stored in `runtime-state.json` under the per-user data directory (macOS also has `runtime.log`). The Windows data directory is `%LOCALAPPDATA%\kimi-cot-translate\windows`. These diagnostic records contain no session text or service keys.
 
@@ -214,11 +216,11 @@ The already-loaded translation layer disappears the next time Kimi quits normall
 
 ## After Kimi updates
 
-The extension files live outside the official app, so a normal app update never overwrites them. After a new process starts, the background task re-checks the signature, the actually running files, the inspector fuse and the thinking-block structure before attaching again.
+The extension files live outside the official app, so a normal app update never overwrites them. After a new process starts, the background task re-checks the running process and files, the injection capability and the thinking-block structure before attaching again.
 
 **Routine follow-up needs nothing from you.** What decides whether translation keeps working is the injection capability and the thinking-block structure, not version numbers:
 
-- If `.think`, `.think-head`, `.think-body`, `.think-body-inner` and `.think-text` are all still present after an official update, and the signature and the debugging capability are unchanged, translation simply keeps working — no waiting for a release, no reinstall.
+- If `.think`, `.think-head`, `.think-body`, `.think-body-inner` and `.think-text` are all still present after an official update, and the injection capability still holds, translation simply keeps working — no waiting for a release, no reinstall.
 - The same holds across an Electron major version: the version number is used for status display only and never gates attachment. Kimi Code 1.3.1 went from Electron 43 to 45 with the structure untouched, and translation kept working.
 - Only when the injection capability or the structure really changes does translation stop and wait for adaptation. That is the "upstream broke, the author must fix it" case.
 
@@ -237,7 +239,7 @@ Symptom cheat sheet:
 | Symptom | Likely cause | What to do |
 | --- | --- | --- |
 | Translation gone after update; detail says `reasoning UI changed` | Thinking-block structure changed | File a compatibility report and wait for an adaptation release |
-| detail mentions signature or structure verification failure | Official package structure changed | Same as above; never bypass manually |
+| detail says `reasoning UI changed`, or the fuse is disabled | Official package structure or debugging capability changed | Same as above; never bypass manually |
 | `blocked-inspector` | Debugging interface not confirmed closed | Quit Kimi normally, then read the log |
 
 This is not an officially supported stable extension API, and compatibility with future versions cannot be guaranteed. Only normal-restart recovery and page-refresh recovery have been verified so far; real cross-version upgrade acceptance has not been done. Static structure checks cannot prove that every interaction of a new version stays compatible.
@@ -280,9 +282,9 @@ node docs/create-screenshots.mjs
 
 GitHub Actions runs the shared UI, hook, ACP protocol, browser, VS Code preview and Windows loader simulated regressions; macOS additionally runs the system loader unit tests. The test environments versus each entry's real install support are listed in the tables above.
 
-The manually triggered [Windows official-app smoke](https://github.com/wssz527/kimi-cot-translate/actions/workflows/windows-live.yml) covers real signature verification, debug triggering, two cold-started processes, attachment, interface closure, scheduled-task install without restart, and safe disable. By design this workflow fails once the official installer changes (a hash circuit-breaker); the hash is updated only after a manual offline compatibility review — **a failure there does not mean this repository's code is broken**. It uses a fresh, logged-out environment and does not verify Bing translation in real user sessions or official upgrades. CI success cannot replace those missing acceptance steps.
+The manually triggered [Windows official-app smoke](https://github.com/wssz527/kimi-cot-translate/actions/workflows/windows-live.yml) covers installer hash and Authenticode verification, CDP injection, two cold-started processes, attachment, scheduled-task install without restart, and safe disable. By design this workflow fails once the official installer changes (a hash circuit-breaker); the hash is updated only after a manual offline compatibility review — **a failure there does not mean this repository's code is broken**. It uses a fresh, logged-out environment and does not verify Bing translation in real user sessions or official upgrades. CI success cannot replace those missing acceptance steps.
 
-The 2026-10-21 macOS deployment acceptance covered real Bing translation, original-toggle, auto-loading after normal launch, page-refresh recovery, and unchanged official signature and resource hashes. Real upgrades, sleep/wake and long-running sessions remain unverified.
+The 2026-10-21 macOS deployment acceptance covered real Bing translation, original-toggle, auto-loading after normal launch, page-refresh recovery, and unchanged official app and resource hashes. Real upgrades, sleep/wake and long-running sessions remain unverified.
 
 ## License and contributing
 

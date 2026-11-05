@@ -190,23 +190,39 @@ test('transient verification errors retry only after their backoff expires', asy
   assert.equal(f.installed(), 1);
 });
 
-test('signature rejection, unknown runtime hashes and fuse mismatches are permanent', async () => {
+test('an unsigned host still verifies, while fuse mismatches stay permanent', async () => {
+  const css = ['.think', '.think-head', '.think-body', '.think-body-inner', '.think-text']
+    .map((name) => `${name}{}`).join('');
+  const binary = Buffer.concat([Buffer.from('prefixdL7pKGdnNz796PbbjQWNKmHXBZaB9tsX'),
+    Buffer.from([1, 9]), Buffer.from('101100001')]);
   const verification = {
     fingerprint: async () => 'file',
-    output: async () => '',
+    output: async (_cmd, args) => (args?.some((a) => a.includes(':CFBundleVersion')) ? '43.1.1\n' : '1.1.3\n'),
     run: async () => ({ stderr: 'Identifier=com.kimi.code.desktop\nTeamIdentifier=2J9472RW75\n' }),
-    readFile: async (file) => String(file).endsWith('.json') ? '[]' : Buffer.from('unknown runtime'),
+    readFile: async (file) => {
+      if (String(file).endsWith('supported-runtimes.json')) return '[]';
+      if (String(file).endsWith('Electron Framework')) return binary;
+      if (String(file).endsWith('index.html')) return '<link href="/assets/main.css">';
+      return css;
+    },
   };
-  for (const override of [
-    { output: async () => { throw Object.assign(new Error('invalid signature'), { code: 1 }); } },
-    { run: async () => ({ stderr: 'Identifier=untrusted\n' }) },
-    {},
-  ]) {
-    await assert.rejects(verifyApp({ ...verification, ...override }), { failureKind: 'permanent' });
+  // codesign failing, an unexpected identity, or no signature output at all are
+  // all reported rather than refused: this is a free third-party translator and
+  // the host's signature says nothing about whether translation can work. What
+  // still protects the attachment is the process identity check before any
+  // signal is sent.
+  const unsigned = await verifyApp({ ...verification,
+    run: async () => { throw Object.assign(new Error('invalid signature'), { code: 1 }); } });
+  assert.equal(unsigned.verified, 'contract');
+  assert.equal(unsigned.signature.status, 'unknown');
+  for (const stderr of ['Identifier=untrusted\n', '', 'Identifier=x\nTeamIdentifier=Y\n']) {
+    const signed = await verifyApp({ ...verification, run: async () => ({ stderr }) });
+    assert.equal(signed.verified, 'contract');
+    assert.equal(signed.signature.status, 'Valid');
   }
-  await assert.rejects(verifyApp({ ...verification, output: async () => {
-    throw Object.assign(new Error('codesign timed out'), { code: null, killed: true });
-  } }), (error) => error.failureKind === undefined);
+  const identity = await verifyApp(verification);
+  assert.equal(identity.signature.identifier, 'com.kimi.code.desktop');
+  assert.ok(identity.signature.team);
   assert.throws(() => inspectFuses(Buffer.from('unknown layout')), { failureKind: 'permanent' });
   const f = tickFixture();
   let checks = 0;

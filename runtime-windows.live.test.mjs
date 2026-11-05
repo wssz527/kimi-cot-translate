@@ -2,25 +2,14 @@ import assert from 'node:assert/strict';
 import { execFile, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { readFile, stat } from 'node:fs/promises';
-import { connect } from 'node:net';
 import { join } from 'node:path';
 import test from 'node:test';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { promisify } from 'node:util';
-import { findProcesses, windowsPaths } from './runtime-windows.mjs';
+import { debugPortOpen, findProcesses, windowsPaths } from './runtime-windows.mjs';
 
 const run = promisify(execFile);
 const enabled = process.platform === 'win32' && process.env.KCT_WINDOWS_LIVE === '1';
-
-function inspectorOpen() {
-  return new Promise((resolve) => {
-    const socket = connect({ host: '127.0.0.1', port: 9229 });
-    const done = (open) => { socket.destroy(); resolve(open); };
-    socket.once('connect', () => done(true));
-    socket.once('error', () => done(false));
-    socket.setTimeout(500, () => done(true));
-  });
-}
 
 async function loader(arg) {
   return run(process.execPath, ['runtime-windows.mjs', arg], {
@@ -50,7 +39,7 @@ test('verified Windows Kimi attaches, installs without restart, disables and rec
   await assert.rejects(stat(dataDir), { code: 'ENOENT' }, 'live test requires fresh plugin data');
   const before = createHash('sha256').update(await readFile(exe)).digest('hex');
   assert.equal(before, '9c6aac3196d3fb2a62e3ff67e6add9f24238efddf661cfcc7088b120f7e478e9');
-  assert.equal(await inspectorOpen(), false, 'test needs a free inspector port');
+  assert.equal(await debugPortOpen(), false, 'test needs a free debugging port');
   let child;
   let installationAttempted = false;
   t.after(async () => {
@@ -60,7 +49,11 @@ test('verified Windows Kimi attaches, installs without restart, disables and rec
   const pids = [];
   for (let cycle = 0; cycle < 2; cycle++) {
     assert.equal((await findProcesses()).length, 0, 'refusing to start alongside an existing Kimi instance');
-    child = spawn(exe, [], { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+    // The Windows loader attaches through the Chromium DevTools Protocol, so the
+    // app has to be started with the debugging port the shortcuts add.
+    child = spawn(exe, ['--remote-debugging-port=9222'], {
+      windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'],
+    });
     let diagnostics = '';
     child.stdout.on('data', (chunk) => { diagnostics = (diagnostics + chunk).slice(-6000); });
     child.stderr.on('data', (chunk) => { diagnostics = (diagnostics + chunk).slice(-6000); });
@@ -89,8 +82,9 @@ test('verified Windows Kimi attaches, installs without restart, disables and rec
     assert.equal(state?.status, 'active', JSON.stringify(state));
     assert.equal(state.pid, child.pid);
     assert.ok(state.loaded >= 1);
-    assert.equal(state.inspectorClosed, true);
-    assert.equal(await inspectorOpen(), false);
+    // The debugging port stays open for this session by design: unlike the macOS
+    // Node inspector it is a launch flag, not something the loader can shut down.
+    assert.equal(await debugPortOpen(), true);
     const snapshot = JSON.stringify(state);
     await loader('--once');
     const unchanged = JSON.parse((await loader('--check')).stdout);
@@ -122,7 +116,8 @@ test('verified Windows Kimi attaches, installs without restart, disables and rec
       assert.equal(child.exitCode, null, 'disabling the extension terminated the app');
     }
     await stopOwned(child);
-    assert.equal(await inspectorOpen(), false);
+    for (let attempt = 0; attempt < 30 && await debugPortOpen(); attempt++) await sleep(500);
+    assert.equal(await debugPortOpen(), false);
   }
   assert.notEqual(pids[0], pids[1]);
   assert.equal(createHash('sha256').update(await readFile(exe)).digest('hex'), before);

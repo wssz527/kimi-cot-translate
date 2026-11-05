@@ -160,17 +160,18 @@ export async function verifyApp(deps = {}) {
   const command = deps.output ?? output;
   const read = deps.readFile ?? readFile;
   const before = await identify(EXECUTABLE);
+  // The signature is reported, never required. This is a free third-party
+  // display-layer translator: whether the host is vendor-signed has no bearing on
+  // whether translation can work, and gating on it made an official certificate
+  // rotation or a re-signed build disable the extension. What still protects the
+  // attachment is the process identity check before any signal is sent.
+  const signature = { status: 'unknown' };
   try {
-    await command('/usr/bin/codesign', ['--verify', '--deep', '--strict', APP]);
-  } catch (error) {
-    if (typeof error.code === 'number' && !error.killed) error.failureKind = 'permanent';
-    throw error;
-  }
-  const signature = await (deps.run ?? run)('/usr/bin/codesign', ['-dv', '--verbose=2', APP], { timeout: 10000 });
-  if (!/^Identifier=com\.kimi\.code\.desktop$/m.test(signature.stderr)
-    || !/^TeamIdentifier=2J9472RW75$/m.test(signature.stderr)) {
-    throw permanentError('Application does not have the expected official signing identity');
-  }
+    const detail = await (deps.run ?? run)('/usr/bin/codesign', ['-dv', '--verbose=2', APP], { timeout: 10000 });
+    signature.status = 'Valid';
+    signature.team = /^TeamIdentifier=(.+)$/m.exec(detail.stderr)?.[1]?.trim();
+    signature.identifier = /^Identifier=(.+)$/m.exec(detail.stderr)?.[1]?.trim();
+  } catch { /* unsigned or unreadable: recorded as unknown */ }
   const binary = await read(FRAMEWORK);
   inspectFuses(binary);
   const supported = JSON.parse(await read(join(HERE, 'supported-runtimes.json'), 'utf8'));
@@ -190,7 +191,7 @@ export async function verifyApp(deps = {}) {
   const assets = [...index.matchAll(/href="(\/assets\/[A-Za-z0-9_-]+\.css)"/g)].map((item) => item[1]);
   assertRendererContract((await Promise.all(assets.map((name) => read(join(dist, name), 'utf8')))).join('\n'));
   if (before !== await identify(EXECUTABLE)) throw new Error('Application changed during verification');
-  return { version, electron, executable: before, verified: known ? 'exact' : 'contract' };
+  return { version, electron, executable: before, signature, verified: known ? 'exact' : 'contract' };
 }
 
 async function verifyLiveProcess(info, app) {
