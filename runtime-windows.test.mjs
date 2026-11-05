@@ -3,9 +3,9 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { basename, join, win32 } from 'node:path';
+import { basename, dirname, join, win32 } from 'node:path';
 import {
-  acquireLock, applyWindowsUpdate, assertPlatform, bridgeRequest, commandLineArgs, disable,
+  acquireLock, applyStagedUpdate, assertPlatform, bridgeRequest, commandLineArgs, disable,
   findProcesses, install, readState, selectProcesses, taskRequest, tick, updateWindows,
   verifyApp, verifyBinary, watch, windowsPaths,
 } from './runtime-windows.mjs';
@@ -694,30 +694,34 @@ test('one Kimi launch checks for updates once, and only while it is running', as
   assert.equal(waiting.status, 'waiting');
 });
 
-test('the update is staged beside the data directory, then handed to a detached process', async (t) => {
+test('a staged copy is installed from outside the running bundle, then removed', async (t) => {
   const dataDir = await temporary(t);
-  const files = new Map([
-    ['runtime-windows.mjs', Buffer.from('loader')],
-    ['kct.js', Buffer.from('translator')],
-  ]);
-  const spawned = [];
-  assert.equal(await applyWindowsUpdate(files, dataDir, {
-    spawnInstaller: (stage) => spawned.push(stage),
-  }), true);
-  assert.equal(spawned.length, 1);
-  const stages = (await readdir(dataDir)).filter((name) => name.startsWith('.update-stage-'));
-  assert.deepEqual(stages.map((name) => join(dataDir, name)), spawned,
-    'the installer has to run from the staged copy, not the bundle it replaces');
-  assert.equal(await readFile(join(spawned[0], 'kct.js'), 'utf8'), 'translator');
+  const stage = join(dataDir, '.update-stage-fixture');
+  await mkdir(stage, { recursive: true });
+  for (const name of FILES) await writeFile(join(stage, name), `staged:${name}`);
+  let bundleDir;
+  const result = await applyStagedUpdate(stage, {
+    localAppData,
+    dataDir,
+    platformCheck: () => {},
+    verifyApp: async () => ({ version: '1.1.1', electron: '43.1.1', executable: 'fp' }),
+    bridge: async () => ({ installed: true }),
+    sleep: async () => {},
+  });
+  assert.equal(result.status, 'installed');
+  const installed = JSON.parse(await readFile(join(dataDir, 'enabled.json'), 'utf8'));
+  assert.match(installed.entry, /bundle-/);
+  assert.equal(await readFile(join(dirname(installed.entry), 'kct.js'), 'utf8'), 'staged:kct.js');
+  const stages = (await readdir(dataDir)).filter((name) => name.startsWith('.update-stage-fixture'));
+  assert.deepEqual(stages, [], 'the staged copy has served its purpose once installed');
 });
 
-test('the watcher stages an update and hands it off only after releasing the lock', async (t) => {
+test('the watcher returns the staged update instead of installing it while locked', async (t) => {
   const root = await temporary(t);
   const dataDir = join(root, 'data');
   await mkdir(dataDir, { recursive: true });
   const staged = join(dataDir, '.update-stage-fixture');
   let ticks = 0;
-  const states = [];
   const result = await watch({
     localAppData,
     dataDir,
@@ -729,16 +733,12 @@ test('the watcher stages an update and hands it off only after releasing the loc
     },
     sleep: async () => { if (++ticks > 6) throw new Error('watch did not stop'); },
     logError: () => {},
-    tick: async () => {
-      states.push('tick');
-      return { status: 'active', updateStatus: 'staged', updateStage: staged };
-    },
-    spawnInstaller: (stage) => { states.push(`spawn:${stage}`); },
+    tick: async () => ({ status: 'active', updateStatus: 'staged', updateStage: staged }),
   });
+  // The watcher holds the bundle lock, so installing from inside it would wait
+  // on itself. It reports the stage and lets the caller run the install.
   assert.equal(result.status, 'updating');
   assert.equal(result.stage, staged);
-  assert.deepEqual(states, ['tick', `spawn:${staged}`],
-    'the installer must start only after the bundle lock is released');
 });
 
 test('a completed install clears the staged copies it ran from', async (t) => {

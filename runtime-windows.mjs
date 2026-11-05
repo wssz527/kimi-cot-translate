@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { createHash, randomUUID } from 'node:crypto';
-import { execFile, spawn } from 'node:child_process';
+import { execFile } from 'node:child_process';
 import { mkdir, mkdtemp, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { connect as netConnect } from 'node:net';
 import { basename, dirname, join, resolve, win32 } from 'node:path';
@@ -655,10 +655,7 @@ export async function watch(options = {}) {
       }
       await pause(1000);
     }
-    if (pendingUpdate) {
-      (options.spawnInstaller ?? spawnUpdateInstaller)(pendingUpdate);
-      return { status: 'updating', stage: pendingUpdate };
-    }
+    if (pendingUpdate) return { status: 'updating', stage: pendingUpdate };
     return { status: 'disabled' };
   } finally { await lock.release(); }
 }
@@ -702,10 +699,10 @@ async function pruneBundles(dataDir, current, previousEntry) {
 }
 
 // The swap cannot happen inside the process that is running the bundle: on
-// Windows a loaded script cannot be replaced in place, and the watcher holds the
-// bundle lock for its whole lifetime. So the new files are staged next to the
-// data directory and a detached `--apply-update` process performs the install
-// once the caller has released the lock.
+// Windows a loaded script cannot be replaced in place, and the scheduled watcher
+// holds the bundle lock for its whole lifetime. So the new files are staged next
+// to the data directory and installed by the caller once it releases the lock.
+//
 // A successful install runs from one of these staged copies, so anything left
 // behind is a run that never completed. Only the bundles themselves are pruned
 // by ownership marker; the stages are named by mkdtemp and carry no marker.
@@ -728,19 +725,14 @@ export async function stageWindowsUpdate(files, dataDir) {
   }
 }
 
-export function spawnUpdateInstaller(stage) {
-  const child = spawn(process.execPath, [join(stage, 'runtime-windows.mjs'), '--apply-update'], {
-    detached: true, stdio: 'ignore', windowsHide: true, cwd: stage,
-    env: { ...process.env, KCT_WINDOWS_UPDATE_STAGE: stage },
-  });
-  child.unref();
-}
-
-// Used by `--once` and `--update`, which release the bundle lock right after the
-// call returns, so the detached installer only has to wait out that handover.
-export async function applyWindowsUpdate(files, dataDir, { spawnInstaller = spawnUpdateInstaller } = {}) {
-  spawnInstaller(await stageWindowsUpdate(files, dataDir));
-  return true;
+// Installs a staged copy after the caller has given up the bundle lock. `install`
+// writes the stop file first, so a scheduled watcher exits and releases it.
+export async function applyStagedUpdate(stage, options = {}) {
+  try {
+    return await install({ ...options, bundleDir: stage });
+  } finally {
+    await rm(stage, { recursive: true, force: true }).catch(() => {});
+  }
 }
 
 export async function install(options = {}) {
@@ -799,9 +791,20 @@ export async function install(options = {}) {
       await callBridge(options, 'Start', { taskName: taskName(options) }).catch(() => {});
     }
   }
-  try { await callBridge(options, 'Start', { taskName: taskName(options) }); }
-  catch (error) {
-    throw new Error('Runtime installed, but the scheduled watcher could not start; retry at next logon', { cause: error });
+  // Task Scheduler accepts a start request asynchronously, so a task that was
+  // registered moments ago can refuse the first one. Retry briefly instead of
+  // reporting a failure for an install that is actually complete.
+  let started;
+  for (let attempt = 0; attempt < 5 && !started; attempt++) {
+    try {
+      await callBridge(options, 'Start', { taskName: taskName(options) });
+      started = true;
+    } catch (error) {
+      if (attempt === 4) {
+        throw new Error('Runtime installed, but the scheduled watcher could not start; retry at next logon', { cause: error });
+      }
+      await (options.sleep ?? sleep)(500);
+    }
   }
   return { status: 'installed', dataDir };
 }
@@ -822,8 +825,8 @@ async function main() {
   assertPlatform();
   const command = process.argv[2];
   if (process.argv.length !== 3
-    || !['--once', '--check', '--watch', '--install', '--disable', '--update', '--apply-update'].includes(command)) {
-    throw new Error('Use --once, --check, --watch, --install, --disable, --update or --apply-update');
+    || !['--once', '--check', '--watch', '--install', '--disable', '--update'].includes(command)) {
+    throw new Error('Use --once, --check, --watch, --install, --disable or --update');
   }
   let result;
   if (command === '--check') result = await readState();
@@ -836,34 +839,40 @@ async function main() {
       applyUpdate: async (files, dir) => ({ staged: await stageWindowsUpdate(files, dir) }),
     });
   }
-  if (command === '--apply-update') {
-    const stage = process.env.KCT_WINDOWS_UPDATE_STAGE;
-    if (!stage) throw new Error('KCT_WINDOWS_UPDATE_STAGE is required');
-    // Run from the freshly downloaded copy, so installing it cannot be
-    // interrupted by the very files being replaced.
-    result = await install({ bundleDir: stage });
-  }
   if (command === '--update') {
     const { dataDir } = windowsPaths();
-    const lock = await acquireLock(dataDir);
-    if (!lock) throw new Error('Another Windows runtime operation is in progress');
-    try {
-      result = await updateWindows({
-        dataDir,
-        applyUpdate: async (files) => applyWindowsUpdate(files, dataDir),
-      });
-    } finally { await lock.release(); }
+    // No bundle lock here: the scheduled watcher holds it for its entire
+    // lifetime, so taking it would make a manual update fail every time the
+    // extension is actually installed. The stage happens unlocked, and the
+    // install runs afterwards from the staged copy, where `install` itself
+    // writes the stop file so the watcher can hand the lock over.
+    let staged;
+    const checked = await updateWindows({
+      dataDir,
+      applyUpdate: async (files) => { staged = await stageWindowsUpdate(files, dataDir); return true; },
+    });
+    result = checked;
+    if (staged) {
+      const installed = await applyStagedUpdate(staged);
+      result = { ...checked, updated: true, installed: installed.status };
+    }
   }
   if (command === '--once') {
     const { dataDir } = windowsPaths();
     const lock = await acquireLock(dataDir);
     if (!lock) throw new Error('Another Windows runtime operation is in progress');
+    let staged;
     try {
       result = await tick({
         updateCheck: true,
-        applyUpdate: async (files) => applyWindowsUpdate(files, dataDir),
+        applyUpdate: async (files) => { staged = await stageWindowsUpdate(files, dataDir); return true; },
       });
     } finally { await lock.release(); }
+    // The lock is gone now, so the install can wait for the watcher to stop.
+    if (staged) {
+      const installed = await applyStagedUpdate(staged);
+      result = { ...result, updateStatus: 'installed', installed: installed.status };
+    }
   }
   console.log(JSON.stringify(result));
   if (result?.status === 'error') process.exitCode = 1;
