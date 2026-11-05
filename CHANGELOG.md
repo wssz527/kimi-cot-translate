@@ -12,6 +12,7 @@
 
 - **macOS 不再要求官方签名**：与 Windows 对齐，`codesign` 结果只记入 `signature` 字段供诊断，不再作为放行条件。此前官方轮换证书、或宿主被重签后，即使 inspector fuse 与思考区块结构都完好，插件也会永久停用。真正保护挂载的仍是注入前的进程身份校验（PID、启动时间、可执行文件路径）。
 - **删除 Windows 侧已失效的 inspector 代码**：`triggerInspector`、`inspectorOperations` 与 `blocked-inspector` 状态标记在改用 CDP 后已无调用方，一并移除，避免状态字段与文档互相矛盾。
+- **Windows 生命周期锁不再因并发竞争而抛错**：两个加载器同时抢锁时，Windows 对「正在创建或删除」的目录返回 `EPERM` / `EACCES` / `ENOTEMPTY`，而代码只把 `EEXIST` 当作「已被占用」，其余直接上抛——CI 上表现为 `EPERM: operation not permitted, mkdir '.runtime-lock.reclaim'`，实机上会让计划任务在一次失败后写出 error 状态。现按同类竞争处理，直接让出锁。
 - **Windows 实机测试脚本对齐 CDP 语义**：此前仍断言 `inspectorClosed` 与 9229 端口，改为以 `--remote-debugging-port=9222` 启动并断言 9222 的释放，同时避免测试进程被误当成用户实例。
 
 ### 文档

@@ -477,15 +477,21 @@ export async function tick(options = {}) {
   return persist(state);
 }
 
+// Windows reports a directory that is already there as EEXIST, but one that is
+// still pending deletion comes back as EPERM or EACCES instead. Contenders race
+// on the same paths here, so all four mean the same thing: somebody else holds
+// or is reclaiming this lock, and this caller must not also take it.
+const LOCK_CONTENDED = new Set(['EEXIST', 'EPERM', 'EACCES', 'ENOTEMPTY']);
+
 export async function acquireLock(dataDir, name = '.runtime-lock') {
   const lock = join(dataDir, name);
   await mkdir(dataDir, { recursive: true });
   try { await mkdir(lock); }
   catch (error) {
-    if (error.code !== 'EEXIST') throw error;
+    if (!LOCK_CONTENDED.has(error.code)) throw error;
     const reclaim = `${lock}.reclaim`;
     try { await mkdir(reclaim); }
-    catch (failure) { if (failure.code === 'EEXIST') return null; throw failure; }
+    catch (failure) { if (LOCK_CONTENDED.has(failure.code)) return null; throw failure; }
     try {
       const owner = await readJSON(join(lock, 'owner.json'), null);
       if (owner?.pid) {
@@ -500,7 +506,7 @@ export async function acquireLock(dataDir, name = '.runtime-lock') {
       }
       await rm(lock, { recursive: true });
       try { await mkdir(lock); }
-      catch (failure) { if (failure.code === 'EEXIST') return null; throw failure; }
+      catch (failure) { if (LOCK_CONTENDED.has(failure.code)) return null; throw failure; }
     } finally { await rm(reclaim, { recursive: true, force: true }); }
   }
   try { await atomicJSON(join(lock, 'owner.json'), { pid: process.pid }); }
