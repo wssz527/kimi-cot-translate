@@ -18,7 +18,6 @@ export const APP = '/Applications/Kimi Code.app';
 const EXECUTABLE = join(APP, 'Contents/MacOS/Kimi Code');
 const FRAMEWORK = join(APP, 'Contents/Frameworks/Electron Framework.framework/Versions/A/Electron Framework');
 const ELECTRON_INFO = join(APP, 'Contents/Frameworks/Electron Framework.framework/Versions/A/Resources/Info.plist');
-const SUPPORTED_ELECTRON_MAJOR = '43';
 export const DATA = join(homedir(), 'Library/Application Support/kimi-cot-translate');
 // launchd watches these directories instead of polling on a timer. The Kimi
 // profile directory changes continuously while the app runs and goes quiet
@@ -151,9 +150,11 @@ export function assertRendererContract(css) {
 }
 
 // The hash allowlist is the fast path for a fully validated runtime. An unknown
-// hash is still allowed when the official signature, the inspector fuse, the
-// Electron major and the renderer contract all hold: a host patch that leaves
-// the reasoning DOM untouched then needs no manual allowlist entry.
+// hash is still allowed when the official signature, the inspector fuse and the
+// renderer contract all hold. Those three are the only properties that decide
+// whether attaching can work, and none of them is inferred from a version
+// number: an official update that leaves them intact keeps translating, whether
+// it is a point release or an Electron major ahead.
 export async function verifyApp(deps = {}) {
   const identify = deps.fingerprint ?? fingerprint;
   const command = deps.output ?? output;
@@ -174,14 +175,12 @@ export async function verifyApp(deps = {}) {
   inspectFuses(binary);
   const supported = JSON.parse(await read(join(HERE, 'supported-runtimes.json'), 'utf8'));
   const known = supported.find((item) => item.sha256 === hash(binary));
+  // Reported for diagnostics only. It is read but never gates attachment.
   const electron = known?.electron ?? (await command('/usr/libexec/PlistBuddy', [
     '-c', 'Print :CFBundleVersion', ELECTRON_INFO,
   ])).trim();
   if (!/^\d+\.\d+\.\d+$/.test(electron)) {
     throw permanentError('Cannot read the Electron version of this Kimi build');
-  }
-  if (electron.split('.')[0] !== SUPPORTED_ELECTRON_MAJOR) {
-    throw permanentError(`Electron ${electron} is outside the supported major ${SUPPORTED_ELECTRON_MAJOR}; translation is disabled until compatibility is checked`);
   }
   const version = (await command('/usr/libexec/PlistBuddy', [
     '-c', 'Print :CFBundleShortVersionString', join(APP, 'Contents/Info.plist'),

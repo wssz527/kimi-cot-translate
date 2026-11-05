@@ -14,7 +14,7 @@
 
 | 平台 | 状态 | 当前验证版本 |
 | --- | --- | --- |
-| 桌面端 macOS Apple Silicon | 已验证真实翻译、启动恢复、页面刷新恢复 | Kimi Code 1.1.2 / 1.1.1 / Electron 43.1.1 |
+| 桌面端 macOS Apple Silicon | 已验证真实翻译、启动恢复、页面刷新恢复 | Kimi Code 1.3.1 / Electron 45.1.0；1.1.2 / 1.1.1 / Electron 43.1.1 |
 | 桌面端 Windows x64 | 预览适配，CI runner 已验证挂载与安全停用 | 同上 |
 | CLI / 浏览器扩展 / VS Code | 预览（各入口验证边界见下表） | CLI 2.1.1 / Chromium MV3 |
 
@@ -216,12 +216,13 @@ node runtime-windows.mjs --disable
 
 ## Kimi 更新后的行为
 
-扩展文件位于官方 App 以外，正常 App 更新不会覆盖这些文件。新进程启动后，后台任务会重新检查签名、实际运行文件、Electron 主版本、inspector fuse 和思考区块结构，再自动挂载。
+扩展文件位于官方 App 以外，正常 App 更新不会覆盖这些文件。新进程启动后，后台任务会重新检查签名、实际运行文件、inspector fuse 和思考区块结构，再自动挂载。
 
-**日常跟随不需要你做任何事。** 判断能否继续用的不是版本号，而是思考区块的界面结构：
+**日常跟随不需要你做任何事。** 判断能否继续用的不是版本号，而是注入能力与思考区块的界面结构：
 
-- 官方更新后如果 `.think` / `.think-head` / `.think-body` / `.think-body-inner` / `.think-text` 这五个结构仍在，且签名、调试能力、Electron 主版本都没变，翻译会直接继续工作，不必等新版、也不必重装。
-- 只有这五项之一真的变了，翻译才会停用并等待适配——这才是「上游坏了、需要我修」的情况。
+- 官方更新后如果 `.think` / `.think-head` / `.think-body` / `.think-body-inner` / `.think-text` 这五个结构仍在，且签名与调试能力没变，翻译会直接继续工作，不必等新版、也不必重装。
+- 跨 Electron 大版本同样如此：版本号本身不参与判断，只用于状态展示。Kimi Code 1.3.1 从 Electron 43 升到 45 时就是这种情况，结构没变、翻译照常。
+- 只有注入能力或结构真的变了，翻译才会停用并等待适配——这才是「上游坏了、需要我修」的情况。
 
 组件自身也会自动跟版，但**只在 Kimi Code 运行时**：每次 Kimi 启动后检查一次仓库发布的更新清单，发现新版本就下载运行时文件、逐个校验 SHA-256，通过后原子替换（失败自动回滚）。同一个 Kimi 进程不会重复检查；Kimi 关闭期间不发任何网络请求。也可以手动触发：
 
@@ -238,7 +239,6 @@ node runtime.mjs --update
 | 现象 | 可能原因 | 处理 |
 | --- | --- | --- |
 | 更新后翻译消失，detail 含 `reasoning UI changed` | 思考区块结构变了 | 提兼容性报告，等待适配版本 |
-| detail 含 `outside the supported major` | Electron 主版本跨代 | 同上 |
 | detail 含签名或结构校验失败 | 官方包结构变化 | 同上；不要手工绕过 |
 | `blocked-inspector` | 调试接口未确认关闭 | 正常退出 Kimi 后查看日志 |
 
@@ -248,7 +248,8 @@ node runtime.mjs --update
 
 ## 已知限制
 
-- 已验证 Kimi Code 1.1.1 与 1.1.2 / Electron 43.1.1；跨版本升级、睡眠唤醒、长期运行尚未验收。
+- 已验证 Kimi Code 1.3.1 / Electron 45.1.0 与 1.1.1 / 1.1.2 / Electron 43.1.1（均为 macOS arm64）；Electron 45 的 Windows 分支、真实跨版本升级链路、睡眠唤醒、长期运行尚未验收。
+- 宿主版本号不参与放行判断：只要签名、inspector fuse 与思考区块结构三项成立，跨 Electron 大版本也会继续挂载；三者之一失效则停用并写出具体原因。
 - 不支持 Kimi 桌面端（Kimi.app，com.moonshot.kimichat）：官方在其 Electron 二进制中关闭了 Node inspector fuse，本项目的运行时注入机制在技术上无法挂载，且本项目不会通过修改官方二进制绕过。Kimi 网页版（kimi.com）用户请使用浏览器扩展入口。
 - kimi.com 普通聊天页未在登录会话验收；VS Code 入口未在真实扩展宿主验收。
 - 翻译使用公共免鉴权端点（Bing / Google），无 SLA，可能限流、变更或受服务方条款约束；长期或大量使用建议使用自带凭据的自定义服务。

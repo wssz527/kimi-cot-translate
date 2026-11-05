@@ -764,7 +764,7 @@ test('an unknown runtime hash is accepted when signature, fuses and the renderer
   assert.equal(result.version, '1.1.3');
 });
 
-test('a new Electron major or a changed reasoning DOM still stops the extension', async () => {
+test('a changed reasoning DOM stops the extension while an unseen Electron major does not', async () => {
   const css = ['.think', '.think-head', '.think-body', '.think-body-inner', '.think-text']
     .map((name) => `${name}{}`).join('');
   const binary = Buffer.concat([Buffer.from('prefixdL7pKGdnNz796PbbjQWNKmHXBZaB9tsX'),
@@ -783,8 +783,15 @@ test('a new Electron major or a changed reasoning DOM still stops the extension'
       return style;
     },
   });
-  await assert.rejects(() => verifyApp(make('44.0.0', css)), { failureKind: 'permanent' });
-  await assert.rejects(() => verifyApp(make('43.2.0', '.think{}.renamed{}.think-head{}')), /reasoning UI/);
+  // What decides attachment is the capability, never the version number: an
+  // Electron major the allowlist has never seen attaches fine while the contract
+  // holds, and stops the moment the reasoning DOM no longer matches.
+  const unseen = await verifyApp(make('44.0.0', css));
+  assert.equal(unseen.verified, 'contract');
+  assert.equal(unseen.electron, '44.0.0');
+  for (const electron of ['44.0.0', '43.2.0']) {
+    await assert.rejects(() => verifyApp(make(electron, '.think{}.renamed{}.think-head{}')), /reasoning UI/);
+  }
 });
 
 test('process discovery matches the executable path despite spaces in the name', async () => {

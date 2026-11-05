@@ -118,16 +118,21 @@ test('only current-user standard main processes survive discovery', async () => 
   assert.equal(selectProcesses({ sid: SID, processes: [INFO, { ...INFO, pid: 45 }] }, { localAppData }).length, 2);
 });
 
-test('binary verification requires signature, independent hash, PE x64, fuse and exact Electron', () => {
+test('binary verification requires signature, PE x64 and fuse while an unseen build still attaches by contract', () => {
   const { binary, allow } = binaryFixture();
   assert.equal(verifyBinary(binary, SIGNATURE, allow()).electron, '43.1.1');
+  assert.equal(verifyBinary(binary, SIGNATURE, allow()).verified, 'exact');
   for (const signature of [{ ...SIGNATURE, status: 'UnknownError' },
     { ...SIGNATURE, thumbprint: '0'.repeat(40) }, {}]) {
     assert.throws(() => verifyBinary(binary, signature, allow()), /Authenticode/);
   }
+  // A build this project has never seen is not a refusal: the capability checks
+  // below are what decide attachment, exactly as on macOS.
   const known = allow();
   binary[1000] = 1;
-  assert.throws(() => verifyBinary(binary, SIGNATURE, known), /Unknown Windows EXE hash/);
+  const unseen = verifyBinary(binary, SIGNATURE, known);
+  assert.equal(unseen.verified, 'contract');
+  assert.equal(unseen.electron, 'unknown');
   binary.writeUInt16LE(0xaa64, 68);
   assert.throws(() => verifyBinary(binary, SIGNATURE, allow()), /PE x64/);
   binary.writeUInt16LE(0x8664, 68);
@@ -135,8 +140,8 @@ test('binary verification requires signature, independent hash, PE x64, fuse and
   binary[fuseAt + 3] = 48;
   assert.throws(() => verifyBinary(binary, SIGNATURE, allow()), /disabled/);
   binary[fuseAt + 3] = 49;
-  binary.write('Electron/43.1.10', 256);
-  assert.throws(() => verifyBinary(binary, SIGNATURE, allow()), /Electron\/43.1.1/);
+  assert.throws(() => verifyBinary(binary, SIGNATURE, [
+    { ...known[0], electron: 43 }, ...known.slice(1)]), /Invalid Windows runtime allowlist/);
 });
 
 test('application verification checks signature and CSS, and detects a concurrent update', async () => {
@@ -210,12 +215,11 @@ test('one attempt survives absence and multiple processes; a new start or source
   assert.notEqual(f.state().revision, firstRevision);
 });
 
-test('signature and hash rejection never reach installation or the trigger', async () => {
-  for (const reason of ['signature', 'hash']) {
+test('signature rejection never reaches installation or the trigger', async () => {
+  for (const reason of ['signature']) {
     const f = tickFixture();
     const { binary, allow } = binaryFixture();
     const known = allow();
-    if (reason === 'hash') binary[1000] = 1;
     let checks = 0;
     f.options.verifyApp = async () => {
       checks++;
@@ -229,7 +233,7 @@ test('signature and hash rejection never reach installation or the trigger', asy
     assert.equal(state.status, 'error');
     assert.equal(state.failureKind, 'permanent');
     assert.equal(state.nextRetryAt, null);
-    assert.match(state.detail, reason === 'signature' ? /Authenticode/ : /Unknown Windows EXE hash/);
+    assert.match(state.detail, /Authenticode/);
     assert.equal(f.installs(), 0);
     f.options.now = () => Date.parse('2026-10-22T03:00:00Z');
     const later = await tick(f.options);

@@ -10,10 +10,12 @@
 
 - 后台任务改为事件驱动：LaunchAgent 不再每 10 秒轮询，改为 `WatchPaths` 监听 Kimi Code 的用户数据目录，Kimi 关闭期间完全不被唤醒。
 - 运行时自更新：每次 Kimi Code 启动后检查一次仓库发布的更新清单（`runtime-manifest.json`），发现新版本时下载运行时文件、逐个校验 SHA-256，再通过既有的原子部署路径替换（失败自动回滚）。同一 Kimi 进程只检查一次，Kimi 未运行时不发起任何网络请求。新增 `node runtime.mjs --update` 手动入口；`--check` 输出新增 `updateStatus` / `updateVersion` / `updateCheckedFor` 字段。
-- 未知内核哈希不再直接熔断：改为在官方签名、inspector fuse、Electron 主版本与思考区块结构四项同时成立时放行，并记 `verified: "contract"`。官方小版本升级只要不改思考区块结构即可继续工作，无需等待新版或重装。
+- 未知内核哈希不再直接熔断：改为在官方签名、inspector fuse 与思考区块结构三项同时成立时放行，并记 `verified: "contract"`。官方升级只要不改思考区块结构即可继续工作，无需等待新版或重装。
 
 ### 修复
 
+- 移除 Electron 主版本白名单：此前即使结构与注入能力都成立，只要宿主的 Electron 主版本不在硬编码列表（如 43 → 45）就永久停用。版本号现在只用于状态展示，不再参与放行判断。
+- Windows 二进制校验同样改为按能力放行：不再要求哈希必须在允许列表内，也不再限定 `Electron/43.1.1`；未知构建按签名、PE、fuse 与结构判定，记 `verified: "contract"`。
 - macOS 进程发现改用进程表精确匹配：`pgrep -x "Kimi Code"` 无法匹配含空格的进程名，会导致「Kimi Code is not running」的误判，后台任务因此不再挂载。
 - 版本号内置于 `runtime-update.mjs`：部署目录没有 `package.json`，原实现每次运行都会因读取失败在日志里留下错误。
 

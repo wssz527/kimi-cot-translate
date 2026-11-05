@@ -146,27 +146,32 @@ export function verifyBinary(binary, signature, supported) {
   if (signature?.status !== 'Valid' || signature.thumbprint?.toUpperCase() !== SIGNER) {
     throw permanentError('Kimi does not have the expected valid official Authenticode signature');
   }
-  if (!Array.isArray(supported) || !supported.length || supported.some((entry) =>
-    !/^[a-f0-9]{64}$/.test(entry?.sha256 ?? '') || !Number.isSafeInteger(entry.size)
-      || entry.electron !== '43.1.1' || entry.appVersion !== '1.1.1'
-      || entry.signerThumbprint !== SIGNER)) {
+  // An allowlist entry only records a build this project has already looked at.
+  // It is never a requirement: the signature, the fuse and the renderer contract
+  // decide whether attaching can work, so a new host build that keeps them keeps
+  // translating without waiting for a release.
+  const entries = Array.isArray(supported) ? supported : [];
+  if (entries.some((entry) => !/^[a-f0-9]{64}$/.test(entry?.sha256 ?? '')
+    || !Number.isSafeInteger(entry.size) || typeof entry.electron !== 'string'
+    || typeof entry.appVersion !== 'string' || entry.signerThumbprint !== SIGNER)) {
     throw permanentError('Invalid Windows runtime allowlist');
   }
   const sha256 = hash(binary);
-  const runtime = supported.find((entry) => entry.sha256 === sha256 && entry.size === binary.length);
-  if (!runtime) throw permanentError('Unknown Windows EXE hash; Kimi is left untouched');
+  const known = entries.find((entry) => entry.sha256 === sha256 && entry.size === binary.length);
   const pe = binary.length >= 64 ? binary.readUInt32LE(0x3c) : -1;
   if (binary.toString('ascii', 0, 2) !== 'MZ' || pe < 0 || pe + 6 > binary.length
     || binary.toString('ascii', pe, pe + 4) !== 'PE\0\0' || binary.readUInt16LE(pe + 4) !== 0x8664) {
     throw permanentError('Expected a Windows PE x64 executable');
   }
   inspectFuses(binary);
-  const version = Buffer.from(`Electron/${runtime.electron}`);
-  const at = binary.indexOf(version);
-  if (at < 0 || /[0-9.]/.test(String.fromCharCode(binary[at + version.length] ?? 0))) {
-    throw permanentError('Expected Electron/43.1.1 in the verified executable');
+  // The Electron version is reported for diagnostics only. Checking that the
+  // embedded string exists proves this is the Electron runtime build rather than
+  // a specific version of it, which is what the injection actually depends on.
+  if (binary.indexOf(Buffer.from('Electron/')) < 0) {
+    throw permanentError('Expected an Electron runtime in the verified executable');
   }
-  return { ...runtime, sha256 };
+  return { version: known?.appVersion ?? 'unknown', electron: known?.electron ?? 'unknown',
+    sha256, verified: known ? 'exact' : 'contract' };
 }
 
 export async function verifyApp(options = {}) {
@@ -190,7 +195,8 @@ export async function verifyApp(options = {}) {
   assertRendererContract((await Promise.all(assets.map((name) =>
     read(win32.join(dist, ...name.slice(1).split('/')), 'utf8')))).join('\n'));
   if (before !== await identifyFile(executable)) throw new Error('Kimi changed during verification');
-  return { version: runtime.appVersion, electron: runtime.electron, sha256: runtime.sha256, executable: before };
+  return { version: runtime.version, electron: runtime.electron, sha256: runtime.sha256,
+    verified: runtime.verified, executable: before };
 }
 
 export async function triggerInspector(info, {

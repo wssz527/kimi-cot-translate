@@ -214,12 +214,13 @@ The already-loaded translation layer disappears the next time Kimi quits normall
 
 ## After Kimi updates
 
-The extension files live outside the official app, so a normal app update never overwrites them. After a new process starts, the background task re-checks the signature, the actually running files, the Electron major version, the inspector fuse and the thinking-block structure before attaching again.
+The extension files live outside the official app, so a normal app update never overwrites them. After a new process starts, the background task re-checks the signature, the actually running files, the inspector fuse and the thinking-block structure before attaching again.
 
-**Routine follow-up needs nothing from you.** What decides whether translation keeps working is the thinking-block structure, not version numbers:
+**Routine follow-up needs nothing from you.** What decides whether translation keeps working is the injection capability and the thinking-block structure, not version numbers:
 
-- If `.think`, `.think-head`, `.think-body`, `.think-body-inner` and `.think-text` are all still present after an official update, and the signature, the debugging capability and the Electron major are unchanged, translation simply keeps working — no waiting for a release, no reinstall.
-- Only when one of those five really changes does translation stop and wait for adaptation. That is the "upstream broke, the author must fix it" case.
+- If `.think`, `.think-head`, `.think-body`, `.think-body-inner` and `.think-text` are all still present after an official update, and the signature and the debugging capability are unchanged, translation simply keeps working — no waiting for a release, no reinstall.
+- The same holds across an Electron major version: the version number is used for status display only and never gates attachment. Kimi Code 1.3.1 went from Electron 43 to 45 with the structure untouched, and translation kept working.
+- Only when the injection capability or the structure really changes does translation stop and wait for adaptation. That is the "upstream broke, the author must fix it" case.
 
 The extension also follows its own releases, but **only while Kimi Code is running**: after each Kimi launch it checks the published update manifest once, downloads the runtime files when a newer version exists, verifies each SHA-256, and swaps them in atomically (rolling back on failure). The same Kimi process is never checked twice, and nothing touches the network while Kimi is closed. You can also trigger it manually:
 
@@ -236,7 +237,6 @@ Symptom cheat sheet:
 | Symptom | Likely cause | What to do |
 | --- | --- | --- |
 | Translation gone after update; detail says `reasoning UI changed` | Thinking-block structure changed | File a compatibility report and wait for an adaptation release |
-| detail says `outside the supported major` | Electron crossed a major version | Same as above |
 | detail mentions signature or structure verification failure | Official package structure changed | Same as above; never bypass manually |
 | `blocked-inspector` | Debugging interface not confirmed closed | Quit Kimi normally, then read the log |
 

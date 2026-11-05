@@ -1,5 +1,10 @@
 [
   {
+    "electron": "45.1.0",
+    "sha256": "365f6e2ac1a7a60022363a207365b1caa26c69be7d6f39bdc88c11bab17e3009",
+    "validatedWithApp": "1.3.1"
+  },
+  {
     "electron": "43.1.1",
     "sha256": "5c47a9cf620f8e944326d9f92d6c163272cb17259ac704e96c573a0e22d3e53a",
     "validatedWithApp": "1.1.2"
