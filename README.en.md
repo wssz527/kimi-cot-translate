@@ -226,7 +226,9 @@ The extension files live outside the official app, so a normal app update never 
 
 The extension also follows its own releases, but **only while Kimi Code is running**: after each Kimi launch it checks the published update manifest once, downloads the runtime files when a newer version exists, verifies each SHA-256, and swaps them in atomically (rolling back on failure). The same Kimi process is never checked twice, and nothing touches the network while Kimi is closed.
 
-Each entry has its own manifest: macOS reads `runtime-manifest.json`, Windows reads `runtime-manifest-windows.json` (which additionally lists `runtime-windows.mjs` and `windows-bridge.ps1`). On Windows the swap is installed from a staged copy and re-registers the scheduled task, because a script file that is currently executing cannot be replaced in place. Manual triggers:
+Each entry has its own manifest: macOS reads `runtime-manifest.json`, Windows reads `runtime-manifest-windows.json` (which additionally lists `runtime-windows.mjs` and `windows-bridge.ps1`). On Windows the swap is installed from a staged copy and re-registers the scheduled task, because a script file that is currently executing cannot be replaced in place.
+
+The manifest is fetched from the canonical host first, then from a passthrough mirror (`cdn.statically.io` / `ghproxy.net`). CDNs that cache by URL including the branch ref are avoided: they can keep serving a stale manifest whose hashes no longer match, which makes every update fail its hash check. Manual triggers:
 
 ```sh
 node runtime.mjs --update            # macOS

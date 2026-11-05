@@ -16,23 +16,31 @@ export const DEFAULT_MANIFEST = 'https://raw.githubusercontent.com/wssz527/kimi-
 export const DEFAULT_WINDOWS_MANIFEST = 'https://raw.githubusercontent.com/wssz527/kimi-cot-translate/main/runtime-manifest-windows.json';
 // raw.githubusercontent.com is unreachable from a plain China Telecom /
 // Unicom / Mobile connection: TCP 443 connects but the TLS request times out.
-// jsDelivr serves the same tagged files and does resolve, so the updater tries
-// the canonical host first and falls back to the CDN rather than leaving those
-// users stranded on whatever version they installed.
+//
+// The fallbacks deliberately avoid jsDelivr. It caches by URL, including the
+// branch ref, so `@main/runtime-manifest.json` keeps answering with an old
+// manifest long after the branch moved — and a stale manifest is worse than no
+// manifest, because the hashes it lists no longer match the files. These two
+// proxies pass the current content through instead.
+const MAIN_PREFIX = 'https://raw.githubusercontent.com/wssz527/kimi-cot-translate/main/';
 export const MANIFEST_MIRRORS = {
-  'https://raw.githubusercontent.com/wssz527/kimi-cot-translate/main/runtime-manifest.json':
-    ['https://cdn.jsdelivr.net/gh/wssz527/kimi-cot-translate@main/runtime-manifest.json'],
-  'https://raw.githubusercontent.com/wssz527/kimi-cot-translate/main/runtime-manifest-windows.json':
-    ['https://cdn.jsdelivr.net/gh/wssz527/kimi-cot-translate@main/runtime-manifest-windows.json'],
+  [`${MAIN_PREFIX}runtime-manifest.json`]: [
+    'https://cdn.statically.io/gh/wssz527/kimi-cot-translate/main/runtime-manifest.json',
+    'https://ghproxy.net/https://raw.githubusercontent.com/wssz527/kimi-cot-translate/main/runtime-manifest.json',
+  ],
+  [`${MAIN_PREFIX}runtime-manifest-windows.json`]: [
+    'https://cdn.statically.io/gh/wssz527/kimi-cot-translate/main/runtime-manifest-windows.json',
+    'https://ghproxy.net/https://raw.githubusercontent.com/wssz527/kimi-cot-translate/main/runtime-manifest-windows.json',
+  ],
 };
 const RAW_PREFIX = 'https://raw.githubusercontent.com/wssz527/kimi-cot-translate/';
-const CDN_PREFIX = 'https://cdn.jsdelivr.net/gh/wssz527/kimi-cot-translate@';
 
-// Rewrites a raw.githubusercontent.com URL onto the CDN, keeping the ref and the
-// path, so a downloaded bundle can come from whichever host answers.
+// Rewrites a raw.githubusercontent.com URL onto a passthrough proxy, keeping the
+// ref and the path, so a downloaded bundle can come from whichever host answers.
+// Tag refs are immutable, so any of these serve the same bytes.
 export function mirrorUrl(url) {
   if (!url.startsWith(RAW_PREFIX)) return null;
-  return CDN_PREFIX + url.slice(RAW_PREFIX.length);
+  return 'https://cdn.statically.io/gh/wssz527/kimi-cot-translate/' + url.slice(RAW_PREFIX.length);
 }
 const HASH_RE = /^[a-f0-9]{64}$/;
 const VERSION_RE = /^\d+\.\d+\.\d+$/;
@@ -109,7 +117,7 @@ export async function downloadBundle(manifest,
 // The deployed bundle has no package.json, so the version travels inside this
 // file. scripts/version-sync.mjs keeps it aligned with the root manifest, and a
 // self-update replaces this file wholesale, carrying the new version with it.
-export const RUNTIME_VERSION = '0.2.9';
+export const RUNTIME_VERSION = '0.2.10';
 
 export async function localVersion() {
   return RUNTIME_VERSION;

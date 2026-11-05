@@ -1,6 +1,6 @@
-# kimi-cot-translate v0.2.9
+# kimi-cot-translate v0.2.10
 
-这个版本把 Windows 缺失的自动更新补上了——在此之前，Windows 用户装完就一直停在旧版本，只有 macOS 会自己跟版。0.2.8 的清单因 CDN 缓存了被移动的标签而校验失败，因此改发 0.2.9；已装 0.2.8 的用户会收到一次正常的更新。
+这个版本把 Windows 缺失的自动更新补上了——在此之前，Windows 用户装完就一直停在旧版本，只有 macOS 会自己跟版。0.2.8 的更新清单被 CDN 缓存成了旧内容，导致更新必因哈希不匹配失败，因此改发 0.2.10；已装 0.2.8/0.2.9 的用户会收到一次正常更新。
 
 > **Unofficial community project.** Not affiliated with, endorsed, or sponsored by Moonshot AI. "Kimi" and "Kimi Code" are trademarks of their respective owners. Provided as-is, without warranty; may stop working after a host update.
 
@@ -25,6 +25,8 @@
 **安装原本会卡 24 秒然后失败。** `Install` 会等旧 watcher 退出，但 watcher 是常驻进程（`-ExecutionTimeLimit 0`），永远等不到——实测 24.4 秒后抛错，超过 bridge 的 20 秒超时。这段等待已移除。
 
 **装完任务还指着旧 bundle。** 之前的 `Restart` 只是启动了旧任务，执行体没有更新，于是新版本装了但跑的还是老版本。现在由延迟助手读取 `enabled.json`，用其中的路径重新注册任务并启动。
+
+**更新源不再使用会缓存分支的 CDN。** jsDelivr 按 URL 缓存，包括 `@main` 分支引用——它会长期返回旧清单，而旧清单里的哈希与实际文件对不上，于是每次更新都卡在哈希校验。现在回退源改用 `cdn.statically.io` 与 `ghproxy.net`，两者都透传当前内容。
 
 **顺带修复了两个会让更新"看起来装好了、其实没启动"的缺陷。** 一是 `install` 从暂存目录运行时，bridge 脚本路径也落在那里，而该目录安装后即被删除，紧接着的 `Start` 必然失败；二是 Task Scheduler 接受启动请求是异步的，刚注册的任务会拒绝第一次请求。前者改为从已部署的 bundle 取路径，后者改为短暂重试。
 
@@ -66,7 +68,7 @@ macOS 桌面端不需要这个参数。
 
 ## 升级方式
 
-- 已安装本插件（macOS）：运行时自更新会自动拉到 0.2.9，也可以 `node runtime.mjs --update`。
+- 已安装本插件（macOS）：运行时自更新会自动拉到 0.2.10，也可以 `node runtime.mjs --update`。
 - 已安装本插件（Windows）：从 0.2.8 起才会自动跟版，**这次仍需手动装一次**——执行 `node runtime-windows.mjs --install` 覆盖安装，此后就会自动更新。旧版本没有更新代码，也只能手动装。
-- 首次安装：下载 `kimi-cot-translate-v0.2.9.zip`，按 README 的 macOS / Windows 章节操作。
-- 浏览器扩展与 VS Code 附件不会自动更新，需重新下载 `kct-browser-v0.2.9.zip` / `kct-copied-thinking-v0.2.9.vsix`。
+- 首次安装：下载 `kimi-cot-translate-v0.2.10.zip`，按 README 的 macOS / Windows 章节操作。
+- 浏览器扩展与 VS Code 附件不会自动更新，需重新下载 `kct-browser-v0.2.10.zip` / `kct-copied-thinking-v0.2.10.vsix`。

@@ -786,7 +786,7 @@ test('a Windows update reaches the CDN when the canonical host is unreachable', 
     applyUpdate: async () => {},
   });
   assert.equal(result.updated, true);
-  assert.ok(asked.some((url) => url.startsWith('https://cdn.jsdelivr.net/gh/wssz527/kimi-cot-translate@v0.2.8/')),
+  assert.ok(asked.some((url) => url.startsWith('https://cdn.statically.io/gh/wssz527/kimi-cot-translate/v0.2.8/')),
     'the same tagged files have to be reachable through the mirror');
 });
 

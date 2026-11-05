@@ -929,12 +929,16 @@ test('an unreachable canonical host falls back to the CDN mirror', async () => {
     'https://raw.githubusercontent.com/wssz527/kimi-cot-translate/main/runtime-manifest.json',
     MANIFEST_MIRRORS['https://raw.githubusercontent.com/wssz527/kimi-cot-translate/main/runtime-manifest.json'][0],
   ], 'the canonical host is tried first, then the mirror');
+  // jsDelivr caches branch refs and can keep serving a stale manifest, whose
+  // hashes then no longer match the files it points at.
+  assert.ok(!JSON.stringify(MANIFEST_MIRRORS).includes('jsdelivr'),
+    'a stale mirror is worse than none: it makes every update fail its hash check');
   const bundle = await downloadBundle({
     version: '0.2.8', base: 'https://raw.githubusercontent.com/wssz527/kimi-cot-translate/v0.2.8', files,
   }, { fetchImpl });
   assert.equal(bundle.size, 5);
   assert.ok([...bundle.values()].every((bytes) => bytes.toString().startsWith('mirrored')));
   assert.equal(mirrorUrl('https://raw.githubusercontent.com/wssz527/kimi-cot-translate/v0.2.8/kct.js'),
-    'https://cdn.jsdelivr.net/gh/wssz527/kimi-cot-translate@v0.2.8/kct.js');
+    'https://cdn.statically.io/gh/wssz527/kimi-cot-translate/v0.2.8/kct.js');
   assert.equal(mirrorUrl('https://example.test/kct.js'), null);
 });

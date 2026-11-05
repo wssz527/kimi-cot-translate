@@ -228,7 +228,9 @@ node runtime-windows.mjs --disable
 
 组件自身也会自动跟版，但**只在 Kimi Code 运行时**：每次 Kimi 启动后检查一次仓库发布的更新清单，发现新版本就下载运行时文件、逐个校验 SHA-256，通过后原子替换（失败自动回滚）。同一个 Kimi 进程不会重复检查；Kimi 关闭期间不发任何网络请求。
 
-两个入口各用各的清单：macOS 读 `runtime-manifest.json`，Windows 读 `runtime-manifest-windows.json`（多出 `runtime-windows.mjs` 与 `windows-bridge.ps1`）。Windows 的替换从暂存副本完成并重新注册计划任务，因为正在运行的脚本文件无法原地覆盖。手动触发：
+两个入口各用各的清单：macOS 读 `runtime-manifest.json`，Windows 读 `runtime-manifest-windows.json`（多出 `runtime-windows.mjs` 与 `windows-bridge.ps1`）。Windows 的替换从暂存副本完成并重新注册计划任务，因为正在运行的脚本文件无法原地覆盖。
+
+清单先请求官方域名，失败后改用 `cdn.statically.io` / `ghproxy.net` 透传源——不使用按 URL 缓存分支的 CDN，否则可能拿到旧清单、令哈希校验必然失败。手动触发：
 
 ```sh
 node runtime.mjs --update            # macOS
