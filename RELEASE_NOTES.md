@@ -10,7 +10,7 @@
 
 真正保护挂载的仍是**注入前的进程身份校验**：PID、启动时间、可执行文件路径逐一比对，任一项不符就不发信号。这条在 macOS 和 Windows 上都在。
 
-**删除 Windows 侧已失效的 inspector 代码。** 0.2.5 改用 CDP 注入后，`triggerInspector`、`inspectorOperations`、`state.inspectorClosed` 以及 `blocked-inspector` 这个状态就再没有调用方了，但文档和实机测试还引用着它们，看状态时会读到对不上的字段。这次一并清掉，`blocked-inspector` 现在只在 macOS 上可能出现。
+**删除 Windows 侧已失效的 inspector 代码。** 0.2.5 改用 CDP 注入后，`triggerInspector`、`inspectorOperations` 与 `--once` 里对 `blocked-inspector` 的退出码判断就再没有调用方了，但文档和实机测试还引用着它们，看状态时会读到对不上的字段。这次一并清掉。`state.inspectorClosed` 在 macOS 上仍然有效（那边确实会关掉 9229），保留不动。
 
 **Windows 生命周期锁的并发竞争不再报错。** 两个加载器（计划任务 watcher 与手动 `--once`）同时抢同一把锁时，Windows 对「正在创建或正在删除」的目录会返回 `EPERM` / `EACCES` / `ENOTEMPTY`，而代码此前只把 `EEXIST` 当作「已被别人占用」，其余错误直接上抛。CI 上表现为 `EPERM: operation not permitted, mkdir '.runtime-lock.reclaim'`；实机上则可能让计划任务在一次竞争后写出 error 状态。现在这几种都按「别人拿着锁」处理，安静让出。
 
