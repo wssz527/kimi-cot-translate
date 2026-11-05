@@ -694,13 +694,21 @@ test('one Kimi launch checks for updates once, and only while it is running', as
   assert.equal(waiting.status, 'waiting');
 });
 
-test('the update is staged outside the running bundle and applied detached', async (t) => {
+test('the update is staged beside the data directory, then handed to a detached process', async (t) => {
   const dataDir = await temporary(t);
-  const files = new Map([['runtime-windows.mjs', Buffer.from('loader')]]);
-  assert.equal(await applyWindowsUpdate(files, dataDir), true);
+  const files = new Map([
+    ['runtime-windows.mjs', Buffer.from('loader')],
+    ['kct.js', Buffer.from('translator')],
+  ]);
+  const spawned = [];
+  assert.equal(await applyWindowsUpdate(files, dataDir, {
+    spawnInstaller: (stage) => spawned.push(stage),
+  }), true);
+  assert.equal(spawned.length, 1);
   const stages = (await readdir(dataDir)).filter((name) => name.startsWith('.update-stage-'));
-  assert.equal(stages.length, 1, 'the detached installer needs a copy it owns');
-  await rm(join(dataDir, stages[0]), { recursive: true, force: true });
+  assert.deepEqual(stages.map((name) => join(dataDir, name)), spawned,
+    'the installer has to run from the staged copy, not the bundle it replaces');
+  assert.equal(await readFile(join(spawned[0], 'kct.js'), 'utf8'), 'translator');
 });
 
 test('the watcher stages an update and hands it off only after releasing the lock', async (t) => {
@@ -731,4 +739,26 @@ test('the watcher stages an update and hands it off only after releasing the loc
   assert.equal(result.stage, staged);
   assert.deepEqual(states, ['tick', `spawn:${staged}`],
     'the installer must start only after the bundle lock is released');
+});
+
+test('a completed install clears the staged copies it ran from', async (t) => {
+  const dataDir = await temporary(t);
+  await mkdir(join(dataDir, '.update-stage-old'), { recursive: true });
+  await writeFile(join(dataDir, '.update-stage-old', 'runtime-windows.mjs'), 'old');
+  await install({
+    localAppData,
+    dataDir,
+    bundleDir: await (async () => {
+      const dir = join(dataDir, 'source');
+      await mkdir(dir, { recursive: true });
+      for (const name of FILES) await writeFile(join(dir, name), `bundle:${name}`);
+      return dir;
+    })(),
+    platformCheck: () => {},
+    verifyApp: async () => ({ version: '1.1.1', electron: '43.1.1', executable: 'fp' }),
+    bridge: async () => ({ installed: true }),
+    sleep: async () => {},
+  }).catch((error) => { throw error; });
+  const left = (await readdir(dataDir)).filter((name) => name.startsWith('.update-stage-'));
+  assert.deepEqual(left, [], 'a stale stage would leak a full runtime bundle per update');
 });

@@ -11,7 +11,7 @@
 ### 修复
 
 - **Windows 补上自动更新**：此前只有 macOS 的 `--once` 会检查更新清单，`runtime-windows.mjs` 完全没有更新代码，`runtime-manifest.json` 也只列了 5 个 macOS 核心文件、不含 Windows 加载器本身。Windows 安装因此永远不会跟版。现新增 `runtime-manifest-windows.json`（8 个文件，含 `runtime-windows.mjs` 与 `windows-bridge.ps1`），Windows 在每次 Kimi 启动后检查一次，下载后逐文件校验 SHA-256，暂存到数据目录，再由独立进程 `--apply-update` 完成安装并重新注册计划任务。新增手动入口 `node runtime-windows.mjs --update`。为支撑两端差异，`runtime-update.mjs` 的清单校验与下载改为接受文件列表参数。
-- 计划任务 watcher 不自行安装更新：它整场持有 bundle 锁，因此只暂存，随后退出循环释放锁，再由独立进程接手，避免与自身文件死锁。
+- 计划任务 watcher 不自行安装更新：它整场持有 bundle 锁，因此只暂存，随后退出循环释放锁，再由独立进程接手，避免与自身文件死锁。安装成功后清除 `.update-stage-*` 暂存目录，避免每次更新留下整份运行时副本。
 
 ## [0.2.7] - 2026-11-05
 

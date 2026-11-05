@@ -706,6 +706,17 @@ async function pruneBundles(dataDir, current, previousEntry) {
 // bundle lock for its whole lifetime. So the new files are staged next to the
 // data directory and a detached `--apply-update` process performs the install
 // once the caller has released the lock.
+// A successful install runs from one of these staged copies, so anything left
+// behind is a run that never completed. Only the bundles themselves are pruned
+// by ownership marker; the stages are named by mkdtemp and carry no marker.
+async function pruneUpdateStages(dataDir) {
+  for (const entry of await readdir(dataDir, { withFileTypes: true })) {
+    if (entry.isDirectory() && entry.name.startsWith('.update-stage-')) {
+      await rm(join(dataDir, entry.name), { recursive: true, force: true });
+    }
+  }
+}
+
 export async function stageWindowsUpdate(files, dataDir) {
   const stage = await mkdtemp(join(dataDir, '.update-stage-'));
   try {
@@ -727,8 +738,8 @@ export function spawnUpdateInstaller(stage) {
 
 // Used by `--once` and `--update`, which release the bundle lock right after the
 // call returns, so the detached installer only has to wait out that handover.
-export async function applyWindowsUpdate(files, dataDir) {
-  spawnUpdateInstaller(await stageWindowsUpdate(files, dataDir));
+export async function applyWindowsUpdate(files, dataDir, { spawnInstaller = spawnUpdateInstaller } = {}) {
+  spawnInstaller(await stageWindowsUpdate(files, dataDir));
   return true;
 }
 
@@ -767,6 +778,9 @@ export async function install(options = {}) {
     committed = true;
     await pruneBundles(dataDir, deployed, oldEnabled?.entry).catch((error) => {
       console.warn(`[kct-windows] Old bundle cleanup failed: ${error.message}`);
+    });
+    await pruneUpdateStages(dataDir).catch((error) => {
+      console.warn(`[kct-windows] Staged update cleanup failed: ${error.message}`);
     });
   } catch (error) {
     if (controlChanged) {
