@@ -1,27 +1,43 @@
-# kimi-cot-translate v0.2.4
+# kimi-cot-translate v0.2.5
 
-这个版本修的是 Windows 端的识别问题：签名、路径、版本号都曾被写死，导致真实安装被误判为「不兼容」。
+这个版本修的是 Windows 端：翻译在真实安装上从未成功挂载过，原因是注入机制的前提假设不成立。
 
 > **Unofficial community project.** Not affiliated with, endorsed, or sponsored by Moonshot AI. "Kimi" and "Kimi Code" are trademarks of their respective owners. Provided as-is, without warranty; may stop working after a host update.
 
 ## 这次改了什么
 
-**签名指纹换成真实值。** 代码里记录的叶证书 SHA-1 是 `F754CEE9121450C6CD50EE89D1CD9E692FE1CA40`，而真实 Kimi Code 由 `NOVASCENT PRIVATE LIMITED` 签发的证书签名，指纹为 `5603104F31C1236A07A3A2E79FA285A11C2B3997`。两者从未匹配过，因此 Windows 端在签名这一步就会被拒。现已改为真实值，并保留严格比对：只有状态为 `Valid` 且指纹命中才放行，不按证书主体放宽。
+**Windows 注入换成 CDP，并在真机跑通。** 原实现调用 `process._debugProcess(pid)` 去触发主进程的 Node inspector，前提是宿主像普通 Node 进程那样注册 `node-debug-handler-<pid>`。在真实安装的 Kimi Code 1.3.1 上这个注册并不存在，调用直接报「系统找不到指定的文件」；同一台机器对普通 Node 子进程调用则成功，所以不是 Node 版本问题，而是这条链路对 Electron 应用不成立。
 
-**不再要求装在固定目录。** 以前只认 `%LOCALAPPDATA%\Programs\Kimi Code`，其他位置直接报 `Only LOCALAPPDATA\Programs\Kimi Code is supported`。安装器允许改盘符或目录，因此现在以实际安装位置为准；进程发现使用同一路径，不会把别的安装认成本程序的目标。
+现在改为：Kimi Code 以 `--remote-debugging-port=9222` 启动后，通过 CDP 直接对渲染进程执行译文脚本，并注册 `Page.addScriptToEvaluateOnNewDocument`，页面刷新后译文会自动恢复。不修改 EXE、不重签、不改 `app.asar`。
 
-**版本号不再参与判断。** Windows 端原先要求二进制哈希必须在允许列表内，且条目被写死为 `Electron/43.1.1`。现在与 macOS 一致：按签名、PE x64、fuse 与思考区块结构判定，未知构建记 `verified: "contract"`，允许列表只作为已知构建的记录。
+**Windows 不再要求官方签名。** 这是免费的第三方显示层工具，宿主是否由官方签名与「能不能翻译」无关。此前把签名当作放行条件，导致官方轮换代码签名证书（`5603104F…` → `187C364D…`）时整个 Windows 端直接失效。签名现在只记录在状态里供诊断，不再拦截。
 
-## 真机验证范围
+**三个会误判的缺陷一并修掉：**
 
-在 Windows 10/11 实机上，用真实安装（Kimi Code 1.2.1，装在 `D:\Apps\KimiCode`）验证了：
+- 只认 `%LOCALAPPDATA%\Programs\Kimi Code`，装在 `D:\Apps\KimiCode` 等其他位置会被拒绝；现在按实际安装目录识别。
+- Kimi Code 通过同一个可执行文件启动 `./bin/kimi-datasource.mjs` 等辅助脚本，它们被误计为第二个主实例从而拒绝挂载；现已排除。
+- 进程发现与路径校验此前各自写死，现在统一使用同一路径，避免互相矛盾。
 
-- 真实签名通过，错误指纹与未信任签名被拒；
-- fuse 检查通过，Node inspector 信号已启用；
-- 完整 `verifyApp` 通过：签名桥接、PE x64、fuse、思考区块 CSS 结构全部成立；
-- 非标准安装路径 `D:\Apps\KimiCode` 可正常识别。
+## 真机验证
 
-**未验证**：真实注入与翻译渲染。SSH 落在 Windows 的 session 0（服务会话），桌面在 session 1，GUI 进程在 session 0 无法稳定运行。这一段需要在已登录的桌面里手动打开 Kimi Code 后测试。
+在 Windows 11 + Kimi Code 1.3.1（安装在 `%LOCALAPPDATA%\Programs\Kimi Code`）上，用经局域网 Magpie 接入的 DeepSeek 产生真实思考内容后确认：
+
+- 挂载返回 `status: active`、`loaded: 1`；
+- 插件自诊断：`发现 1 个思考块 / open=true / ctx=true / 状态=ok`；
+- 原文节点 `PRE.think-text.kct-source-hidden` → `display: none`；
+- 译文节点 `PRE.think-text.kct-translated` → `display: block`，内容为对应的中文翻译。
+
+## 使用前提
+
+Windows 上需要让 Kimi Code 以调试端口启动，翻译才会挂载：
+
+```
+"C:\Users\<你>\AppData\Local\Programs\Kimi Code\Kimi Code.exe" --remote-debugging-port=9222
+```
+
+安装后的计划任务 watcher 会在 Kimi 运行时维护挂载，但**不会替你修改启动参数**。如果直接用原快捷方式启动（不带该参数），状态会显示需要重启并带上该参数。
+
+macOS 端不受影响，仍由启动器负责。
 
 ## 安装与校验 / Install & verify
 
@@ -31,9 +47,9 @@ shasum -a 256 -c SHA256SUMS.txt
 
 | 附件 | 用途 |
 | --- | --- |
-| `kimi-cot-translate-v0.2.4.zip` | 完整源码 + 预构建产物（桌面端 `node runtime.mjs --install` 入口） |
-| `kct-browser-v0.2.4.zip` | Chromium 浏览器扩展（解压后「加载已解压的扩展程序」） |
-| `kct-copied-thinking-v0.2.4.vsix` | VS Code 复制预览（`Extensions: Install from VSIX...`） |
+| `kimi-cot-translate-v0.2.5.zip` | 完整源码 + 预构建产物（桌面端 `node runtime.mjs --install` 入口） |
+| `kct-browser-v0.2.5.zip` | Chromium 浏览器扩展（解压后「加载已解压的扩展程序」） |
+| `kct-copied-thinking-v0.2.5.vsix` | VS Code 复制预览（`Extensions: Install from VSIX...`） |
 | `SHA256SUMS.txt` | 上述附件的 SHA-256 校验 |
 
 需要 Node.js 24。macOS 上已安装的用户由自更新自动升级；Windows 端目前没有自更新通道，需要重新解压并执行 `node runtime-windows.mjs --install`。
@@ -43,7 +59,7 @@ shasum -a 256 -c SHA256SUMS.txt
 | 入口 | 状态 |
 | --- | --- |
 | 桌面端 macOS arm64 | 真实翻译已验证（Kimi Code 1.3.1 / Electron 45.1.0、1.1.2 与 1.1.1 / Electron 43.1.1） |
-| 桌面端 Windows x64 | 签名、fuse、PE 与结构校验已在真机通过；**注入与翻译未在真机验证**（会话隔离限制） |
+| 桌面端 Windows x64 | **真机已验证**：Kimi Code 1.3.1 上挂载成功并正确显示中文译文（需 `--remote-debugging-port`） |
 | CLI 翻译终端 | 真实模型与 Bing 翻译已验证 |
 | 浏览器扩展（Kimi Code Web） | 官方 2.1.1 真实会话实测通过 |
 | 浏览器扩展（kimi.com） | 实验实现，未在登录会话验收 |
@@ -51,9 +67,10 @@ shasum -a 256 -c SHA256SUMS.txt
 
 ## 已知限制
 
-- Windows 端的证书指纹会随官方证书轮换而失效；届时需要把新指纹加入 `SIGNERS`。当前证书有效期至 2026-11-01。
+- Windows 需要手动以 `--remote-debugging-port=9222` 启动 Kimi Code；官方更新若改变启动参数校验或渲染入口，需重新验证。
+- Windows 端没有自更新通道，升级需要手动重装。
 - 思考区块结构若变化，翻译仍会停用并等待适配。
-- 不支持 Kimi 桌面端（Kimi.app / Kimi.exe）：官方二进制关闭了 Node inspector fuse，运行时注入机制无法挂载；Kimi 网页版用户请使用浏览器扩展。
+- 不支持 Kimi 桌面端（Kimi.exe）：它是与 Kimi Code 不同的产品，官方关闭了相关调试能力。
 - 翻译使用公共免鉴权端点（Bing / Google），无 SLA，可能限流或变更；待翻译的思考文本会发往所选第三方端点。
 - 自定义服务的 API key 明文保存在本机 localStorage。
 

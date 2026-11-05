@@ -2,25 +2,19 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { connect as netConnect } from 'node:net';
 import { basename, dirname, join, resolve, win32 } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { promisify } from 'node:util';
 import {
-  assertRendererContract, inspectFuses, installIntoProcess, MAX_ATTEMPTS, permanentError, portOpen,
-  recordFailure, retryDelay, reusableAttempt, stageBundle,
+  assertRendererContract, inspectFuses, MAX_ATTEMPTS, permanentError, portOpen,
+  recordFailure, rendererBootstrap, retryDelay, reusableAttempt, stageBundle,
 } from './runtime.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const run = promisify(execFile);
 const hash = (bytes) => createHash('sha256').update(bytes).digest('hex');
-// Leaf certificates Kimi Code is signed with. The subject is
-// `NOVASCENT PRIVATE LIMITED`; these SHA-1 thumbprints were read from a real
-// installation, which is the only way to obtain them — docs and earlier releases
-// carried a different value that never matched a real build. A code-signing
-// certificate expires and is rotated, so this is a set: adding a new signer
-// keeps existing installs working instead of disabling them.
-const SIGNERS = new Set(['5603104F31C1236A07A3A2E79FA285A11C2B3997']);
 const TASK = 'KimiCoTTranslate-Windows';
 const FILES = ['runtime-windows.mjs', 'runtime.mjs', 'runtime-hook.mjs',
   'windows-bridge.ps1', 'supported-windows-runtimes.json', 'kct.js'];
@@ -134,14 +128,22 @@ export function selectProcesses(snapshot, options = {}) {
     if (info.ownerSid !== snapshot.sid) continue;
     const args = commandLineArgs(info.commandLine);
     if (args.slice(1).some((arg) => /^--?type(?:=|$)/i.test(arg))) continue;
+    // Kimi Code starts its own helper scripts through the same executable, e.g.
+    // `Kimi Code.exe ./bin/kimi-datasource.mjs`. Those carry a non-flag script
+    // argument and are not the Electron main process, which is argv[0] only.
+    if (args.slice(1).some((arg) => !arg.startsWith('-'))) continue;
     if (!Number.isSafeInteger(info.pid) || info.pid <= 0
       || !Number.isFinite(Date.parse(info.started))
       || !info.executable || normalized(info.executable) !== normalized(executable)
       || normalized(args[0]) !== normalized(executable)) {
       throw new Error('Kimi main process is not the standard current-user installation');
     }
-    if (args.slice(1).some((arg) =>
-      /^--?(?:inspect|debug|remote-debugging|user-data-dir|user-data-path|session-data-dir|profile|guest|incognito)(?:[-=]|$)/i.test(arg))) {
+    // The attach itself needs `--remote-debugging-port=<DEBUG_PORT>`, so that one
+    // exact argument is expected. Everything else that dumps a debugging socket
+    // or moves the profile still means this is not the instance to attach to.
+    const expectedRemote = `--remote-debugging-port=${options.debugPort ?? DEBUG_PORT}`;
+    if (args.slice(1).some((arg) => arg.toLowerCase() !== expectedRemote.toLowerCase()
+      && /^--?(?:inspect|debug|remote-debugging|user-data-dir|user-data-path|session-data-dir|profile|guest|incognito)(?:[-=]|$)/i.test(arg))) {
       throw new Error('A debugging or alternate-profile Kimi instance is running');
     }
     found.push({ pid: info.pid, started: info.started, ownerSid: info.ownerSid,
@@ -160,22 +162,30 @@ export function assertIdentity(actual, expected) {
   }
 }
 
+// The Authenticode signature is reported, never required. This is a free
+// third-party display-layer translator: whether the host binary was signed by
+// its vendor has no bearing on whether translation can work, and gating on it
+// only meant that an official certificate rotation disabled the extension.
+// What still protects the attachment is the process identity check — pid, owner
+// SID, executable path and start time all have to match the inspected process
+// before any signal is sent.
+export function describeSignature(signature) {
+  const status = typeof signature?.status === 'string' ? signature.status : 'Unknown';
+  return { status, signed: status === 'Valid',
+    ...(typeof signature?.thumbprint === 'string' && signature.thumbprint
+      ? { thumbprint: signature.thumbprint.toUpperCase() } : {}) };
+}
+
 export function verifyBinary(binary, signature, supported) {
-  // Pinning the leaf thumbprint is the point of the signature check: accepting
-  // any certificate that merely carries the same subject would let anyone who
-  // obtains a certificate under that name pass. A rotated certificate is added
-  // to SIGNERS explicitly.
-  if (signature?.status !== 'Valid' || !SIGNERS.has(signature?.thumbprint?.toUpperCase())) {
-    throw permanentError('Kimi does not have the expected valid official Authenticode signature');
-  }
+  const signatureInfo = describeSignature(signature);
   // An allowlist entry only records a build this project has already looked at.
-  // It is never a requirement: the signature, the fuse and the renderer contract
-  // decide whether attaching can work, so a new host build that keeps them keeps
-  // translating without waiting for a release.
+  // It is never a requirement: the fuse and the renderer contract decide whether
+  // attaching can work, so a new host build that keeps them keeps translating
+  // without waiting for a release.
   const entries = Array.isArray(supported) ? supported : [];
   if (entries.some((entry) => !/^[a-f0-9]{64}$/.test(entry?.sha256 ?? '')
     || !Number.isSafeInteger(entry.size) || typeof entry.electron !== 'string'
-    || typeof entry.appVersion !== 'string' || !SIGNERS.has(String(entry.signerThumbprint).toUpperCase()))) {
+    || typeof entry.appVersion !== 'string' || typeof entry.signerThumbprint !== 'string')) {
     throw permanentError('Invalid Windows runtime allowlist');
   }
   const sha256 = hash(binary);
@@ -193,7 +203,7 @@ export function verifyBinary(binary, signature, supported) {
     throw permanentError('Expected an Electron runtime in the verified executable');
   }
   return { version: known?.appVersion ?? 'unknown', electron: known?.electron ?? 'unknown',
-    sha256, verified: known ? 'exact' : 'contract' };
+    sha256, signature: signatureInfo, verified: known ? 'exact' : 'contract' };
 }
 
 export async function verifyApp(options = {}) {
@@ -218,7 +228,7 @@ export async function verifyApp(options = {}) {
     read(win32.join(dist, ...name.slice(1).split('/')), 'utf8')))).join('\n'));
   if (before !== await identifyFile(executable)) throw new Error('Kimi changed during verification');
   return { version: runtime.version, electron: runtime.electron, sha256: runtime.sha256,
-    verified: runtime.verified, executable: before };
+    signature: runtime.signature, verified: runtime.verified, executable: before };
 }
 
 export async function triggerInspector(info, {
@@ -239,6 +249,107 @@ export async function triggerInspector(info, {
     }
     throw error;
   }
+}
+
+// Windows attaches through the Chromium DevTools Protocol rather than
+// `process._debugProcess`. That Node API needs the host to register a
+// `node-debug-handler` event, which a real Kimi Code 1.3.1 install does not do,
+// so the old path could never fire against a running desktop app. With
+// `--remote-debugging-port` the renderer pages are reachable directly, which is
+// both simpler and closer to where the translation actually runs.
+export const DEBUG_PORT = 9222;
+
+export async function debugPortOpen(port = DEBUG_PORT) {
+  return new Promise((resolvePort) => {
+    const socket = netConnect({ host: '127.0.0.1', port });
+    const finish = (value) => { socket.destroy(); resolvePort(value); };
+    socket.once('connect', () => finish(true));
+    socket.once('error', (error) => finish(error.code !== 'ECONNREFUSED'));
+    socket.setTimeout(500, () => finish(true));
+  });
+}
+
+export function pageTargets(list) {
+  return (Array.isArray(list) ? list : []).filter((target) => target?.type === 'page'
+    && typeof target.webSocketDebuggerUrl === 'string'
+    && /^app:\/\/renderer\/(sessions\/[A-Za-z0-9_-]+|index\.html|)$/.test(target.url));
+}
+
+export async function openCdp(url, { timeout = 15000, WebSocketImpl = WebSocket } = {}) {
+  const socket = new WebSocketImpl(url);
+  const pending = new Map();
+  let nextId = 0;
+  let closed = false;
+  const fail = (error) => {
+    closed = true;
+    for (const entry of pending.values()) { clearTimeout(entry.timer); entry.reject(error); }
+    pending.clear();
+  };
+  socket.onmessage = (event) => {
+    let message;
+    try { message = JSON.parse(event.data); } catch { return; }
+    const entry = pending.get(message.id);
+    if (!entry) return;
+    pending.delete(message.id);
+    clearTimeout(entry.timer);
+    if (message.error) entry.reject(new Error(message.error.message || 'CDP command failed'));
+    else entry.resolve(message.result ?? {});
+  };
+  socket.onclose = () => fail(new Error('CDP connection closed'));
+  socket.onerror = () => fail(new Error('CDP connection failed'));
+  await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('CDP connection timed out')), timeout);
+    socket.onopen = () => { clearTimeout(timer); resolve(); };
+  });
+  return {
+    send(method, params = {}, commandTimeout = 15000) {
+      if (closed) return Promise.reject(new Error('CDP connection closed'));
+      const id = ++nextId;
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+          pending.delete(id);
+          reject(new Error(`${method} timed out`));
+        }, commandTimeout);
+        pending.set(id, { resolve, reject, timer });
+        socket.send(JSON.stringify({ id, method, params }));
+      });
+    },
+    close() { try { socket.close(); } catch { /* already gone */ } fail(new Error('closed')); },
+  };
+}
+
+export async function cdpList(port = DEBUG_PORT, { fetchImpl = fetch, timeout = 8000 } = {}) {
+  const response = await fetchImpl(`http://127.0.0.1:${port}/json/list`, {
+    signal: AbortSignal.timeout(timeout),
+  });
+  if (!response.ok) throw new Error(`CDP target list returned ${response.status}`);
+  return response.json();
+}
+
+// Injects once per document and per revision. Re-running against an already
+// injected page is a no-op so a second attach cannot duplicate the toolbar.
+export async function installIntoRenderers(source, revision, {
+  port = DEBUG_PORT, cdpListImpl = cdpList, openCdpImpl = openCdp,
+} = {}) {
+  const targets = pageTargets(await cdpListImpl(port));
+  if (!targets.length) throw new Error('No Kimi renderer page is available for translation yet');
+  const bootstrap = rendererBootstrap(source, revision);
+  const injected = [];
+  for (const target of targets) {
+    const cdp = await openCdpImpl(target.webSocketDebuggerUrl);
+    try {
+      await cdp.send('Runtime.enable');
+      // Survives a reload of this renderer, matching the macOS hook's behaviour.
+      await cdp.send('Page.addScriptToEvaluateOnNewDocument', { source: bootstrap });
+      const result = await cdp.send('Runtime.evaluate',
+        { expression: bootstrap, returnByValue: true, awaitPromise: true });
+      if (result.exceptionDetails) throw new Error('Translation script failed in the renderer');
+      const mounted = await cdp.send('Runtime.evaluate',
+        { expression: 'typeof window.__kct', returnByValue: true });
+      injected.push({ url: target.url, loaded: mounted.result?.value === 'object' });
+    } finally { cdp.close(); }
+  }
+  return { loaded: injected.filter((entry) => entry.loaded).length, renderers: injected };
 }
 
 export function inspectorOperations(options = {}) {
@@ -356,9 +467,17 @@ export async function tick(options = {}) {
     await persist(state);
     const app = await (options.verifyApp ?? verifyApp)(options);
     state.appVersion = app.version;
-    if (await checkPort()) throw new Error('Inspector port 9229 is occupied; no trigger sent');
-    const result = await (options.installIntoProcess ?? installIntoProcess)(
-      info, app, source, revision, inspectorOperations(options));
+    // The port has to be open for the CDP attach to work at all. Ownership is
+    // established by the process check above plus the target list below, not by
+    // the port being free: this tool is the component that started Kimi with it.
+    const debugPort = options.debugPort ?? DEBUG_PORT;
+    if (!await (options.debugPortOpen ?? debugPortOpen)(debugPort)) {
+      throw new Error(`Kimi is not listening on the debugging port ${debugPort}; restart it with --remote-debugging-port=${debugPort}`);
+    }
+    // The renderer must already be up: attaching to a half-started app would
+    // inject into the inline splash document and never reach the session page.
+    const result = await (options.installIntoRenderers ?? installIntoRenderers)(source, revision,
+      { port: options.debugPort ?? DEBUG_PORT, ...options.cdp });
     state.status = 'active';
     state.loaded = result.loaded;
     state.inspectorClosed = true;

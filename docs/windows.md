@@ -32,19 +32,28 @@ Kimi Code.exe SHA-256:
 
 ## 采用的运行机制
 
-Windows Node 的内部接口 `process._debugProcess(pid)` 会读取目标进程注册的 `node-debug-handler-<pid>` 映射，并通过目标提供的入口触发 inspector。这与 POSIX 的 `SIGUSR1` 实现不同，不能在 Mac 上直接执行 Windows 分支。
+**2026-11-05 更正：早期实现依赖的 `process._debugProcess(pid)` 在真实安装上不成立。**
 
-实现依据：
+原实现假设 Kimi Code 会像普通 Node 进程那样注册 `node-debug-handler-<pid>`，从而接受调试触发。在真实安装的 Kimi Code 1.3.1 上，该注册并不存在，调用直接返回「系统找不到指定的文件」；同一台机器上对普通 Node 子进程调用则成功，因此不是 Node 版本问题。
 
-- [Node 24.18.0 的进程调试实现](https://github.com/nodejs/node/blob/v24.18.0/src/node_process_methods.cc)
-- [Electron 43.1.1 的 Node 环境初始化](https://github.com/electron/electron/blob/v43.1.1/shell/common/node_bindings.cc)
-- [Electron fuse 说明](https://www.electronjs.org/docs/latest/tutorial/fuses)
+现在改为通过 Chromium DevTools Protocol 直接注入渲染进程：Kimi Code 以 `--remote-debugging-port=9222` 启动后，`/json/list` 暴露 `app://renderer/sessions/...` 页面，加载器直接在该页执行译文脚本，并注册 `Page.addScriptToEvaluateOnNewDocument` 以便刷新后恢复。链路比原先的「触发主进程 inspector → hook webContents → 转发渲染层」更短，也不再依赖目标进程的 Node 调试映射。
 
-该接口属于 Node 内部能力，必须固定运行环境并验证实际行为。加载器先验证官方签名、Windows 独立哈希、fuse、进程身份和监听端口，再短时挂载内存 hook；不修改 EXE、不重签、不替用户启动第二个 Kimi 实例。
+不修改 EXE、不重签、不改 app.asar；进程身份（PID、所属 SID、可执行文件路径、启动时间）仍逐一比对后才注入。
 
 ## 验证边界
 
-Mac 可以验证二进制结构、fuse、CSS 契约、进程数据解析、任务参数构造及模拟失败处理。Windows 调试触发、实际签名校验、监听归属和页面挂载需要 Windows 环境。
+Mac 可以验证二进制结构、fuse、CSS 契约、进程数据解析、任务参数构造及模拟失败处理。CDP 挂载与页面注入需要 Windows 运行环境。
+
+**2026-11-05 真机验收（Kimi Code 1.3.1，Windows 11，安装在 `%LOCALAPPDATA%\Programs\Kimi Code`）**：
+
+- 以 `--remote-debugging-port=9222` 启动后，CDP 暴露真实会话页 `app://renderer/sessions/session_...`。
+- 挂载返回 `status: active`、`loaded: 1`。
+- 使用 DeepSeek（经局域网 Magpie）产生真实思考内容后，译文渲染正确：
+  - 原文 `PRE.think-text.kct-source-hidden` → `display: none`
+  - 译文 `PRE.think-text.kct-translated` → `display: block`
+- 插件自诊断：`发现 1 个思考块 / open=true / ctx=true / 状态=ok`。
+
+前提条件：该机器需以带 `--remote-debugging-port=9222` 的方式启动 Kimi Code；计划任务 watcher 会维护挂载，但不会替用户改变启动参数。
 
 Windows 动态测试在全新 GitHub `windows-latest` runner 上使用 Node 24.21.0 x64，解压官方已验证包，未执行官方安装器，未登录真实账户，覆盖：
 

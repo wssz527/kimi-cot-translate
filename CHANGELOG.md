@@ -14,8 +14,10 @@
 
 ### 修复
 
-- Windows 签名指纹改为真实值：原值 `F754CEE9…` 与真实签名（`NOVASCENT PRIVATE LIMITED`，`5603104F…`）不符，导致真实安装被拒。改为指纹集合，证书轮换时可精确新增。
-- Windows 不再限定单一安装目录：`D:\Apps\KimiCode` 这类非标准安装位置可正常识别，进程发现使用同一路径。
+- **Windows 注入改为 CDP**：早期实现依赖 `process._debugProcess(pid)`，它要求目标进程注册 `node-debug-handler`，而真实安装的 Kimi Code 并不注册，调用直接失败（`系统找不到指定的文件`）。改为通过 `--remote-debugging-port` 直接注入渲染进程，并在真机（Kimi Code 1.3.1）验证译文正确显示。
+- **Windows 不再要求官方签名**：本插件是免费的第三方显示层工具，宿主是否由官方签名与翻译能力无关。证书轮换曾导致整个 Windows 端失效，现改为记为 `signature` 字段仅供参考。
+- **Windows 允许非标准安装路径**：安装器可指向其他盘符，加载器按实际目录识别，进程发现使用同一路径。
+- **Windows 不再误判自身子进程**：Kimi Code 通过同一可执行文件启动 `./bin/kimi-datasource.mjs` 等辅助脚本，它们此前被计为第二个主实例，导致拒绝挂载。
 - 移除 Electron 主版本白名单：此前即使结构与注入能力都成立，只要宿主的 Electron 主版本不在硬编码列表（如 43 → 45）就永久停用。版本号现在只用于状态展示，不再参与放行判断。
 - Windows 二进制校验同样改为按能力放行：不再要求哈希必须在允许列表内，也不再限定 `Electron/43.1.1`；未知构建按签名、PE、fuse 与结构判定，记 `verified: "contract"`。
 - macOS 进程发现改用进程表精确匹配：`pgrep -x "Kimi Code"` 无法匹配含空格的进程名，会导致「Kimi Code is not running」的误判，后台任务因此不再挂载。

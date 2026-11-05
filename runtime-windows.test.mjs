@@ -60,12 +60,10 @@ function tickFixture() {
     findProcesses: async () => found,
     fingerprint: async () => 'file-fingerprint',
     verifyApp: async () => ({ version: '1.1.1', electron: '43.1.1', executable: 'file-fingerprint' }),
-    portOpen: async () => false,
-    installIntoProcess: async (_info, _app, _source, _revision, operations) => {
-      assert.deepEqual(Object.keys(operations).sort(),
-        ['checkIdentity', 'triggerInspector', 'verifyLiveProcess', 'verifyPortOwner'].sort());
+    debugPortOpen: async () => true,
+    installIntoRenderers: async (_source, _revision, _options) => {
       installs++;
-      return { loaded: 1 };
+      return { loaded: 1, renderers: [] };
     },
   };
   return { options, sources, setFound: (value) => { found = value; },
@@ -108,29 +106,49 @@ test('only current-user standard main processes survive discovery', async () => 
     assert.equal(action, 'Discover'); return snapshot;
   } }), [INFO]);
   for (const arg of ['--inspect', '--inspect-brk=9229', '--debug-port=9229',
-    '--remote-debugging-port=9222', '--user-data-dir=C:\\tmp', '--profile-directory=Other',
+    '--remote-debugging-port=9333', '--user-data-dir=C:\\tmp', '--profile-directory=Other',
     '--ins"pect"=9229', '"--user-data-dir=C:\\Other Profile"',
     '--unused=C:\\tmp\\ --user-data-dir=C:\\alternate',
-    '--unused=C:\\tmp\\\t--remote-debugging-port=9222']) {
+    '--unused=C:\\tmp\\\t--remote-debugging-port=9333']) {
     assert.throws(() => selectProcesses({ sid: SID,
       processes: [{ ...INFO, commandLine: `${INFO.commandLine} ${arg}` }] }, { localAppData }), /debugging|profile/);
   }
+  // This tool attaches through the debugging port, so its own exact argument is
+  // the expected state rather than a reason to refuse.
+  assert.deepEqual(selectProcesses({ sid: SID,
+    processes: [{ ...INFO, commandLine: `${INFO.commandLine} --remote-debugging-port=9222` }] },
+  { localAppData }).map((p2) => p2.pid), [INFO.pid]);
   for (const changed of [{ executable: 'C:\\Other\\Kimi Code.exe' }, { ownerSid: '' },
     { started: 'invalid' }, { pid: 0 }, { commandLine: null },
     { commandLine: '"C:\\Other\\Kimi Code.exe"' }]) {
     assert.throws(() => selectProcesses({ sid: SID, processes: [{ ...INFO, ...changed }] }, { localAppData }));
   }
   assert.equal(selectProcesses({ sid: SID, processes: [INFO, { ...INFO, pid: 45 }] }, { localAppData }).length, 2);
+  // Kimi Code launches helper scripts through its own executable. They are not
+  // a second main process and must not make attachment refuse as ambiguous.
+  const helper = { ...INFO, pid: 46,
+    commandLine: `"${INFO.executable}" ./bin/kimi-datasource.mjs` };
+  assert.deepEqual(selectProcesses({ sid: SID, processes: [INFO, helper] }, { localAppData }).map((p) => p.pid),
+    [INFO.pid]);
 });
 
-test('binary verification requires signature, PE x64 and fuse while an unseen build still attaches by contract', () => {
+test('binary verification needs PE x64 and fuse, reports the signature, and never requires it', () => {
   const { binary, allow } = binaryFixture();
   assert.equal(verifyBinary(binary, SIGNATURE, allow()).electron, '43.1.1');
   assert.equal(verifyBinary(binary, SIGNATURE, allow()).verified, 'exact');
-  for (const signature of [{ ...SIGNATURE, status: 'UnknownError' },
-    { ...SIGNATURE, thumbprint: '0'.repeat(40) }, {}]) {
-    assert.throws(() => verifyBinary(binary, signature, allow()), /Authenticode/);
+  // The signature is informational. This is a free third-party translator, so
+  // an unsigned, expired or rotated-certificate host must still work; gating on
+  // it is what used to break Windows whenever the vendor rotated its certificate.
+  const rotated = { status: 'Valid', thumbprint: '187C364D836FF69A95A57E07C7B9A864BC00362A',
+    subject: 'CN=NOVASCENT PRIVATE LIMITED, O=NOVASCENT PRIVATE LIMITED, L=Singapore, C=SG' };
+  for (const signature of [rotated, { status: 'UnknownError' }, { status: 'NotTrusted' },
+    { status: 'Valid', thumbprint: 'A'.repeat(40) }, undefined]) {
+    const result = verifyBinary(binary, signature, allow());
+    assert.equal(result.verified, 'exact');
+    assert.equal(result.signature.signed, signature?.status === 'Valid');
   }
+  assert.equal(verifyBinary(binary, SIGNATURE, allow()).signature.thumbprint,
+    '5603104F31C1236A07A3A2E79FA285A11C2B3997');
   // A build this project has never seen is not a refusal: the capability checks
   // below are what decide attachment, exactly as on macOS.
   const known = allow();
@@ -149,7 +167,7 @@ test('binary verification requires signature, PE x64 and fuse while an unseen bu
     { ...known[0], electron: 43 }, ...known.slice(1)]), /Invalid Windows runtime allowlist/);
 });
 
-test('application verification checks signature and CSS, and detects a concurrent update', async () => {
+test('application verification checks the renderer contract and detects a concurrent update', async () => {
   const { binary, allow } = binaryFixture();
   let signature = SIGNATURE, style = CSS, changed = false, reads = 0;
   const options = {
@@ -167,8 +185,9 @@ test('application verification checks signature and CSS, and detects a concurren
     },
   };
   assert.equal((await verifyApp(options)).version, '1.1.1');
+  // An unsigned host still verifies: the signature is reported, not required.
   signature = { ...SIGNATURE, status: 'NotTrusted' };
-  await assert.rejects(verifyApp(options), /Authenticode/);
+  assert.equal((await verifyApp(options)).signature.signed, false);
   signature = SIGNATURE;
   style = '.unrelated{}';
   await assert.rejects(verifyApp(options), /reasoning UI changed/);
@@ -220,43 +239,43 @@ test('one attempt survives absence and multiple processes; a new start or source
   assert.notEqual(f.state().revision, firstRevision);
 });
 
-test('signature rejection never reaches installation or the trigger', async () => {
-  for (const reason of ['signature']) {
-    const f = tickFixture();
-    const { binary, allow } = binaryFixture();
-    const known = allow();
-    let checks = 0;
-    f.options.verifyApp = async () => {
-      checks++;
-      return verifyApp({
-        localAppData, fingerprint: async () => 'file',
-        bridge: async () => reason === 'signature' ? { ...SIGNATURE, status: 'NotTrusted' } : SIGNATURE,
-        readFile: async (file) => String(file).endsWith('.json') ? JSON.stringify(known) : binary,
-      });
-    };
-    const state = await tick(f.options);
-    assert.equal(state.status, 'error');
-    assert.equal(state.failureKind, 'permanent');
-    assert.equal(state.nextRetryAt, null);
-    assert.match(state.detail, /Authenticode/);
-    assert.equal(f.installs(), 0);
-    f.options.now = () => Date.parse('2026-10-22T03:00:00Z');
-    const later = await tick(f.options);
-    assert.equal(later.status, 'error');
-    assert.equal(checks, 1);
-    assert.equal(f.installs(), 0);
-  }
+test('an unsigned host still attaches, while a changed renderer contract stops it', async () => {
+  const f = tickFixture();
+  const { binary, allow } = binaryFixture();
+  const known = allow();
+  let style = CSS;
+  f.options.verifyApp = async () => verifyApp({
+    localAppData, fingerprint: async () => 'file',
+    bridge: async () => ({ ...SIGNATURE, status: 'NotTrusted' }),
+    readFile: async (file) => {
+      if (String(file).endsWith('.json')) return JSON.stringify(known);
+      if (String(file).endsWith('index.html')) return '<link href="/assets/main.css">';
+      if (file === PATHS.executable) return binary;
+      return style;
+    },
+  });
+  const state = await tick(f.options);
+  assert.equal(state.status, 'active');
+  // The reasoning DOM is the real contract: when it changes, nothing attaches.
+  style = '.unrelated{}';
+  const blocked = tickFixture();
+  blocked.options.verifyApp = f.options.verifyApp;
+  const failed = await tick(blocked.options);
+  assert.equal(failed.status, 'error');
+  assert.equal(failed.failureKind, 'permanent');
+  assert.equal(blocked.installs(), 0);
 });
 
-test('occupied ports remain retryable without recording a signal attempt', async () => {
+test('a closed debugging port is a retryable failure and nothing is injected', async () => {
   const f = tickFixture();
-  f.options.portOpen = async () => true;
-  const occupied = await tick(f.options);
-  assert.match(occupied.detail, /occupied/);
-  assert.equal(occupied.status, 'error');
+  f.options.debugPortOpen = async () => false;
+  const closed = await tick(f.options);
+  assert.match(closed.detail, /debugging port/);
+  assert.equal(closed.status, 'error');
   assert.equal(f.installs(), 0);
+  // A later tick after the port is up attaches normally.
   f.options.now = () => Date.parse('2026-10-22T00:00:40Z');
-  f.options.portOpen = async () => false;
+  f.options.debugPortOpen = async () => true;
   assert.equal((await tick(f.options)).status, 'active');
   assert.equal(f.installs(), 1);
 });
@@ -297,7 +316,7 @@ test('the helper uses a bounded separate Node process with an argument-safe PID'
 test('helper timeout stays blocked until its port is released, then retries after backoff', async () => {
   const f = tickFixture();
   let calls = 0;
-  f.options.installIntoProcess = async () => {
+  f.options.installIntoRenderers = async () => {
     calls++;
     if (calls === 1) {
       return triggerInspector(INFO, {
@@ -341,7 +360,7 @@ test('transient failures retry after backoff and preserve the budget across revi
   assert.equal(f.state().attempts, 2);
 
   const g = tickFixture();
-  g.options.installIntoProcess = async () => { throw new Error('still transient'); };
+  g.options.installIntoRenderers = async () => { throw new Error('still transient'); };
   for (let i = 0; i < 8; i++) {
     await tick(g.options);
     const next = g.state().nextRetryAt;
@@ -360,10 +379,10 @@ test('transient failures retry after backoff and preserve the budget across revi
 test('a changed PID or start resets attempts without waiting for the old deadline', async () => {
   for (const changed of [{ ...INFO, pid: 43 }, { ...INFO, started: '2026-10-22T00:00:01Z' }]) {
     const f = tickFixture();
-    f.options.installIntoProcess = async () => { throw new Error('transient'); };
+    f.options.installIntoRenderers = async () => { throw new Error('transient'); };
     await tick(f.options);
     f.setFound([changed]);
-    f.options.installIntoProcess = async () => ({ loaded: 1 });
+    f.options.installIntoRenderers = async () => ({ loaded: 1, renderers: [] });
     const state = await tick(f.options);
     assert.equal(state.status, 'active');
     assert.equal(state.attempts, 1);
@@ -645,12 +664,14 @@ test('state corruption uses safe defaults and reports a diagnostic', async (t) =
   const state = await tick({ ...f.options, dataDir, logError: (message) => errors.push(message) });
   assert.equal(state.status, 'active');
   assert.equal(f.installs(), 1);
-  const occupied = tickFixture();
-  delete occupied.options.readState;
-  occupied.options.portOpen = async () => true;
-  assert.equal((await tick({ ...occupied.options, dataDir,
+  // With the debugging port closed there is nothing to attach to, so the tick
+  // reports an error instead of pretending the translation is live.
+  const closed = tickFixture();
+  delete closed.options.readState;
+  closed.options.debugPortOpen = async () => false;
+  assert.equal((await tick({ ...closed.options, dataDir,
     logError: (message) => errors.push(message) })).status, 'error');
-  assert.equal(occupied.installs(), 0, 'safe defaults must still check the port before triggering');
+  assert.equal(closed.installs(), 0, 'safe defaults must still require the port before attaching');
 });
 
 test('scheduled tasks are per-user limited and never request forced termination', async () => {
