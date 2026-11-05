@@ -14,6 +14,8 @@
 
 ### 修复
 
+- Windows 签名指纹改为真实值：原值 `F754CEE9…` 与真实签名（`NOVASCENT PRIVATE LIMITED`，`5603104F…`）不符，导致真实安装被拒。改为指纹集合，证书轮换时可精确新增。
+- Windows 不再限定单一安装目录：`D:\Apps\KimiCode` 这类非标准安装位置可正常识别，进程发现使用同一路径。
 - 移除 Electron 主版本白名单：此前即使结构与注入能力都成立，只要宿主的 Electron 主版本不在硬编码列表（如 43 → 45）就永久停用。版本号现在只用于状态展示，不再参与放行判断。
 - Windows 二进制校验同样改为按能力放行：不再要求哈希必须在允许列表内，也不再限定 `Electron/43.1.1`；未知构建按签名、PE、fuse 与结构判定，记 `verified: "contract"`。
 - macOS 进程发现改用进程表精确匹配：`pgrep -x "Kimi Code"` 无法匹配含空格的进程名，会导致「Kimi Code is not running」的误判，后台任务因此不再挂载。

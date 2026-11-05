@@ -16,7 +16,7 @@
 | Windows 调试映射标记 | 包含 UTF-16 的 `node-debug-handler` |
 | 思考区块 CSS | `think`、`think-head`、`think-body`、`think-body-inner`、`think-text` 均存在 |
 | 签名证书主体 | `NOVASCENT PRIVATE LIMITED` |
-| 签名叶证书 SHA-1 thumbprint | `F754CEE9121450C6CD50EE89D1CD9E692FE1CA40` |
+| 签名叶证书 SHA-1 thumbprint | `5603104F31C1236A07A3A2E79FA285A11C2B3997` |
 
 离线提取到了签名证书链，随后 Windows 动态测试也通过了安装包与 App 的 Authenticode `Valid` 校验；加载器还比对了指定叶证书 thumbprint。
 

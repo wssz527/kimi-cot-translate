@@ -13,7 +13,7 @@ import {
 const localAppData = "C:\\Users\\Test O'Brien\\AppData\\Local";
 const PATHS = windowsPaths({ localAppData });
 const SID = 'S-1-5-21-100-200-300-1001';
-const SIGNATURE = { status: 'Valid', thumbprint: 'F754CEE9121450C6CD50EE89D1CD9E692FE1CA40' };
+const SIGNATURE = { status: 'Valid', thumbprint: '5603104F31C1236A07A3A2E79FA285A11C2B3997' };
 const INFO = {
   pid: 42, started: '2026-10-22T00:00:00.000Z', ownerSid: SID,
   executable: PATHS.executable, commandLine: `"${PATHS.executable}"`,
@@ -72,11 +72,16 @@ function tickFixture() {
     state: () => previous, installs: () => installs };
 }
 
-test('paths follow LOCALAPPDATA dynamically and reject nonstandard installations', () => {
+test('paths follow the real installation and keep LOCALAPPDATA as the default', () => {
   assert.equal(PATHS.appDir, win32.join(localAppData, 'Programs', 'Kimi Code'));
   assert.equal(PATHS.dataDir, win32.join(localAppData, 'kimi-cot-translate', 'windows'));
   assert.equal(windowsPaths({ localAppData, dataDir: '/test-data' }).dataDir, '/test-data');
-  assert.throws(() => windowsPaths({ localAppData, appDir: 'C:\\Elsewhere' }), /Only LOCALAPPDATA/);
+  // The installer can be pointed at another drive, so an explicit directory is
+  // honoured instead of being rejected for not matching the default.
+  const custom = windowsPaths({ localAppData, appDir: 'D:\\Apps\\KimiCode' });
+  assert.equal(custom.appDir, win32.resolve('D:\\Apps\\KimiCode'));
+  assert.equal(custom.executable, win32.join(win32.resolve('D:\\Apps\\KimiCode'), 'Kimi Code.exe'));
+  assert.throws(() => windowsPaths({ localAppData, appDir: 'D:\\' }), /drive root/);
   assert.throws(() => windowsPaths({ localAppData: 'relative' }), /absolute/);
   assert.doesNotThrow(() => assertPlatform({ platform: 'win32', arch: 'x64', nodeVersion: '24.18.0' }));
   for (const overrides of [{ platform: 'darwin' }, { arch: 'arm64' }, { nodeVersion: '22.0.0' },

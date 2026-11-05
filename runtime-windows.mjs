@@ -14,7 +14,13 @@ import {
 const HERE = dirname(fileURLToPath(import.meta.url));
 const run = promisify(execFile);
 const hash = (bytes) => createHash('sha256').update(bytes).digest('hex');
-const SIGNER = 'F754CEE9121450C6CD50EE89D1CD9E692FE1CA40';
+// Leaf certificates Kimi Code is signed with. The subject is
+// `NOVASCENT PRIVATE LIMITED`; these SHA-1 thumbprints were read from a real
+// installation, which is the only way to obtain them — docs and earlier releases
+// carried a different value that never matched a real build. A code-signing
+// certificate expires and is rotated, so this is a set: adding a new signer
+// keeps existing installs working instead of disabling them.
+const SIGNERS = new Set(['5603104F31C1236A07A3A2E79FA285A11C2B3997']);
 const TASK = 'KimiCoTTranslate-Windows';
 const FILES = ['runtime-windows.mjs', 'runtime.mjs', 'runtime-hook.mjs',
   'windows-bridge.ps1', 'supported-windows-runtimes.json', 'kct.js'];
@@ -30,11 +36,19 @@ export function windowsPaths({
 } = {}) {
   if (!localAppData || !win32.isAbsolute(localAppData)) throw new Error('LOCALAPPDATA must be absolute');
   const standard = win32.join(localAppData, 'Programs', 'Kimi Code');
-  if (appDir && normalized(appDir) !== normalized(standard)) {
-    throw new Error('Only LOCALAPPDATA\\Programs\\Kimi Code is supported');
+  // The installer can be pointed at another drive or folder, so the real
+  // executable decides which installation is being verified. An explicit
+  // appDir must still be absolute and hold a Kimi Code executable; the standard
+  // location stays the default when nothing is passed.
+  const resolved = appDir ? win32.resolve(appDir) : standard;
+  if (!win32.isAbsolute(resolved)) throw new Error('Kimi Code app directory must be absolute');
+  // A drive root has no basename; refusing it keeps the executable path from
+  // collapsing to the drive itself.
+  if (appDir && win32.basename(resolved) === '') {
+    throw new Error('Kimi Code app directory must be a directory, not a drive root');
   }
   return {
-    appDir: standard, executable: win32.join(standard, 'Kimi Code.exe'),
+    appDir: resolved, executable: win32.join(resolved, 'Kimi Code.exe'),
     dataDir: dataDir ?? win32.join(localAppData, 'kimi-cot-translate', 'windows'),
   };
 }
@@ -106,6 +120,10 @@ export function commandLineArgs(text) {
 }
 
 export function selectProcesses(snapshot, options = {}) {
+  // The executable path is decided by the caller's appDir. It is compared
+  // exactly against the process command line, so a different installation is
+  // accepted only when it is the one being verified — any other path still
+  // fails below instead of being treated as ours.
   const { executable } = windowsPaths(options);
   if (!/^S-1-\d+(?:-\d+)+$/.test(snapshot?.sid ?? '') || !Array.isArray(snapshot.processes)) {
     throw new Error('Cannot establish the current Windows user');
@@ -143,7 +161,11 @@ export function assertIdentity(actual, expected) {
 }
 
 export function verifyBinary(binary, signature, supported) {
-  if (signature?.status !== 'Valid' || signature.thumbprint?.toUpperCase() !== SIGNER) {
+  // Pinning the leaf thumbprint is the point of the signature check: accepting
+  // any certificate that merely carries the same subject would let anyone who
+  // obtains a certificate under that name pass. A rotated certificate is added
+  // to SIGNERS explicitly.
+  if (signature?.status !== 'Valid' || !SIGNERS.has(signature?.thumbprint?.toUpperCase())) {
     throw permanentError('Kimi does not have the expected valid official Authenticode signature');
   }
   // An allowlist entry only records a build this project has already looked at.
@@ -153,7 +175,7 @@ export function verifyBinary(binary, signature, supported) {
   const entries = Array.isArray(supported) ? supported : [];
   if (entries.some((entry) => !/^[a-f0-9]{64}$/.test(entry?.sha256 ?? '')
     || !Number.isSafeInteger(entry.size) || typeof entry.electron !== 'string'
-    || typeof entry.appVersion !== 'string' || entry.signerThumbprint !== SIGNER)) {
+    || typeof entry.appVersion !== 'string' || !SIGNERS.has(String(entry.signerThumbprint).toUpperCase()))) {
     throw permanentError('Invalid Windows runtime allowlist');
   }
   const sha256 = hash(binary);

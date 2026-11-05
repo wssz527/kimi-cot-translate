@@ -39,7 +39,13 @@ switch ($Action) {
         $thumbprint = if ($null -ne $signature.SignerCertificate) {
             $signature.SignerCertificate.Thumbprint
         } else { '' }
-        @{ status = $signature.Status.ToString(); thumbprint = $thumbprint } | ConvertTo-Json -Compress
+        # The subject lets the loader accept a rotated certificate by publisher
+        # while the pinned thumbprints are updated.
+        $subject = if ($null -ne $signature.SignerCertificate) {
+            $signature.SignerCertificate.Subject
+        } else { '' }
+        @{ status = $signature.Status.ToString(); thumbprint = $thumbprint;
+           subject = $subject } | ConvertTo-Json -Compress
     }
     'PortOwner' {
         $listeners = @(Get-NetTCPConnection -State Listen | Where-Object {
