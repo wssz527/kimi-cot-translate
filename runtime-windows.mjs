@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { createHash, randomUUID } from 'node:crypto';
-import { execFile } from 'node:child_process';
-import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { execFile, spawn } from 'node:child_process';
+import { mkdir, mkdtemp, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { connect as netConnect } from 'node:net';
 import { basename, dirname, join, resolve, win32 } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -11,6 +11,9 @@ import {
   assertRendererContract, inspectFuses, MAX_ATTEMPTS, permanentError, portOpen,
   recordFailure, rendererBootstrap, retryDelay, reusableAttempt, stageBundle,
 } from './runtime.mjs';
+import {
+  DEFAULT_WINDOWS_MANIFEST, downloadBundle, resolveUpdate, WINDOWS_RUNTIME_FILES,
+} from './runtime-update.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const run = promisify(execFile);
@@ -401,6 +404,39 @@ export async function readState(options = {}) {
   }
 }
 
+// Self-update, mirroring the macOS loader. A Windows install is a bundle
+// directory plus a scheduled task pointing at it, so the swap has to stage the
+// new bundle, repoint enabled.json, and only then prune the old one. The check
+// happens once per Kimi launch and only after a process is found, so a closed
+// app never causes a request.
+export async function updateWindows({
+  currentVersion,
+  dataDir,
+  manifestUrl,
+  fetchImpl = fetch,
+  resolveUpdateFn,
+  applyUpdate,
+} = {}) {
+  const check = await (resolveUpdateFn ?? ((from) => resolveUpdate({
+    current: from,
+    manifestUrl: manifestUrl ?? DEFAULT_WINDOWS_MANIFEST,
+    fetchImpl,
+    files: WINDOWS_RUNTIME_FILES,
+  })))(currentVersion);
+  if (!check?.available) {
+    return { updated: false, reason: 'up-to-date', current: check?.current, remote: check?.remote };
+  }
+  if (!applyUpdate) return { updated: false, reason: 'no-deploy', available: true, remote: check.remote };
+  const files = await downloadBundle(check.manifest, { fetchImpl, required: WINDOWS_RUNTIME_FILES });
+  const applied = await applyUpdate(files, dataDir);
+  // The watcher cannot install while it holds the bundle lock, so it only
+  // stages and lets the caller hand off.
+  if (applied?.staged) {
+    return { updated: false, reason: 'staged', stage: applied.staged, from: check.current, to: check.remote };
+  }
+  return { updated: true, from: check.current, to: check.remote };
+}
+
 export async function tick(options = {}) {
   const paths = windowsPaths(options);
   const read = options.readFile ?? readFile;
@@ -431,6 +467,38 @@ export async function tick(options = {}) {
   const sameProcess = attempt?.pid === info.pid
     && (attempt.started === info.started || attempt.identity?.startsWith(`${identity}:`)
       || attempt.identity === identity);
+  // Check for a newer release once per Kimi launch, and only now that a live
+  // process has been found: a closed app must never reach the network. A failed
+  // check is recorded and otherwise ignored — the attachment below is what the
+  // user is waiting for, and a broken updater must not break translation.
+  const updateInfo = {};
+  const previousCheckedFor = attempt?.updateCheckedFor;
+  if (options.updateCheck && previousCheckedFor !== identity) {
+    const update = await updateWindows({
+      currentVersion: options.currentVersion,
+      dataDir: paths.dataDir,
+      manifestUrl: options.manifestUrl,
+      fetchImpl: options.fetchImpl,
+      resolveUpdateFn: options.resolveUpdateFn,
+      applyUpdate: options.applyUpdate,
+    }).catch((error) => ({ updated: false, reason: 'failed', error }));
+    updateInfo.updateCheckedFor = identity;
+    updateInfo.lastUpdateCheckAt = new Date(now()).toISOString();
+    if (update?.updated) {
+      updateInfo.updateStatus = 'installed';
+      updateInfo.updateVersion = update.to;
+    } else if (update?.reason === 'failed') {
+      updateInfo.updateStatus = 'failed';
+      updateInfo.updateError = update.error?.message ?? String(update.error);
+    } else if (update?.reason === 'staged') {
+      updateInfo.updateStatus = 'staged';
+      updateInfo.updateVersion = update.to;
+      updateInfo.updateStage = update.stage;
+    } else {
+      updateInfo.updateStatus = update?.reason === 'no-deploy' ? 'available' : 'up-to-date';
+      updateInfo.updateVersion = update?.remote;
+    }
+  }
   if (sameProcess && attempt.status !== 'active' && attempt.failureKind !== 'permanent') {
     const reusable = await reusableAttempt(attempt, now(), checkPort);
     if (reusable) return persist(reusable);
@@ -440,6 +508,7 @@ export async function tick(options = {}) {
     identity, revision: null, pid: info.pid, started: info.started, status: 'checking',
     attempts: (sameProcess ? attempt.attempts ?? 1 : 0) + 1,
     lastAttemptAt: new Date(now()).toISOString(), nextRetryAt: null, failureKind: null,
+    ...updateInfo,
   };
   try {
     const bundle = options.bundleDir ?? HERE;
@@ -535,6 +604,7 @@ export async function watch(options = {}) {
     let enabled;
     let nextTick = 0;
     let failures = 0;
+    let pendingUpdate;
     while (true) {
       try {
         if (await stopped(dataDir, readStat)) break;
@@ -566,9 +636,17 @@ export async function watch(options = {}) {
         }
         if (current?.generation !== enabled.generation || current.entry !== entry) break;
         if (now() >= nextTick) {
-          await (options.tick ?? tick)(options);
+          const state = await (options.tick ?? tick)(options);
           failures = 0;
           nextTick = now() + 10000;
+          // A staged update cannot be installed from here: this process holds
+          // the bundle lock and is running the bundle being replaced. Break out
+          // so the lock is released, then hand the staged copy to the detached
+          // installer, which repoints the scheduled task at the new bundle.
+          if (state?.updateStatus === 'staged') {
+            pendingUpdate = state.updateStage ?? options.pendingStage;
+            break;
+          }
         }
       } catch (error) {
         failures += 1;
@@ -576,6 +654,10 @@ export async function watch(options = {}) {
         nextTick = now() + retryDelay(failures);
       }
       await pause(1000);
+    }
+    if (pendingUpdate) {
+      (options.spawnInstaller ?? spawnUpdateInstaller)(pendingUpdate);
+      return { status: 'updating', stage: pendingUpdate };
     }
     return { status: 'disabled' };
   } finally { await lock.release(); }
@@ -617,6 +699,37 @@ async function pruneBundles(dataDir, current, previousEntry) {
   for (const item of owned) {
     if (item.dir !== current && item.dir !== previous?.dir) await rm(item.dir, { recursive: true });
   }
+}
+
+// The swap cannot happen inside the process that is running the bundle: on
+// Windows a loaded script cannot be replaced in place, and the watcher holds the
+// bundle lock for its whole lifetime. So the new files are staged next to the
+// data directory and a detached `--apply-update` process performs the install
+// once the caller has released the lock.
+export async function stageWindowsUpdate(files, dataDir) {
+  const stage = await mkdtemp(join(dataDir, '.update-stage-'));
+  try {
+    for (const [name, bytes] of files) await writeFile(join(stage, name), bytes, { mode: 0o600 });
+    return stage;
+  } catch (error) {
+    await rm(stage, { recursive: true, force: true }).catch(() => {});
+    throw error;
+  }
+}
+
+export function spawnUpdateInstaller(stage) {
+  const child = spawn(process.execPath, [join(stage, 'runtime-windows.mjs'), '--apply-update'], {
+    detached: true, stdio: 'ignore', windowsHide: true, cwd: stage,
+    env: { ...process.env, KCT_WINDOWS_UPDATE_STAGE: stage },
+  });
+  child.unref();
+}
+
+// Used by `--once` and `--update`, which release the bundle lock right after the
+// call returns, so the detached installer only has to wait out that handover.
+export async function applyWindowsUpdate(files, dataDir) {
+  spawnUpdateInstaller(await stageWindowsUpdate(files, dataDir));
+  return true;
 }
 
 export async function install(options = {}) {
@@ -694,19 +807,49 @@ export async function disable(options = {}) {
 async function main() {
   assertPlatform();
   const command = process.argv[2];
-  if (process.argv.length !== 3 || !['--once', '--check', '--watch', '--install', '--disable'].includes(command)) {
-    throw new Error('Use --once, --check, --watch, --install or --disable');
+  if (process.argv.length !== 3
+    || !['--once', '--check', '--watch', '--install', '--disable', '--update', '--apply-update'].includes(command)) {
+    throw new Error('Use --once, --check, --watch, --install, --disable, --update or --apply-update');
   }
   let result;
   if (command === '--check') result = await readState();
   if (command === '--install') result = await install();
   if (command === '--disable') result = await disable();
-  if (command === '--watch') result = await watch();
+  if (command === '--watch') {
+    const { dataDir } = windowsPaths();
+    result = await watch({
+      updateCheck: true,
+      applyUpdate: async (files, dir) => ({ staged: await stageWindowsUpdate(files, dir) }),
+    });
+  }
+  if (command === '--apply-update') {
+    const stage = process.env.KCT_WINDOWS_UPDATE_STAGE;
+    if (!stage) throw new Error('KCT_WINDOWS_UPDATE_STAGE is required');
+    // Run from the freshly downloaded copy, so installing it cannot be
+    // interrupted by the very files being replaced.
+    result = await install({ bundleDir: stage });
+  }
+  if (command === '--update') {
+    const { dataDir } = windowsPaths();
+    const lock = await acquireLock(dataDir);
+    if (!lock) throw new Error('Another Windows runtime operation is in progress');
+    try {
+      result = await updateWindows({
+        dataDir,
+        applyUpdate: async (files) => applyWindowsUpdate(files, dataDir),
+      });
+    } finally { await lock.release(); }
+  }
   if (command === '--once') {
     const { dataDir } = windowsPaths();
     const lock = await acquireLock(dataDir);
     if (!lock) throw new Error('Another Windows runtime operation is in progress');
-    try { result = await tick(); } finally { await lock.release(); }
+    try {
+      result = await tick({
+        updateCheck: true,
+        applyUpdate: async (files) => applyWindowsUpdate(files, dataDir),
+      });
+    } finally { await lock.release(); }
   }
   console.log(JSON.stringify(result));
   if (result?.status === 'error') process.exitCode = 1;

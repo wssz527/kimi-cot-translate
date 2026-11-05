@@ -5,8 +5,8 @@ import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/
 import { tmpdir } from 'node:os';
 import { basename, join, win32 } from 'node:path';
 import {
-  acquireLock, assertPlatform, bridgeRequest, commandLineArgs, disable, findProcesses,
-  install, readState, selectProcesses, taskRequest, tick,
+  acquireLock, applyWindowsUpdate, assertPlatform, bridgeRequest, commandLineArgs, disable,
+  findProcesses, install, readState, selectProcesses, taskRequest, tick, updateWindows,
   verifyApp, verifyBinary, watch, windowsPaths,
 } from './runtime-windows.mjs';
 
@@ -622,4 +622,113 @@ test('scheduled tasks are per-user limited and never request forced termination'
   const allowlist = JSON.parse(await readFile(new URL('./supported-windows-runtimes.json', import.meta.url), 'utf8'));
   assert.equal(allowlist[0].sha256, '9c6aac3196d3fb2a62e3ff67e6add9f24238efddf661cfcc7088b120f7e478e9');
   assert.equal(allowlist[0].electron, '43.1.1');
+});
+
+test('a newer Windows release is downloaded with every file the bundle needs', async () => {
+  const { createHash } = await import('node:crypto');
+  const required = ['runtime-windows.mjs', 'runtime.mjs', 'runtime-hook.mjs', 'runtime-update.mjs',
+    'windows-bridge.ps1', 'supported-windows-runtimes.json', 'supported-runtimes.json', 'kct.js'];
+  const bodies = Object.fromEntries(required.map((name) => [name, `new ${name}`]));
+  const files = Object.fromEntries(Object.entries(bodies)
+    .map(([name, text]) => [name, createHash('sha256').update(Buffer.from(text)).digest('hex')]));
+  assert.deepEqual(Object.keys(files).sort(), [...required].sort(),
+    'the Windows manifest has to list the loader itself, not just the shared files');
+  const applied = [];
+  const result = await updateWindows({
+    currentVersion: '0.2.6',
+    dataDir: 'C:\\Data',
+    resolveUpdateFn: async (from) => ({ available: true, current: from, remote: '0.2.7',
+      manifest: { version: '0.2.7', base: 'https://example.test', files } }),
+    fetchImpl: async (url) => ({ ok: true, arrayBuffer: async () => Buffer.from(bodies[url.split('/').pop()]) }),
+    applyUpdate: async (downloaded, dataDir) => { applied.push({ size: downloaded.size, dataDir }); },
+  });
+  assert.equal(result.updated, true);
+  assert.equal(result.to, '0.2.7');
+  assert.equal(applied.length, 1);
+  assert.equal(applied[0].size, required.length);
+});
+
+test('an up-to-date Windows install downloads and installs nothing', async () => {
+  let fetched = 0;
+  const result = await updateWindows({
+    currentVersion: '0.2.7',
+    dataDir: 'C:\\Data',
+    resolveUpdateFn: async (from) => ({ available: false, current: from, remote: '0.2.7' }),
+    fetchImpl: async () => { fetched += 1; throw new Error('no download expected'); },
+    applyUpdate: async () => { throw new Error('no install expected'); },
+  });
+  assert.equal(result.updated, false);
+  assert.equal(result.reason, 'up-to-date');
+  assert.equal(fetched, 0);
+});
+
+test('a failed update check is recorded without stopping attachment', async (t) => {
+  const f = tickFixture();
+  f.options.updateCheck = true;
+  f.options.resolveUpdateFn = async () => { throw new Error('manifest unreachable'); };
+  const state = await tick(f.options);
+  assert.equal(state.status, 'active');
+  assert.equal(state.updateStatus, 'failed');
+  assert.match(state.updateError, /manifest unreachable/);
+  assert.equal(f.installs(), 1);
+});
+
+test('one Kimi launch checks for updates once, and only while it is running', async (t) => {
+  const f = tickFixture();
+  f.options.updateCheck = true;
+  let checks = 0;
+  f.options.resolveUpdateFn = async (from) => {
+    checks += 1;
+    return { available: false, current: from, remote: '0.2.7' };
+  };
+  const first = await tick(f.options);
+  assert.equal(checks, 1);
+  assert.equal(first.updateStatus, 'up-to-date');
+  await tick(f.options);
+  assert.equal(checks, 1, 'the same launch must not re-check');
+  const idle = tickFixture();
+  idle.options.updateCheck = true;
+  idle.options.resolveUpdateFn = async () => { throw new Error('no network while Kimi is closed'); };
+  idle.setFound([]);
+  const waiting = await tick(idle.options);
+  assert.equal(waiting.status, 'waiting');
+});
+
+test('the update is staged outside the running bundle and applied detached', async (t) => {
+  const dataDir = await temporary(t);
+  const files = new Map([['runtime-windows.mjs', Buffer.from('loader')]]);
+  assert.equal(await applyWindowsUpdate(files, dataDir), true);
+  const stages = (await readdir(dataDir)).filter((name) => name.startsWith('.update-stage-'));
+  assert.equal(stages.length, 1, 'the detached installer needs a copy it owns');
+  await rm(join(dataDir, stages[0]), { recursive: true, force: true });
+});
+
+test('the watcher stages an update and hands it off only after releasing the lock', async (t) => {
+  const root = await temporary(t);
+  const dataDir = join(root, 'data');
+  await mkdir(dataDir, { recursive: true });
+  const staged = join(dataDir, '.update-stage-fixture');
+  let ticks = 0;
+  const states = [];
+  const result = await watch({
+    localAppData,
+    dataDir,
+    bundleDir: root,
+    statFile: async () => { const error = new Error('missing'); error.code = 'ENOENT'; throw error; },
+    readFile: async (file) => {
+      if (String(file).endsWith('enabled.json')) return JSON.stringify({ entry: join(root, 'runtime-windows.mjs'), generation: 'g' });
+      return '{}';
+    },
+    sleep: async () => { if (++ticks > 6) throw new Error('watch did not stop'); },
+    logError: () => {},
+    tick: async () => {
+      states.push('tick');
+      return { status: 'active', updateStatus: 'staged', updateStage: staged };
+    },
+    spawnInstaller: (stage) => { states.push(`spawn:${stage}`); },
+  });
+  assert.equal(result.status, 'updating');
+  assert.equal(result.stage, staged);
+  assert.deepEqual(states, ['tick', `spawn:${staged}`],
+    'the installer must start only after the bundle lock is released');
 });

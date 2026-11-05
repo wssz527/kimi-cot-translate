@@ -224,13 +224,16 @@ The extension files live outside the official app, so a normal app update never 
 - The same holds across an Electron major version: the version number is used for status display only and never gates attachment. Kimi Code 1.3.1 went from Electron 43 to 45 with the structure untouched, and translation kept working.
 - Only when the injection capability or the structure really changes does translation stop and wait for adaptation. That is the "upstream broke, the author must fix it" case.
 
-The extension also follows its own releases, but **only while Kimi Code is running**: after each Kimi launch it checks the published update manifest once, downloads the runtime files when a newer version exists, verifies each SHA-256, and swaps them in atomically (rolling back on failure). The same Kimi process is never checked twice, and nothing touches the network while Kimi is closed. You can also trigger it manually:
+The extension also follows its own releases, but **only while Kimi Code is running**: after each Kimi launch it checks the published update manifest once, downloads the runtime files when a newer version exists, verifies each SHA-256, and swaps them in atomically (rolling back on failure). The same Kimi process is never checked twice, and nothing touches the network while Kimi is closed.
+
+Each entry has its own manifest: macOS reads `runtime-manifest.json`, Windows reads `runtime-manifest-windows.json` (which additionally lists `runtime-windows.mjs` and `windows-bridge.ps1`). On Windows the swap runs in a detached process that re-registers the scheduled task, because a script file that is currently executing cannot be replaced in place. Manual triggers:
 
 ```sh
-node runtime.mjs --update
+node runtime.mjs --update            # macOS
+node runtime-windows.mjs --update    # Windows
 ```
 
-The outcome lands in the `updateStatus` / `updateVersion` fields of `--check` (`up-to-date` / `installed` / `available` / `failed`); `updateCheckedFor` records which launch was already checked.
+The outcome lands in the `updateStatus` / `updateVersion` fields of `--check` (`up-to-date` / `installed` / `available` / `staged` / `failed`); `updateCheckedFor` records which launch was already checked.
 
 Why the hash allowlist still exists: a fully verified kernel takes the fast path and skips extra probing. An unknown hash no longer trips a hard stop; it falls through to the structural checks above. That is what keeps an official point release from breaking translation.
 

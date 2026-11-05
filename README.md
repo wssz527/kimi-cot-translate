@@ -226,13 +226,16 @@ node runtime-windows.mjs --disable
 - 跨 Electron 大版本同样如此：版本号本身不参与判断，只用于状态展示。Kimi Code 1.3.1 从 Electron 43 升到 45 时就是这种情况，结构没变、翻译照常。
 - 只有注入能力或结构真的变了，翻译才会停用并等待适配——这才是「上游坏了、需要我修」的情况。
 
-组件自身也会自动跟版，但**只在 Kimi Code 运行时**：每次 Kimi 启动后检查一次仓库发布的更新清单，发现新版本就下载运行时文件、逐个校验 SHA-256，通过后原子替换（失败自动回滚）。同一个 Kimi 进程不会重复检查；Kimi 关闭期间不发任何网络请求。也可以手动触发：
+组件自身也会自动跟版，但**只在 Kimi Code 运行时**：每次 Kimi 启动后检查一次仓库发布的更新清单，发现新版本就下载运行时文件、逐个校验 SHA-256，通过后原子替换（失败自动回滚）。同一个 Kimi 进程不会重复检查；Kimi 关闭期间不发任何网络请求。
+
+两个入口各用各的清单：macOS 读 `runtime-manifest.json`，Windows 读 `runtime-manifest-windows.json`（多出 `runtime-windows.mjs` 与 `windows-bridge.ps1`）。Windows 的替换由独立进程完成并重新注册计划任务，因为正在运行的脚本文件无法原地覆盖。手动触发：
 
 ```sh
-node runtime.mjs --update
+node runtime.mjs --update            # macOS
+node runtime-windows.mjs --update    # Windows
 ```
 
-停用状态会写在 `--check` 输出的 `updateStatus` / `updateVersion` 字段里（`up-to-date` / `installed` / `available` / `failed`），`updateCheckedFor` 记录已检查过的那次启动。
+更新状态写在 `--check` 输出的 `updateStatus` / `updateVersion` 字段里（`up-to-date` / `installed` / `available` / `staged` / `failed`），`updateCheckedFor` 记录已检查过的那次启动。
 
 为什么仍然保留哈希允许列表：完全验证过的内核走快速路径，跳过额外探测。未知哈希不再直接熔断，而是转入上面的结构校验——这是「不因官方小版本升级而中断」的关键改动。
 
