@@ -18,8 +18,8 @@ const INFO = {
   pid: 42, started: '2026-10-22T00:00:00.000Z', ownerSid: SID,
   executable: PATHS.executable, commandLine: `"${PATHS.executable}"`,
 };
-const FILES = ['runtime-windows.mjs', 'runtime.mjs', 'runtime-hook.mjs',
-  'windows-bridge.ps1', 'supported-windows-runtimes.json', 'kct.js'];
+const FILES = ['runtime-windows.mjs', 'runtime.mjs', 'runtime-hook.mjs', 'runtime-update.mjs',
+  'windows-bridge.ps1', 'supported-windows-runtimes.json', 'supported-runtimes.json', 'kct.js'];
 const CSS = ['think', 'think-head', 'think-body', 'think-body-inner', 'think-text']
   .map((name) => `.${name}{}`).join('');
 

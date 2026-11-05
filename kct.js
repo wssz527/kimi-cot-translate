@@ -49,6 +49,7 @@ const ctxs = new WeakMap();
 const cacheSizes = new WeakMap();
 const scheduled = new Set();
 let rafPending = 0;
+let flushTimer = 0;
 let cacheTimer = 0;
 let cacheFlushTimer = 0;
 let cacheDirty = false;
@@ -327,9 +328,16 @@ function customEndpointURL(endpoint) {
   if (!endpoint) throw new Error('custom endpoint not configured');
   let url;
   try { url = new URL(endpoint); } catch (_) { throw new Error('自定义端点地址无效'); }
-  const local = ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname);
+  // Plain HTTP is refused except where the traffic never leaves a machine or a
+  // private network. Loopback covers a local server; the RFC 1918 ranges cover a
+  // translation gateway running on another box in the same LAN, which a user may
+  // legitimately operate without a certificate.
+  const local = ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname)
+    || /^10\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(url.hostname)
+    || /^192\.168\.\d{1,3}\.\d{1,3}$/.test(url.hostname)
+    || /^172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}$/.test(url.hostname);
   if (url.protocol !== 'https:' && !(url.protocol === 'http:' && local)) {
-    throw new Error('远程自定义端点必须使用 HTTPS；仅本机地址允许 HTTP');
+    throw new Error('远程自定义端点必须使用 HTTPS；本机或局域网地址允许 HTTP');
   }
   return url;
 }
@@ -933,12 +941,20 @@ function schedule(ctx) {
   }
   scheduled.add(ctx);
   if (rafPending) return;
-  rafPending = requestAnimationFrame(() => {
+  const flush = () => {
     rafPending = 0;
+    clearTimeout(flushTimer);
+    flushTimer = 0;
     const batch = [...scheduled];
     scheduled.clear();
     for (const item of batch) void maybeRun(item);
-  });
+  };
+  // requestAnimationFrame is throttled to nothing while the window is hidden or
+  // minimised, and a block that was expanded in that state would never get its
+  // toolbar or translation. A timer keeps the same coalescing without depending
+  // on frames being produced.
+  rafPending = requestAnimationFrame(flush);
+  flushTimer = setTimeout(flush, 250);
 }
 
 function isOpen(think) {

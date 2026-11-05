@@ -16,8 +16,11 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const run = promisify(execFile);
 const hash = (bytes) => createHash('sha256').update(bytes).digest('hex');
 const TASK = 'KimiCoTTranslate-Windows';
-const FILES = ['runtime-windows.mjs', 'runtime.mjs', 'runtime-hook.mjs',
-  'windows-bridge.ps1', 'supported-windows-runtimes.json', 'kct.js'];
+// runtime.mjs imports runtime-update.mjs at module load, so the bundle has to
+// carry it and the macOS allowlist it reads; a missing file only surfaced once
+// the deployed copy was actually executed.
+const FILES = ['runtime-windows.mjs', 'runtime.mjs', 'runtime-hook.mjs', 'runtime-update.mjs',
+  'windows-bridge.ps1', 'supported-windows-runtimes.json', 'supported-runtimes.json', 'kct.js'];
 const BUNDLE_MARKER = '.kct-windows-bundle.json';
 const normalized = (value) => win32.resolve(value).toLowerCase();
 const fingerprint = async (file) => {
@@ -328,6 +331,24 @@ export async function cdpList(port = DEBUG_PORT, { fetchImpl = fetch, timeout = 
 
 // Injects once per document and per revision. Re-running against an already
 // injected page is a no-op so a second attach cannot duplicate the toolbar.
+//
+// The session is deliberately kept open: `Page.addScriptToEvaluateOnNewDocument`
+// belongs to the session that registered it, so closing the socket would undo the
+// very reload survival that makes translation come back after a refresh. The
+// caller owns the returned sessions and closes them on detach.
+const sessions = new Map();
+
+export function openRendererSessions() {
+  return [...sessions.values()];
+}
+
+export function closeRendererSessions() {
+  for (const entry of sessions.values()) {
+    try { entry.cdp.close(); } catch { /* already gone */ }
+  }
+  sessions.clear();
+}
+
 export async function installIntoRenderers(source, revision, {
   port = DEBUG_PORT, cdpListImpl = cdpList, openCdpImpl = openCdp,
 } = {}) {
@@ -336,18 +357,37 @@ export async function installIntoRenderers(source, revision, {
   const bootstrap = rendererBootstrap(source, revision);
   const injected = [];
   for (const target of targets) {
+    const existing = sessions.get(target.id);
+    if (existing && existing.revision === revision) {
+      // Already wired on this very page and revision; re-evaluating would only
+      // redeclare its top-level bindings.
+      const mounted = await existing.cdp.send('Runtime.evaluate',
+        { expression: 'typeof window.__kct', returnByValue: true }).catch(() => null);
+      injected.push({ url: target.url, loaded: mounted?.result?.value === 'object' });
+      continue;
+    }
+    if (existing) {
+      try { existing.cdp.close(); } catch { /* replaced below */ }
+      sessions.delete(target.id);
+    }
     const cdp = await openCdpImpl(target.webSocketDebuggerUrl);
     try {
       await cdp.send('Runtime.enable');
-      // Survives a reload of this renderer, matching the macOS hook's behaviour.
+      await cdp.send('Page.enable');
       await cdp.send('Page.addScriptToEvaluateOnNewDocument', { source: bootstrap });
       const result = await cdp.send('Runtime.evaluate',
         { expression: bootstrap, returnByValue: true, awaitPromise: true });
       if (result.exceptionDetails) throw new Error('Translation script failed in the renderer');
       const mounted = await cdp.send('Runtime.evaluate',
         { expression: 'typeof window.__kct', returnByValue: true });
-      injected.push({ url: target.url, loaded: mounted.result?.value === 'object' });
-    } finally { cdp.close(); }
+      const loaded = mounted.result?.value === 'object';
+      if (loaded) sessions.set(target.id, { cdp, url: target.url, revision });
+      else cdp.close();
+      injected.push({ url: target.url, loaded });
+    } catch (error) {
+      cdp.close();
+      throw error;
+    }
   }
   return { loaded: injected.filter((entry) => entry.loaded).length, renderers: injected };
 }

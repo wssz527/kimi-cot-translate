@@ -14,6 +14,7 @@
 
 ### 修复
 
+- **隐藏窗口不再导致翻译停滞**：工具栏显示与翻译调度原本只由 `requestAnimationFrame` 驱动，而 Chromium 在窗口最小化或处于后台时完全暂停 rAF（实测 `visibilityState: hidden` 时一帧都不产生）。因此展开思考块后界面毫无反应，看起来像没有挂载。改为 rAF + 250ms 定时器兜底，并保留原有合并行为。
 - **Windows 注入改为 CDP**：早期实现依赖 `process._debugProcess(pid)`，它要求目标进程注册 `node-debug-handler`，而真实安装的 Kimi Code 并不注册，调用直接失败（`系统找不到指定的文件`）。改为通过 `--remote-debugging-port` 直接注入渲染进程，并在真机（Kimi Code 1.3.1）验证译文正确显示。
 - **Windows 不再要求官方签名**：本插件是免费的第三方显示层工具，宿主是否由官方签名与翻译能力无关。证书轮换曾导致整个 Windows 端失效，现改为记为 `signature` 字段仅供参考。
 - **Windows 允许非标准安装路径**：安装器可指向其他盘符，加载器按实际目录识别，进程发现使用同一路径。

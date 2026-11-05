@@ -1,10 +1,12 @@
-# kimi-cot-translate v0.2.5
+# kimi-cot-translate v0.2.6
 
-这个版本修的是 Windows 端：翻译在真实安装上从未成功挂载过，原因是注入机制的前提假设不成立。
+这个版本修的是 Windows 端：注入机制换成 CDP，并解决了隐藏窗口下翻译停摆的问题。
 
 > **Unofficial community project.** Not affiliated with, endorsed, or sponsored by Moonshot AI. "Kimi" and "Kimi Code" are trademarks of their respective owners. Provided as-is, without warranty; may stop working after a host update.
 
 ## 这次改了什么
+
+**隐藏窗口不再让翻译停摆。** 工具栏显示和翻译调度原本只由 `requestAnimationFrame` 驱动。Chromium 在窗口最小化或处于后台时会把 rAF 完全暂停（实测 `visibilityState: hidden` 时一帧都不产生），于是展开思考块后界面毫无反应——插件其实已经挂载（`window.__kct` 存在、上下文就绪），只是驱动它的帧循环停了。现在改为 rAF + 250ms 定时器兜底，原来的合并行为不变。
 
 **Windows 注入换成 CDP，并在真机跑通。** 原实现调用 `process._debugProcess(pid)` 去触发主进程的 Node inspector，前提是宿主像普通 Node 进程那样注册 `node-debug-handler-<pid>`。在真实安装的 Kimi Code 1.3.1 上这个注册并不存在，调用直接报「系统找不到指定的文件」；同一台机器对普通 Node 子进程调用则成功，所以不是 Node 版本问题，而是这条链路对 Electron 应用不成立。
 
@@ -47,9 +49,9 @@ shasum -a 256 -c SHA256SUMS.txt
 
 | 附件 | 用途 |
 | --- | --- |
-| `kimi-cot-translate-v0.2.5.zip` | 完整源码 + 预构建产物（桌面端 `node runtime.mjs --install` 入口） |
-| `kct-browser-v0.2.5.zip` | Chromium 浏览器扩展（解压后「加载已解压的扩展程序」） |
-| `kct-copied-thinking-v0.2.5.vsix` | VS Code 复制预览（`Extensions: Install from VSIX...`） |
+| `kimi-cot-translate-v0.2.6.zip` | 完整源码 + 预构建产物（桌面端 `node runtime.mjs --install` 入口） |
+| `kct-browser-v0.2.6.zip` | Chromium 浏览器扩展（解压后「加载已解压的扩展程序」） |
+| `kct-copied-thinking-v0.2.6.vsix` | VS Code 复制预览（`Extensions: Install from VSIX...`） |
 | `SHA256SUMS.txt` | 上述附件的 SHA-256 校验 |
 
 需要 Node.js 24。macOS 上已安装的用户由自更新自动升级；Windows 端目前没有自更新通道，需要重新解压并执行 `node runtime-windows.mjs --install`。
@@ -59,7 +61,7 @@ shasum -a 256 -c SHA256SUMS.txt
 | 入口 | 状态 |
 | --- | --- |
 | 桌面端 macOS arm64 | 真实翻译已验证（Kimi Code 1.3.1 / Electron 45.1.0、1.1.2 与 1.1.1 / Electron 43.1.1） |
-| 桌面端 Windows x64 | **真机已验证**：Kimi Code 1.3.1 上挂载成功并正确显示中文译文（需 `--remote-debugging-port`） |
+| 桌面端 Windows x64 | **真机已验证**：Kimi Code 1.3.1 上展开思考块后原文隐藏、中文译文显示（需 `--remote-debugging-port`） |
 | CLI 翻译终端 | 真实模型与 Bing 翻译已验证 |
 | 浏览器扩展（Kimi Code Web） | 官方 2.1.1 真实会话实测通过 |
 | 浏览器扩展（kimi.com） | 实验实现，未在登录会话验收 |
