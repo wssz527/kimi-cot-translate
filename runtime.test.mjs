@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -907,4 +908,33 @@ test('the installed LaunchAgent wakes on Kimi activity, never on a timer', async
   assert.match(plist, /<key>WatchPaths<\/key>/);
   assert.match(plist, /kimi-code-app/);
   assert.match(plist, /<key>RunAtLoad<\/key><true\/>/);
+});
+
+test('an unreachable canonical host falls back to the CDN mirror', async () => {
+  const { downloadBundle, fetchManifest, mirrorUrl, MANIFEST_MIRRORS } = await import('./runtime-update.mjs');
+  const seen = [];
+  const fetchImpl = async (url) => {
+    seen.push(url);
+    if (url.includes('raw.githubusercontent.com')) throw Object.assign(new Error('timeout'), { name: 'TimeoutError' });
+    return { ok: true, arrayBuffer: async () => Buffer.from(`mirrored ${url.split('/').pop()}`) };
+  };
+  const files = Object.fromEntries(['runtime.mjs', 'runtime-hook.mjs', 'runtime-update.mjs',
+    'supported-runtimes.json', 'kct.js'].map((name) => [name,
+    createHash('sha256').update(Buffer.from(`mirrored ${name}`)).digest('hex')]));
+  const fetched = await fetchManifest('https://raw.githubusercontent.com/wssz527/kimi-cot-translate/main/runtime-manifest.json', {
+    fetchImpl, files,
+  }).catch(() => null);
+  assert.equal(fetched, null, 'the fixture returns file bytes, not JSON');
+  assert.deepEqual(seen.slice(0, 2), [
+    'https://raw.githubusercontent.com/wssz527/kimi-cot-translate/main/runtime-manifest.json',
+    MANIFEST_MIRRORS['https://raw.githubusercontent.com/wssz527/kimi-cot-translate/main/runtime-manifest.json'][0],
+  ], 'the canonical host is tried first, then the mirror');
+  const bundle = await downloadBundle({
+    version: '0.2.8', base: 'https://raw.githubusercontent.com/wssz527/kimi-cot-translate/v0.2.8', files,
+  }, { fetchImpl });
+  assert.equal(bundle.size, 5);
+  assert.ok([...bundle.values()].every((bytes) => bytes.toString().startsWith('mirrored')));
+  assert.equal(mirrorUrl('https://raw.githubusercontent.com/wssz527/kimi-cot-translate/v0.2.8/kct.js'),
+    'https://cdn.jsdelivr.net/gh/wssz527/kimi-cot-translate@v0.2.8/kct.js');
+  assert.equal(mirrorUrl('https://example.test/kct.js'), null);
 });

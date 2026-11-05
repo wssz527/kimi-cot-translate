@@ -16,6 +16,8 @@
 - 计划任务持有的 watcher 不能自己安装（它整场持有 bundle 锁），所以它只负责暂存，然后退出循环、释放锁，再交给独立进程接手。
 - 也可以手动执行 `node runtime-windows.mjs --update`。
 
+**更新源增加国内可直连的镜像。** 在你的 Windows 真机上，`raw.githubusercontent.com` 的 443 端口能连上但 HTTPS 请求超时——典型的大陆网络情况。这意味着即使自动更新接好了，用户也拉不到东西。现在清单和每个运行时文件都先试官方域名，失败后自动改用 jsDelivr 镜像，下载内容仍逐个校验 SHA-256，镜像被篡改也装不进去。
+
 **顺带修复了 Windows 生命周期锁的并发竞争。** 两个加载器同时抢锁时，Windows 对「正在创建或正在删除」的目录返回 `EPERM` / `EACCES` / `ENOTEMPTY`，而代码此前只认 `EEXIST`，其余直接上抛。CI 上的表现是 `EPERM: operation not permitted, mkdir .runtime-lock.reclaim`；实机则可能让计划任务在输掉一次竞争后写出 error 状态。现在这几种都按「别人拿着锁」处理。
 
 **macOS 不再要求官方签名。** 此前会校验 `codesign --verify --deep --strict` 以及签名主体；一旦官方轮换证书、或你装的是被重签的构建，即使 inspector fuse 和思考区块结构都完好，插件也会永久停用。而这三件事里只有后两件真正决定能不能翻译。签名现在只写进 `signature` 字段供诊断。
@@ -46,7 +48,7 @@ macOS 桌面端不需要这个参数。
 
 ## 验证
 
-- 全量回归：主套件 140、macOS 加载器 42、Windows 加载器 32、VS Code 12，全部通过。
+- 全量回归：主套件 140、macOS 加载器 43、Windows 加载器 34、VS Code 12，全部通过。
 - macOS 真机（Kimi Code 1.3.1 / Electron 45.1.0）：`--install` 后 `--once` 返回 `status: active`、`loaded: 1`、`appVersion: 1.3.1`；自动更新把 `updateVersion` 从 0.2.2 提升到 0.2.7 并成功替换运行时文件。
 - Windows 真机（Kimi Code 1.3.1，Windows 11，局域网内实机）：CDP 挂载返回 `status: active`、`loaded: 1`；用 DeepSeek 产生真实思考内容后，原文节点 `display: none`、译文节点 `display: block`，内容为真实中文。
 
@@ -55,6 +57,6 @@ macOS 桌面端不需要这个参数。
 ## 升级方式
 
 - 已安装本插件（macOS）：运行时自更新会自动拉到 0.2.8，也可以 `node runtime.mjs --update`。
-- 已安装本插件（Windows）：从 0.2.8 起才会自动跟版，**这次仍需手动装一次**——执行 `node runtime-windows.mjs --install` 覆盖安装，此后就会自动更新。
+- 已安装本插件（Windows）：从 0.2.8 起才会自动跟版，**这次仍需手动装一次**——执行 `node runtime-windows.mjs --install` 覆盖安装，此后就会自动更新。旧版本没有更新代码，也只能手动装。
 - 首次安装：下载 `kimi-cot-translate-v0.2.8.zip`，按 README 的 macOS / Windows 章节操作。
 - 浏览器扩展与 VS Code 附件不会自动更新，需重新下载 `kct-browser-v0.2.8.zip` / `kct-copied-thinking-v0.2.8.vsix`。

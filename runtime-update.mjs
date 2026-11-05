@@ -14,6 +14,26 @@ export const WINDOWS_RUNTIME_FILES = ['runtime-windows.mjs', 'runtime.mjs', 'run
   'supported-runtimes.json', 'kct.js'];
 export const DEFAULT_MANIFEST = 'https://raw.githubusercontent.com/wssz527/kimi-cot-translate/main/runtime-manifest.json';
 export const DEFAULT_WINDOWS_MANIFEST = 'https://raw.githubusercontent.com/wssz527/kimi-cot-translate/main/runtime-manifest-windows.json';
+// raw.githubusercontent.com is unreachable from a plain China Telecom /
+// Unicom / Mobile connection: TCP 443 connects but the TLS request times out.
+// jsDelivr serves the same tagged files and does resolve, so the updater tries
+// the canonical host first and falls back to the CDN rather than leaving those
+// users stranded on whatever version they installed.
+export const MANIFEST_MIRRORS = {
+  'https://raw.githubusercontent.com/wssz527/kimi-cot-translate/main/runtime-manifest.json':
+    ['https://cdn.jsdelivr.net/gh/wssz527/kimi-cot-translate@main/runtime-manifest.json'],
+  'https://raw.githubusercontent.com/wssz527/kimi-cot-translate/main/runtime-manifest-windows.json':
+    ['https://cdn.jsdelivr.net/gh/wssz527/kimi-cot-translate@main/runtime-manifest-windows.json'],
+};
+const RAW_PREFIX = 'https://raw.githubusercontent.com/wssz527/kimi-cot-translate/';
+const CDN_PREFIX = 'https://cdn.jsdelivr.net/gh/wssz527/kimi-cot-translate@';
+
+// Rewrites a raw.githubusercontent.com URL onto the CDN, keeping the ref and the
+// path, so a downloaded bundle can come from whichever host answers.
+export function mirrorUrl(url) {
+  if (!url.startsWith(RAW_PREFIX)) return null;
+  return CDN_PREFIX + url.slice(RAW_PREFIX.length);
+}
 const HASH_RE = /^[a-f0-9]{64}$/;
 const VERSION_RE = /^\d+\.\d+\.\d+$/;
 
@@ -50,10 +70,24 @@ export function validateManifest(manifest, required = RUNTIME_FILES) {
   return manifest;
 }
 
+async function fetchWithMirrors(url, { fetchImpl, timeoutMs, mirrors = [] }) {
+  const attempts = [url, ...(mirrors.length ? mirrors : [mirrorUrl(url)]).filter(Boolean)];
+  let last;
+  for (const target of attempts) {
+    try {
+      const response = await fetchImpl(target, { signal: AbortSignal.timeout(timeoutMs), redirect: 'follow' });
+      if (!response.ok) throw new Error(`request failed with ${response.status}`);
+      return response;
+    } catch (error) { last = error; }
+  }
+  throw last;
+}
+
 export async function fetchManifest(url = DEFAULT_MANIFEST,
-  { fetchImpl = fetch, timeoutMs = 10000, files = RUNTIME_FILES } = {}) {
-  const response = await fetchImpl(url, { signal: AbortSignal.timeout(timeoutMs), redirect: 'follow' });
-  if (!response.ok) throw new Error(`Update manifest request failed with ${response.status}`);
+  { fetchImpl = fetch, timeoutMs = 10000, files = RUNTIME_FILES, mirrors } = {}) {
+  const response = await fetchWithMirrors(url, {
+    fetchImpl, timeoutMs, mirrors: mirrors ?? MANIFEST_MIRRORS[url] ?? [],
+  });
   return validateManifest(await response.json(), files);
 }
 
@@ -62,8 +96,7 @@ export async function downloadBundle(manifest,
   const files = new Map();
   for (const name of required) {
     const url = `${manifest.base.replace(/\/$/, '')}/${name}`;
-    const response = await fetchImpl(url, { signal: AbortSignal.timeout(timeoutMs), redirect: 'follow' });
-    if (!response.ok) throw new Error(`Update download failed for ${name}: ${response.status}`);
+    const response = await fetchWithMirrors(url, { fetchImpl, timeoutMs });
     const bytes = Buffer.from(await response.arrayBuffer());
     if (hashBytes(bytes) !== manifest.files[name]) {
       throw new Error(`Update download hash mismatch for ${name}; the release is left untouched`);

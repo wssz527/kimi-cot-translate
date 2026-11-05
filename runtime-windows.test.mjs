@@ -762,3 +762,28 @@ test('a completed install clears the staged copies it ran from', async (t) => {
   const left = (await readdir(dataDir)).filter((name) => name.startsWith('.update-stage-'));
   assert.deepEqual(left, [], 'a stale stage would leak a full runtime bundle per update');
 });
+
+test('a Windows update reaches the CDN when the canonical host is unreachable', async () => {
+  const { createHash } = await import('node:crypto');
+  const required = ['runtime-windows.mjs', 'runtime.mjs', 'runtime-hook.mjs', 'runtime-update.mjs',
+    'windows-bridge.ps1', 'supported-windows-runtimes.json', 'supported-runtimes.json', 'kct.js'];
+  const bodies = Object.fromEntries(required.map((name) => [name, `mirror ${name}`]));
+  const files = Object.fromEntries(Object.entries(bodies)
+    .map(([name, text]) => [name, createHash('sha256').update(Buffer.from(text)).digest('hex')]));
+  const asked = [];
+  const result = await updateWindows({
+    currentVersion: '0.2.7',
+    dataDir: 'C:\\Data',
+    resolveUpdateFn: async () => ({ available: true, current: '0.2.7', remote: '0.2.8',
+      manifest: { version: '0.2.8', base: 'https://raw.githubusercontent.com/wssz527/kimi-cot-translate/v0.2.8', files } }),
+    fetchImpl: async (url) => {
+      asked.push(url);
+      if (url.includes('raw.githubusercontent.com')) throw new Error('A TLS connection could not be established');
+      return { ok: true, arrayBuffer: async () => Buffer.from(bodies[url.split('/').pop()]) };
+    },
+    applyUpdate: async () => {},
+  });
+  assert.equal(result.updated, true);
+  assert.ok(asked.some((url) => url.startsWith('https://cdn.jsdelivr.net/gh/wssz527/kimi-cot-translate@v0.2.8/')),
+    'the same tagged files have to be reachable through the mirror');
+});
