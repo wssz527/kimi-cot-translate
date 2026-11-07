@@ -697,6 +697,7 @@ export async function deploy({
   fileStat = stat,
   commit,
   platformCheck = assertInstallPlatform,
+  retryDelayMs = 1000,
 } = {}) {
   platformCheck();
   await verify();
@@ -756,7 +757,21 @@ export async function deploy({
       await rm(plistNext, { force: true }).catch(() => {});
       throw error;
     }
-    await run('/bin/launchctl', ['bootstrap', `gui/${process.getuid()}`, plistPath]);
+    // A single failed bootstrap used to leave the agent unloaded: launchd
+    // occasionally refuses the first bootstrap right after a bootout, and the
+    // catch path only restored the plist file, not the running service. Retry
+    // before giving up — without the agent nothing checks for updates, so a
+    // failed re-registration silently pauses translation until it is noticed.
+    const bootstrap = () => run('/bin/launchctl', ['bootstrap', `gui/${process.getuid()}`, plistPath]);
+    try {
+      await bootstrap();
+    } catch (error) {
+      await sleep(retryDelayMs);
+      await bootstrap().catch((retryError) => {
+        retryError.firstError = error;
+        throw retryError;
+      });
+    }
     const completed = switched;
     switched = undefined;
     await (commit ? commit(completed) : completed.commit()).catch((commitError) => {

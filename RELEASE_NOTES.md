@@ -1,6 +1,6 @@
-# kimi-cot-translate v0.2.10
+# kimi-cot-translate v0.2.11
 
-这个版本把 Windows 缺失的自动更新补上了——在此之前，Windows 用户装完就一直停在旧版本，只有 macOS 会自己跟版。0.2.8 的更新清单被 CDN 缓存成了旧内容，导致更新必因哈希不匹配失败，因此改发 0.2.10；已装 0.2.8/0.2.9 的用户会收到一次正常更新。
+这个版本把 Windows 缺失的自动更新补上了——在此之前，Windows 用户装完就一直停在旧版本，只有 macOS 会自己跟版。0.2.8 的更新清单被 CDN 缓存成了旧内容，导致更新必因哈希不匹配失败，因此改发 0.2.10。0.2.11 修复的是另一件事：官方升级 Kimi Code 时，LaunchAgent 重注册偶尔被 launchd 拒绝，后台任务从此停摆——11 月 7 日 Kimi Code 1.3.2 升级时就因此断了一天。现在 bootstrap 失败会自动重试，仍失败则回滚并恢复旧服务。
 
 > **Unofficial community project.** Not affiliated with, endorsed, or sponsored by Moonshot AI. "Kimi" and "Kimi Code" are trademarks of their respective owners. Provided as-is, without warranty; may stop working after a host update.
 
@@ -68,7 +68,7 @@ macOS 桌面端不需要这个参数。
 
 ## 升级方式
 
-- 已安装本插件（macOS）：运行时自更新会自动拉到 0.2.10，也可以 `node runtime.mjs --update`。
+- 已安装本插件（macOS）：运行时自更新会自动拉到 0.2.11，也可以 `node runtime.mjs --update`。
 - 已安装本插件（Windows）：从 0.2.8 起才会自动跟版，**这次仍需手动装一次**——执行 `node runtime-windows.mjs --install` 覆盖安装，此后就会自动更新。旧版本没有更新代码，也只能手动装。
-- 首次安装：下载 `kimi-cot-translate-v0.2.10.zip`，按 README 的 macOS / Windows 章节操作。
-- 浏览器扩展与 VS Code 附件不会自动更新，需重新下载 `kct-browser-v0.2.10.zip` / `kct-copied-thinking-v0.2.10.vsix`。
+- 首次安装：下载 `kimi-cot-translate-v0.2.11.zip`，按 README 的 macOS / Windows 章节操作。
+- 浏览器扩展与 VS Code 附件不会自动更新，需重新下载 `kct-browser-v0.2.11.zip` / `kct-copied-thinking-v0.2.11.vsix`。

@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { EventEmitter } from 'node:events';
+import { existsSync } from 'node:fs';
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -505,6 +506,7 @@ const deployDeps = (fixture, calls, overrides = {}) => ({
   platformCheck: () => {},
   verify: async () => {},
   acquire: async () => ({ release: async () => {} }),
+  retryDelayMs: 0,
   run: async (_command, args) => {
     calls.push(args[0]);
     if (args[0] === 'print' && overrides.loadCheck) overrides.loadCheck();
@@ -522,7 +524,9 @@ test('a failed bootstrap restores the old plist and old bundle', async (t) => {
     /bootstrap failed/);
   assert.equal(await readFile(fixture.plistPath, 'utf8'), oldPlist);
   assert.equal(await readFile(join(fixture.dataDir, 'runtime.mjs'), 'utf8'), 'old loader');
-  assert.deepEqual(calls, ['print', 'bootout', 'bootstrap', 'bootstrap']);
+  // A first bootstrap can be refused right after a bootout, so it retries once
+  // before rolling back — both attempts must appear.
+  assert.deepEqual(calls, ['print', 'bootout', 'bootstrap', 'bootstrap', 'bootstrap']);
 });
 
 test('a failed bootout does not switch files, and failed first install leaves no plist', async (t) => {
@@ -541,7 +545,7 @@ test('a failed bootout does not switch files, and failed first install leaves no
   await assert.rejects(deploy(deployDeps(fresh, freshCalls,
     { failWhen: (verb) => verb === 'bootstrap' })), /bootstrap failed/);
   await assert.rejects(readFile(fresh.plistPath), { code: 'ENOENT' });
-  assert.deepEqual(freshCalls, ['bootstrap']);
+  assert.deepEqual(freshCalls, ['bootstrap', 'bootstrap']);
 });
 
 test('installation reports a busy shared lock instead of deploying', async (t) => {
@@ -668,17 +672,24 @@ test('a failed plist restore keeps its backup and leaves the job stopped', async
   const calls = [];
   await assert.rejects(deploy({
     ...deployDeps(fixture, calls),
+    // Both bootstrap attempts must fail, so the plist restore path is reached
+    // even with the retry in place; the restore then hits a directory where the
+    // plist was, keeping the backup on disk.
     run: async (_command, args) => {
       calls.push(args[0]);
-      if (args[0] === 'bootstrap') {
+      // The second attempt is where the plist gets clobbered: after the first
+      // failure the restore already put the backup back, so breaking it here is
+      // what makes the final restore fail.
+      if (args[0] === 'bootstrap' && calls.filter((c) => c === 'bootstrap').length >= 2) {
         await rm(fixture.plistPath);
         await mkdir(fixture.plistPath);
         throw new Error('bootstrap failed');
       }
+      if (args[0] === 'bootstrap') throw new Error('bootstrap failed');
     },
-  }), (error) => error.message === 'bootstrap failed' && !!error.plistRestoreError);
+  }), (error) => /bootstrap failed/.test(error.message) && !!error.plistRestoreError);
   assert.equal(await readFile(join(fixture.dataDir, '.runtime-plist.backup'), 'utf8'), 'original plist');
-  assert.deepEqual(calls, ['print', 'bootout', 'bootstrap']);
+  assert.deepEqual(calls, ['print', 'bootout', 'bootstrap', 'bootstrap']);
 });
 
 // ---------------------------------------------------------------------------

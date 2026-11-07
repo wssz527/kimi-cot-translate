@@ -6,6 +6,12 @@
 
 ## [Unreleased]
 
+## [0.2.11] - 2026-11-08
+
+### 修复
+
+- **macOS 的 LaunchAgent 重注册失败会自动重试**：官方升级触发 `--update` 时，`deploy` 先 bootout 再 bootstrap；launchd 偶尔会拒绝 bootout 之后的第一次 bootstrap，而失败路径只回滚了 plist 文件、没有把服务装回来——后台任务从此停摆，既不挂载也不检查更新。Kimi Code 1.3.2 升级当晚就发生了整整一天。现在 bootstrap 失败会先重试一次，仍失败则回滚并重启旧服务。
+
 ## [0.2.10] - 2026-11-06
 
 ### 修复
