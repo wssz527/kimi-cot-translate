@@ -57,6 +57,7 @@ let cacheMemoryOnly = false;
 let queueTimer = 0;
 let cacheEpoch = 0;
 let setupPrompted = false;
+let booted = false;
 const requestControllers = new Set();
 
 // ---------------------------------------------------------------------------
@@ -1548,6 +1549,20 @@ function flushCache() {
 // boot
 // ---------------------------------------------------------------------------
 
+function health() {
+  const blocks = [...document.querySelectorAll(THINK)];
+  const contexts = blocks.map((block) => ctxs.get(block)).filter(Boolean);
+  return {
+    ready: booted,
+    enabled: state.settings.enabled,
+    blocks: blocks.length,
+    mounted: contexts.filter((ctx) => ctx.bar.isConnected).length,
+    unsupported: blocks.length - contexts.length,
+    translated: contexts.filter((ctx) => ctx.status.dataset.state === 'ok' && ctx.translatedSource).length,
+    failed: contexts.filter((ctx) => ctx.status.dataset.state === 'error').length,
+  };
+}
+
 function boot() {
   loadSettings();
   loadCache();
@@ -1569,6 +1584,7 @@ function boot() {
   window.addEventListener('pagehide', flushCache);
   window.addEventListener('pagehide', leavePage);
   window.addEventListener('beforeunload', flushCache);
+  booted = true;
 }
 
 if (typeof document === 'undefined') {
@@ -1582,5 +1598,5 @@ if (typeof document === 'undefined') {
   } else {
     boot();
   }
-  window.__kct = { state, mount, openPanel, resetAll, translateText, diagnose };
+  window.__kct = { state, mount, openPanel, resetAll, translateText, diagnose, health };
 }

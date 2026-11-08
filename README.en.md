@@ -57,7 +57,7 @@ You can also `git clone` this repository; the browser extension and VS Code arti
 
 Installation only sets up the extension's background loader. It does not force-quit or restart Kimi, and it does not modify the official installation package. The first install loads the translation layer into any already-running process that passes verification. When the extension is updated, pages that already loaded an older script pick up the new one on their next normal refresh or reopen; the installer never refreshes pages on its own.
 
-Node.js 24 for your architecture is required. Before running the installer, consider reading the verification flow in `runtime.mjs` (process identity → inspector fuse → renderer structure). The signature and the version number are recorded only and never gate attachment.
+Node.js 24 for your architecture is required. Before running the installer, consider reading the verification flow in `runtime.mjs` (official signature and team identity → process identity → inspector fuse → live page structure). A failed signature check stops attachment; the version number and packaged stylesheet names never decide compatibility.
 
 ### macOS
 
@@ -67,19 +67,31 @@ In a system terminal, enter this directory, confirm `node --version` prints `v24
 node runtime.mjs --install
 ```
 
-The installer verifies the official app and copies four runtime files into the current user's persistent directory:
+The installer verifies the official app, writes every runtime file into an immutable version directory, and installs a stable entry point that only launches the current version:
 
 ```text
 ~/Library/Application Support/kimi-cot-translate/
+├── runtime.mjs          stable launcher referenced by the LaunchAgent
+├── deployment.json      atomic version pointer (current / previous)
+└── versions/<sha256>/   hash-verified runtime copies
 ```
 
+A normal update only writes a new version directory and switches the pointer; it never re-registers the LaunchAgent. Only a launcher or service-configuration change runs a controlled migration. The automatic update path explicitly forbids migration, even when the service environment marker is missing or malformed; a release that requires migration keeps the current runtime and asks for `--install` from a terminal. A new version that fails its first start rolls back to the previous complete copy.
+
+Upgrading from v0.2.x needs no manual reinstall. That release kept five loose files with no version directory; the current runtime detects the layout and migrates it once:
+
+- The old files are stored as their own version, so a failed migration or a failed first start falls back to them.
+- The v0.2.x updater did not know about `runtime-launcher.mjs`, so it could replace the five files and leave no launcher behind. In that case the runtime checks the installed files against the published manifest, fetches the launcher, verifies its hash and writes it before importing it, then rebuilds the version directory and pointer. A failed download changes nothing and is retried on the next start.
+- Migration never unloads the background job: the entry path stays the file the LaunchAgent already references, and the job is only paused and re-registered by an explicit `--install`.
+
+The first start after migration is a candidate and only writes `healthyAt` once injection is confirmed live. If a Kimi window still runs the previous `kct.js`, `--doctor` reports `page.status: stale-renderer`; run `--refresh` or let the window reload normally.
 The background task lives at:
 
 ```text
 ~/Library/LaunchAgents/com.user.kimi-cot-translate.runtime.plist
 ```
 
-It runs once at login and afterwards is woken only when Kimi Code's user-data directory changes — that is, while Kimi is running. After opening Kimi Code normally, attachment usually completes within a dozen seconds. Once Kimi quits, that directory goes quiet and the background task is not woken at all: no polling, no resident process, no network access. The loader never starts or quits Kimi, and never creates a second Kimi instance.
+It runs once at login. While Kimi is running, changes under Kimi Code's user-data directory wake it immediately, and a low-frequency 60-second fallback covers missed directory events. After opening Kimi Code normally, attachment usually completes within a dozen seconds. While Kimi is closed the fallback still starts, but it only reads the local process table and state file: it is not resident, makes no network requests, and never starts or quits Kimi. The loader never creates a second Kimi instance.
 
 The installed copy is independent of this directory — moving the source afterwards does not affect it. The background task uses the absolute path of the Node that installed it; if you remove or move that Node, run the install command again.
 
@@ -182,7 +194,11 @@ Diagnostic records (`runtime-state.json`, `runtime.log`) contain no session text
 macOS:
 
 ```sh
-node "$HOME/Library/Application Support/kimi-cot-translate/runtime.mjs" --check
+D="$HOME/Library/Application Support/kimi-cot-translate"
+node "$D/runtime.mjs" --check     # history of the most recent background check
+node "$D/runtime.mjs" --doctor    # live install, service, process, injection, page and translation probe
+node "$D/runtime.mjs" --repair    # register the LaunchAgent again when it is missing
+node "$D/runtime.mjs" --refresh   # reload only pages whose renderer revision is behind
 ```
 
 Windows, in this repository directory:
@@ -191,12 +207,18 @@ Windows, in this repository directory:
 node runtime-windows.mjs --check
 ```
 
-The status is the record of the most recent background check:
+`--check` only reflects the most recent background check and cannot prove the current page is still mounted; use `--doctor` for a live conclusion. The diagnostic labels live evidence, historical records and unknown states separately, so a historical `active` is never presented as a current injection.
+
+The common background states are:
 
 - `active`, `loaded: 1`: the recorded PID finished attachment.
 - `waiting`: waiting for a normal instance to start, or for conditions such as multiple instances or a busy port to clear.
-- `error`: verification or attachment failed — read `detail`. Transient failures retry automatically with backoff; permanent incompatibility (the inspector fuse is disabled, the thinking-block structure changed) is never retried.
+- `error`: verification or attachment failed — read `detail`. Transient failures retry automatically with backoff; permanent incompatibility (the official signature or team identity fails, the inspector fuse is disabled) is never retried. Whether the page structure actually works is reported by `--doctor` as `page.status`.
 - `blocked-inspector` (macOS only): the debugging interface could not be confirmed closed — quit Kimi normally and check the log.
+
+`--doctor` reports the installation and version pointer, LaunchAgent registration and configuration, process discovery, hook injection, page mounting, translation results and the latest update. Every field is marked `live`, `history` or `unknown`, and it states whether the inspector was closed.
+
+When a page still runs an older `kct.js`, `page.status` is `stale-renderer` and `injection.staleRenderers` gives the count. `--refresh` reloads only those pages; settings and caches stay in localStorage. A reload interrupts unsaved view state, so run it only when needed.
 
 Status is stored in `runtime-state.json` under the per-user data directory (macOS also has `runtime.log`). The Windows data directory is `%LOCALAPPDATA%\kimi-cot-translate\windows`. These diagnostic records contain no session text or service keys.
 
@@ -216,15 +238,15 @@ The already-loaded translation layer disappears the next time Kimi quits normall
 
 ## After Kimi updates
 
-The extension files live outside the official app, so a normal app update never overwrites them. After a new process starts, the background task re-checks the running process and files, the injection capability and the thinking-block structure before attaching again.
+The extension files live outside the official app, so a normal app update never overwrites them. After a new process starts, the background task re-checks the running process and files, the official signature and injection capability, and confirms the thinking-block structure in the live page before attaching again.
 
-**Routine follow-up needs nothing from you.** What decides whether translation keeps working is the injection capability and the thinking-block structure, not version numbers:
+**Routine follow-up needs nothing from you.** What decides whether translation keeps working is the official signature, the injection capability and the live page structure, not version numbers:
 
-- If `.think`, `.think-head`, `.think-body`, `.think-body-inner` and `.think-text` are all still present after an official update, and the injection capability still holds, translation simply keeps working — no waiting for a release, no reinstall.
-- The same holds across an Electron major version: the version number is used for status display only and never gates attachment. Kimi Code 1.3.1 went from Electron 43 to 45 with the structure untouched, and translation kept working.
-- Only when the injection capability or the structure really changes does translation stop and wait for adaptation. That is the "upstream broke, the author must fix it" case.
+- If the official signature stays valid, the inspector still works, and the live page still exposes the thinking blocks after an official update, translation simply keeps working — no waiting for a release, no reinstall.
+- The same holds across an Electron major version: the version number is used for status display only and never gates attachment. Kimi Code 1.3.1 went from Electron 43 to 45 with signature and structure untouched, and translation kept working.
+- Only when the official signature, the injection capability or the live page structure really changes does translation stop and wait for adaptation. That is the "upstream broke, the author must fix it" case.
 
-The extension also follows its own releases, but **only while Kimi Code is running**: after each Kimi launch it checks the published update manifest once, downloads the runtime files when a newer version exists, verifies each SHA-256, and swaps them in atomically (rolling back on failure). The same Kimi process is never checked twice, and nothing touches the network while Kimi is closed.
+The extension also follows its own releases, but **only while Kimi Code is running**: after each Kimi launch it checks the published update manifest once, downloads the runtime files when a newer version exists, verifies each SHA-256, writes a new version directory and atomically switches the pointer. A new version is marked healthy only after a real injection confirmation; otherwise it returns to `previous`. A normal file update never re-registers the LaunchAgent, and the automatic path forbids migration; if a launcher or service-configuration change is required, the current runtime keeps running and the update asks for `--install` from a terminal. The same Kimi process is never checked twice, and nothing touches the network while Kimi is closed.
 
 Each entry has its own manifest: macOS reads `runtime-manifest.json`, Windows reads `runtime-manifest-windows.json` (which additionally lists `runtime-windows.mjs` and `windows-bridge.ps1`). On Windows the swap is installed from a staged copy and re-registers the scheduled task, because a script file that is currently executing cannot be replaced in place.
 
@@ -235,16 +257,18 @@ node runtime.mjs --update            # macOS
 node runtime-windows.mjs --update    # Windows
 ```
 
-The outcome lands in the `updateStatus` / `updateVersion` fields of `--check` (`up-to-date` / `installed` / `available` / `staged` / `failed`); `updateCheckedFor` records which launch was already checked.
+The outcome lands in the `updateStatus` / `updateVersion` fields of `--check` (`up-to-date` / `available` / `staged` / `failed`); `updateCheckedFor` records which launch was already checked.
 
-Why the hash allowlist still exists: a fully verified kernel takes the fast path and skips extra probing. An unknown hash no longer trips a hard stop; it falls through to the structural checks above. That is what keeps an official point release from breaking translation.
+Why the hash allowlist still exists: a fully verified kernel takes the fast path and skips extra probing. An unknown hash no longer trips a hard stop; it still has to pass the official signature and inspector fuse checks. The packaged stylesheet is auxiliary evidence only; the live page is inspected after attachment. That is what keeps an official point release from breaking translation.
 
 Symptom cheat sheet:
 
 | Symptom | Likely cause | What to do |
 | --- | --- | --- |
-| Translation gone after update; detail says `reasoning UI changed` | Thinking-block structure changed | File a compatibility report and wait for an adaptation release |
-| detail says `reasoning UI changed`, or the fuse is disabled | Official package structure or debugging capability changed | Same as above; never bypass manually |
+| detail says `signature or signing identity` | The official signature or team identity could not be verified | Confirm the official app is intact; if the vendor rotated its certificate, wait for an updated signature requirement |
+| `--doctor` reports `page.status: stale-renderer` | The page still runs an older `kct.js` | Run `--refresh`, or reload the page manually |
+| `--doctor` reports `page.status: unsupported-structure` | The thinking-block structure changed in the live page | File a compatibility report and wait for an adaptation release |
+| detail says the fuse is disabled | The vendor disabled the inspector capability | Attachment cannot be done safely; never bypass manually |
 | `blocked-inspector` | Debugging interface not confirmed closed | Quit Kimi normally, then read the log |
 
 This is not an officially supported stable extension API, and compatibility with future versions cannot be guaranteed. Only normal-restart recovery and page-refresh recovery have been verified so far; real cross-version upgrade acceptance has not been done. Static structure checks cannot prove that every interaction of a new version stays compatible.
@@ -254,6 +278,7 @@ During attachment, a localhost-only Node inspector is opened briefly (about 12 s
 ## Known limitations
 
 - Kimi Code 1.1.1 and 1.1.2 / Electron 43.1.1 are verified; cross-version upgrades, sleep/wake and long-running sessions are not yet accepted.
+- The host version never gates attachment; the official signature and team identity, process identity and inspector fuse do. Rotating the vendor certificate requires updating the signature requirement in code, and verification is never bypassed.
 - The Kimi desktop app (Kimi.app, com.moonshot.kimichat) is not supported: the official Electron binary ships with the Node inspector fuse disabled, so this project's runtime injection mechanism cannot attach, and this project will not patch official binaries to work around it. Kimi web (kimi.com) users should use the browser extension entry instead.
 - The kimi.com general chat page has not been verified in a logged-in session; the VS Code entry has not been verified inside a real extension host.
 - Translation uses public unauthenticated endpoints (Bing / Google) with no SLA; they may be rate-limited, change, or be governed by the providers' terms. For heavy or long-term use, prefer a custom service with your own credentials.

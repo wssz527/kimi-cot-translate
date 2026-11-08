@@ -3,13 +3,13 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { existsSync } from 'node:fs';
-import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, stat, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import vm from 'node:vm';
 import { assertIdentity, assertRendererContract, attachInspector, deploy, inspectorDeadlineExpression,
-  inspectFuses, parseProcess, permanentError, portOpen, rendererBootstrap, readBundle, saveState,
-  stageBundle, switchBundle, tick, verifyApp } from './runtime.mjs';
+  inspectFuses, launchOutcome, pageHealth, parseProcess, permanentError, portOpen, rendererBootstrap,
+  readBundle, saveState, stageBundle, tick, verifyApp } from './runtime.mjs';
 
 const startedUTC = (text) => {
   const [, month, day, time, year] = /\w{3} (\w{3}) (\d+) (\d{2}:\d{2}:\d{2}) (\d{4})/.exec(text);
@@ -21,7 +21,8 @@ const INFO = parseProcess(
   `85123 ${process.getuid()} Wed Oct 21 13:58:18 2026 /Applications/Kimi Code.app/Contents/MacOS/Kimi Code`,
   startedUTC,
 );
-const CORE_FILES = ['runtime.mjs', 'runtime-hook.mjs', 'runtime-update.mjs', 'supported-runtimes.json', 'kct.js'];
+const CORE_FILES = ['runtime.mjs', 'runtime-hook.mjs', 'runtime-update.mjs', 'runtime-launcher.mjs',
+  'supported-runtimes.json', 'kct.js'];
 
 function tickFixture() {
   let previous = {}, found = [INFO], installed = 0, verified = 0, saves = 0;
@@ -77,6 +78,39 @@ test('renderer bootstrap is scoped and idempotent without replacing stored setti
   assert.equal(window.boots, 1);
   assert.equal(window.__kctRuntimeRevision, 'test-revision');
   assert.equal(settings.get('kct:settings:v1'), '{"autoTranslate":false}');
+});
+
+test('launch outcomes separate success, waiting, retry and incompatibility', () => {
+  assert.equal(launchOutcome({ status: 'active', loaded: 1, inspectorClosed: true,
+    liveVerified: true }), 'success');
+  assert.equal(launchOutcome({ status: 'active', loaded: 0, inspectorClosed: true,
+    liveVerified: true }), 'failed');
+  assert.equal(launchOutcome({ status: 'waiting' }), 'waiting');
+  assert.equal(launchOutcome({ status: 'checking' }), 'transient');
+  assert.equal(launchOutcome({ status: 'error', failureKind: 'transient' }), 'transient');
+  assert.equal(launchOutcome({ status: 'error', failureKind: 'inspector-uncertain' }), 'failed');
+  assert.equal(launchOutcome({ status: 'error', failureKind: 'permanent' }), 'incompatible');
+  assert.equal(launchOutcome({ status: 'blocked-inspector', failureKind: 'transient' }), 'transient');
+  assert.equal(launchOutcome(null, Object.assign(new Error('x'), { failureKind: 'permanent' })), 'incompatible');
+  assert.equal(launchOutcome(null, new Error('x')), 'failed');
+});
+
+test('a historical active record can never confirm a candidate', () => {
+  const historical = { status: 'active', loaded: 1, inspectorClosed: true,
+    revision: 'same-revision', identity: 'same-identity', checkedAt: '2026-11-01T00:00:00.000Z' };
+  assert.equal(launchOutcome(historical), 'transient',
+    'without a live verification this run the outcome is not a success');
+  assert.equal(launchOutcome({ ...historical, liveVerified: false }), 'transient');
+  assert.equal(launchOutcome({ ...historical, liveVerified: true }), 'success');
+});
+
+test('renderer bootstrap never claims the new revision for an older mounted page', () => {
+  const window = { __kct: { old: true }, __kctRuntimeRevision: 'old' };
+  const context = vm.createContext({ window, localStorage: new Map(), console });
+  vm.runInContext(rendererBootstrap('window.__kct = { replaced: true };', 'new'), context);
+  assert.equal(window.__kct.old, true);
+  assert.equal(window.__kct.replaced, undefined);
+  assert.equal(window.__kctRuntimeRevision, 'old');
 });
 
 test('a changed reasoning UI is rejected even with a compatible Electron runtime', () => {
@@ -192,50 +226,48 @@ test('transient verification errors retry only after their backoff expires', asy
   assert.equal(f.installed(), 1);
 });
 
-test('an unsigned host still verifies, while fuse mismatches stay permanent', async () => {
-  const css = ['.think', '.think-head', '.think-body', '.think-body-inner', '.think-text']
-    .map((name) => `${name}{}`).join('');
+test('unsigned and untrusted hosts fail closed before attachment', async () => {
   const binary = Buffer.concat([Buffer.from('prefixdL7pKGdnNz796PbbjQWNKmHXBZaB9tsX'),
     Buffer.from([1, 9]), Buffer.from('101100001')]);
+  let calls = 0;
   const verification = {
     fingerprint: async () => 'file',
-    output: async (_cmd, args) => (args?.some((a) => a.includes(':CFBundleVersion')) ? '43.1.1\n' : '1.1.3\n'),
-    run: async () => ({ stderr: 'Identifier=com.kimi.code.desktop\nTeamIdentifier=2J9472RW75\n' }),
+    output: async () => '45.1.0',
+    run: async (_command, args) => {
+      calls++;
+      assert.ok(args.includes('--verify'));
+      assert.ok(args.includes('--deep'));
+      assert.ok(args.some((arg) => arg.includes('anchor apple generic') && arg.includes('com.kimi.code.desktop')));
+      return {};
+    },
     readFile: async (file) => {
       if (String(file).endsWith('supported-runtimes.json')) return '[]';
       if (String(file).endsWith('Electron Framework')) return binary;
-      if (String(file).endsWith('index.html')) return '<link href="/assets/main.css">';
-      return css;
+      return '';
     },
   };
-  // codesign failing, an unexpected identity, or no signature output at all are
-  // all reported rather than refused: this is a free third-party translator and
-  // the host's signature says nothing about whether translation can work. What
-  // still protects the attachment is the process identity check before any
-  // signal is sent.
-  const unsigned = await verifyApp({ ...verification,
-    run: async () => { throw Object.assign(new Error('invalid signature'), { code: 1 }); } });
-  assert.equal(unsigned.verified, 'contract');
-  assert.equal(unsigned.signature.status, 'unknown');
-  for (const stderr of ['Identifier=untrusted\n', '', 'Identifier=x\nTeamIdentifier=Y\n']) {
-    const signed = await verifyApp({ ...verification, run: async () => ({ stderr }) });
-    assert.equal(signed.verified, 'contract');
-    assert.equal(signed.signature.status, 'Valid');
-  }
   const identity = await verifyApp(verification);
-  assert.equal(identity.signature.identifier, 'com.kimi.code.desktop');
-  assert.ok(identity.signature.team);
+  assert.equal(identity.signature.status, 'valid');
+  assert.equal(identity.verified, 'capabilities');
+  assert.equal(calls, 1);
+  await assert.rejects(verifyApp({ ...verification, run: async () => { throw new Error('invalid'); } }),
+    { failureKind: 'permanent' });
+  await assert.rejects(verifyApp({ ...verification, run: async () => { throw Object.assign(new Error('timeout'), { killed: true }); } }),
+    { message: 'timeout' });
   assert.throws(() => inspectFuses(Buffer.from('unknown layout')), { failureKind: 'permanent' });
-  const f = tickFixture();
-  let checks = 0;
-  f.deps.verifyApp = async () => { checks++; throw permanentError('Unknown runtime hash'); };
-  const failed = await tick(f.deps);
-  assert.equal(failed.failureKind, 'permanent');
-  assert.equal(failed.nextRetryAt, null);
-  f.advance(86400000);
-  assert.deepEqual(await tick(f.deps), failed);
-  assert.equal(checks, 1);
-  assert.equal(f.installed(), 0);
+});
+
+test('a fresh official Desktop process after upgrade gets a new verified injection attempt', async () => {
+  const fixture = tickFixture();
+  const first = await tick(fixture.deps);
+  assert.equal(first.status, 'active');
+  const restarted = { ...INFO, pid: INFO.pid + 1, started: 'Wed Oct 21 14:08:18 2026',
+    startedAt: INFO.startedAt - 10000 };
+  fixture.setFound([restarted]);
+  const second = await tick(fixture.deps);
+  assert.equal(second.status, 'active');
+  assert.equal(second.pid, restarted.pid);
+  assert.equal(fixture.installed(), 2);
 });
 
 test('PID and process start changes each reset the retry budget', async () => {
@@ -408,74 +440,6 @@ test('unchanged active, waiting and failed states keep checkedAt and do not rewr
   }
 });
 
-test('a file failure during the switch restores the complete old deployment', async (t) => {
-  const root = await mkdtemp(join(tmpdir(), 'kct-deploy-test-'));
-  t.after(() => rm(root, { recursive: true, force: true }));
-  const dataDir = join(root, 'data');
-  await import('node:fs/promises').then(({ mkdir }) => mkdir(dataDir));
-
-  const oldFiles = new Map(CORE_FILES.map((name, index) => [name, Buffer.from(`old ${name} ${index}`)]));
-  const newFiles = new Map(CORE_FILES.map((name, index) => [name, Buffer.from(`new ${name} ${index}`)]));
-  for (const [name, bytes] of oldFiles) await writeFile(join(dataDir, name), bytes);
-  const stage = await stageBundle(dataDir, newFiles);
-
-  const { rename: realRename } = await import('node:fs/promises');
-  let renamedIntoData = 0;
-  const failOnInstalledFile = async (from, to) => {
-    if (from.startsWith(stage) && to.startsWith(dataDir) && ++renamedIntoData === 3) {
-      const error = new Error('simulated mid-switch failure');
-      error.code = 'EIO';
-      throw error;
-    }
-    return realRename(from, to);
-  };
-
-  await assert.rejects(
-    switchBundle({ dataDir, stageDir: stage, renameFile: failOnInstalledFile }),
-    /simulated mid-switch failure/,
-  );
-  assert.equal(renamedIntoData, 3);
-  for (const [name, expected] of oldFiles) {
-    assert.deepEqual(await readFile(join(dataDir, name)), expected, `${name} must be restored`);
-  }
-
-  await rm(stage, { recursive: true, force: true });
-  const leftovers = await import('node:fs/promises').then(({ readdir }) => readdir(dataDir));
-  assert.deepEqual(leftovers.sort(), [...CORE_FILES].sort());
-  assert.deepEqual((await import('node:fs/promises')
-    .then(({ readdir }) => readdir(root))).filter((name) => name.startsWith('.deploy')), []);
-});
-
-test('a failure while backing up leaves the old deployment intact', async (t) => {
-  const root = await mkdtemp(join(tmpdir(), 'kct-backup-failure-'));
-  t.after(() => rm(root, { recursive: true, force: true }));
-  const dataDir = join(root, 'data');
-  const { mkdir, rename: realRename } = await import('node:fs/promises');
-  await mkdir(dataDir);
-  const oldFiles = new Map(CORE_FILES.map((name) => [name, Buffer.from(`old ${name}`)]));
-  const newFiles = new Map(CORE_FILES.map((name) => [name, Buffer.from(`new ${name}`)]));
-  for (const [name, bytes] of oldFiles) await writeFile(join(dataDir, name), bytes);
-  const stage = await stageBundle(dataDir, newFiles);
-
-  let moved = 0;
-  const failDuringBackup = async (from, to) => {
-    if (from.startsWith(dataDir) && to.includes('.deploy-backup-') && ++moved === 2) {
-      throw new Error('backup failure');
-    }
-    return realRename(from, to);
-  };
-  await assert.rejects(
-    switchBundle({ dataDir, stageDir: stage, renameFile: failDuringBackup }),
-    /backup failure/,
-  );
-  for (const [name, expected] of oldFiles) {
-    assert.deepEqual(await readFile(join(dataDir, name)), expected, `${name} must remain old`);
-  }
-  await rm(stage, { recursive: true, force: true });
-  assert.deepEqual((await import('node:fs/promises')
-    .then(({ readdir }) => readdir(root))).filter((name) => name.startsWith('.deploy')), []);
-});
-
 test('the bundle reader rejects invalid allowlist data before staging', async (t) => {
   const root = await mkdtemp(join(tmpdir(), 'kct-read-test-'));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -490,218 +454,546 @@ async function deployFixture() {
   const dataDir = join(root, 'data');
   const plistPath = join(root, 'runtime.plist');
   await mkdir(dataDir);
-  await writeFile(join(dataDir, 'runtime-hook.mjs'), 'old hook');
-  await writeFile(join(dataDir, 'supported-runtimes.json'), 'old runtimes');
-  await writeFile(join(dataDir, 'kct.js'), 'old renderer');
-  await writeFile(join(dataDir, 'runtime.mjs'), 'old loader');
-  const files = new Map(CORE_FILES.map((name) => [name, Buffer.from(`new ${name}`)]));
+  const files = new Map(CORE_FILES.map((name) => [name, Buffer.from('export {};\n')]));
+  files.set('runtime.mjs', Buffer.from('process.exitCode = 0;\n'));
+  files.set('runtime-launcher.mjs', await readFile(new URL('./runtime-launcher.mjs', import.meta.url)));
+  files.set('supported-runtimes.json', Buffer.from(JSON.stringify([
+    { electron: '99.0.0', sha256: 'a'.repeat(64), validatedWithApp: '1.0.0' },
+  ])));
   return { root, dataDir, plistPath, files };
 }
 
-const deployDeps = (fixture, calls, overrides = {}) => ({
-  files: fixture.files,
-  dataDir: fixture.dataDir,
-  plistPath: fixture.plistPath,
-  label: 'test.runtime',
-  platformCheck: () => {},
-  verify: async () => {},
-  acquire: async () => ({ release: async () => {} }),
-  retryDelayMs: 0,
-  run: async (_command, args) => {
+function candidateRuntime(outcome, extra = {}) {
+  const fields = Object.entries({ outcome, ...extra })
+    .map(([key, value]) => `${JSON.stringify(key)}:${JSON.stringify(value)}`).join(',');
+  return `import { writeFile } from 'node:fs/promises';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
+const here = dirname(fileURLToPath(import.meta.url));
+await writeFile(join(here, '../../.last-run.json'), JSON.stringify({ id: process.env.KCT_LAUNCH_ID ?? null, ${fields} }));
+`;
+}
+
+async function switchCandidate(fixture, script) {
+  const { switchVersion, readDeployment } = await import('./runtime-launcher.mjs');
+  const next = new Map(fixture.files);
+  next.set('runtime.mjs', Buffer.from(script));
+  await switchVersion(fixture.dataDir, next);
+  return readDeployment(fixture.dataDir);
+}
+
+function agentFixture(fixture, initial = false) {
+  let loaded = initial;
+  const calls = [];
+  let bootstrapFailures = 0;
+  const run = async (command, args) => {
+    if (command === '/usr/bin/plutil') return JSON.stringify({ Label: 'test.runtime',
+      ProgramArguments: [process.execPath, join(fixture.dataDir, 'runtime.mjs'), '--once'],
+      RunAtLoad: true, StartInterval: 60 });
     calls.push(args[0]);
-    if (args[0] === 'print' && overrides.loadCheck) overrides.loadCheck();
-    if (overrides.failWhen?.(args[0])) throw new Error(`${args[0]} failed`);
-  },
-});
+    if (args[0] === 'print') {
+      if (!loaded) throw new Error('Could not find service test.runtime');
+      return `${process.execPath}\n${join(fixture.dataDir, 'runtime.mjs')}`;
+    }
+    if (args[0] === 'bootout') loaded = false;
+    if (args[0] === 'bootstrap') {
+      if (bootstrapFailures > 0) { bootstrapFailures--; throw new Error('bootstrap failed'); }
+      loaded = true;
+    }
+    return '';
+  };
+  return { calls, run, failBootstrap: (count) => { bootstrapFailures = count; }, loaded: () => loaded };
+}
 
-test('a failed bootstrap restores the old plist and old bundle', async (t) => {
+const deployDeps = (fixture, agent) => ({ files: fixture.files, dataDir: fixture.dataDir,
+  plistPath: fixture.plistPath, label: 'test.runtime', platformCheck: () => {},
+  verify: async () => {}, run: agent.run, retryDelayMs: 0, allowMigration: true });
+
+test('migration failure restores the legacy entry and plist and restarts the old job', async (t) => {
   const fixture = await deployFixture();
   t.after(() => rm(fixture.root, { recursive: true, force: true }));
-  const oldPlist = '<plist>old node path</plist>';
-  await writeFile(fixture.plistPath, oldPlist);
-  const calls = [];
-  await assert.rejects(deploy(deployDeps(fixture, calls, { failWhen: (verb) => verb === 'bootstrap' })),
-    /bootstrap failed/);
-  assert.equal(await readFile(fixture.plistPath, 'utf8'), oldPlist);
-  assert.equal(await readFile(join(fixture.dataDir, 'runtime.mjs'), 'utf8'), 'old loader');
-  // A first bootstrap can be refused right after a bootout, so it retries once
-  // before rolling back — both attempts must appear.
-  assert.deepEqual(calls, ['print', 'bootout', 'bootstrap', 'bootstrap', 'bootstrap']);
-});
-
-test('a failed bootout does not switch files, and failed first install leaves no plist', async (t) => {
-  const fixture = await deployFixture();
-  t.after(() => rm(fixture.root, { recursive: true, force: true }));
+  await writeFile(join(fixture.dataDir, 'runtime.mjs'), 'old loader');
   await writeFile(fixture.plistPath, 'old plist');
-  const calls = [];
-  await assert.rejects(deploy(deployDeps(fixture, calls, { failWhen: (verb) => verb === 'bootout' })),
-    /bootout failed/);
+  const agent = agentFixture(fixture, true);
+  agent.failBootstrap(2);
+  await assert.rejects(deploy(deployDeps(fixture, agent)), /bootstrap failed/);
+  assert.equal(await readFile(join(fixture.dataDir, 'runtime.mjs'), 'utf8'), 'old loader');
   assert.equal(await readFile(fixture.plistPath, 'utf8'), 'old plist');
+  assert.equal(agent.loaded(), true);
+  assert.deepEqual(agent.calls, ['print', 'bootout', 'bootstrap', 'bootstrap', 'bootstrap', 'print']);
+});
+
+test('a migration journal restores the previous entry and registration after interruption', async (t) => {
+  const fixture = await deployFixture();
+  t.after(() => rm(fixture.root, { recursive: true, force: true }));
+  const entry = join(fixture.dataDir, 'runtime.mjs');
+  const journal = join(fixture.dataDir, '.migration.json');
+  await writeFile(entry, 'legacy runtime');
+  await writeFile(fixture.plistPath, 'legacy plist');
+  await writeFile(join(fixture.dataDir, 'deployment.json'), '{"current":"' + 'a'.repeat(64) + '"}');
+  await writeFile(journal, JSON.stringify({ entry: Buffer.from('legacy runtime').toString('base64'),
+    plist: Buffer.from('legacy plist').toString('base64'), pointer: null, wasLoaded: true }));
+  const agent = agentFixture(fixture, true);
+  const broken = new Map(fixture.files);
+  broken.delete('runtime-launcher.mjs');
+  await assert.rejects(deploy({ ...deployDeps(fixture, agent), files: broken }),
+    /missing runtime-launcher/);
+  assert.equal(await readFile(entry, 'utf8'), 'legacy runtime');
+  assert.equal(await readFile(fixture.plistPath, 'utf8'), 'legacy plist');
+  assert.equal(existsSync(join(fixture.dataDir, 'deployment.json')), false);
+  assert.equal(agent.loaded(), true);
+  assert.equal(existsSync(journal), false);
+});
+
+test('an unloaded agent is registered and ordinary bundle updates never bootout or bootstrap', async (t) => {
+  const fixture = await deployFixture();
+  t.after(() => rm(fixture.root, { recursive: true, force: true }));
+  const agent = agentFixture(fixture);
+  await deploy(deployDeps(fixture, agent));
+  const before = await readFile(join(fixture.dataDir, 'runtime.mjs'));
+  const plist = await readFile(fixture.plistPath, 'utf8');
+  assert.match(plist, /<key>StartInterval<\/key><integer>60<\/integer>/);
+  assert.match(plist, /<key>WatchPaths<\/key>/);
+  const { switchVersion, readDeployment } = await import('./runtime-launcher.mjs');
+  const next = new Map(fixture.files);
+  next.set('runtime.mjs', Buffer.from('process.exitCode = 0;\nconst changed = true;\n'));
+  agent.calls.length = 0;
+  await switchVersion(fixture.dataDir, next);
+  assert.deepEqual(agent.calls, []);
+  assert.deepEqual(await readFile(join(fixture.dataDir, 'runtime.mjs')), before);
+  assert.equal((await readDeployment(fixture.dataDir)).candidate, true);
+});
+
+test('a runtime-only update from inside the service switches the pointer without unloading it', async (t) => {
+  const fixture = await deployFixture();
+  t.after(() => rm(fixture.root, { recursive: true, force: true }));
+  const agent = agentFixture(fixture);
+  await deploy(deployDeps(fixture, agent));
+  const { atomicJSON, readDeployment } = await import('./runtime-launcher.mjs');
+  const healthy = await readDeployment(fixture.dataDir);
+  await atomicJSON(join(fixture.dataDir, 'deployment.json'), { ...healthy, candidate: false });
+  const entry = await readFile(join(fixture.dataDir, 'runtime.mjs'));
+  const next = new Map(fixture.files);
+  next.set('runtime.mjs', Buffer.from('process.exitCode = 0;\nconst changed = true;\n'));
+  const old = process.env.XPC_SERVICE_NAME;
+  process.env.XPC_SERVICE_NAME = 'test.runtime';
+  t.after(() => { if (old === undefined) delete process.env.XPC_SERVICE_NAME; else process.env.XPC_SERVICE_NAME = old; });
+  agent.calls.length = 0;
+  await deploy({ ...deployDeps(fixture, agent), files: next });
+  assert.deepEqual(agent.calls, ['print']);
+  assert.deepEqual(await readFile(join(fixture.dataDir, 'runtime.mjs')), entry);
+  assert.equal((await readDeployment(fixture.dataDir)).candidate, true);
+});
+
+test('a failed bootout does not modify an existing entry or plist', async (t) => {
+  const fixture = await deployFixture();
+  t.after(() => rm(fixture.root, { recursive: true, force: true }));
+  await writeFile(join(fixture.dataDir, 'runtime.mjs'), 'old loader');
+  await writeFile(fixture.plistPath, 'old plist');
+  const agent = agentFixture(fixture, true);
+  const run = async (command, args) => {
+    if (args[0] === 'bootout') throw new Error('bootout failed');
+    return agent.run(command, args);
+  };
+  await assert.rejects(deploy({ ...deployDeps(fixture, agent), run }), /bootout failed/);
   assert.equal(await readFile(join(fixture.dataDir, 'runtime.mjs'), 'utf8'), 'old loader');
-
-  const fresh = await deployFixture();
-  t.after(() => rm(fresh.root, { recursive: true, force: true }));
-  const freshCalls = [];
-  await assert.rejects(deploy(deployDeps(fresh, freshCalls,
-    { failWhen: (verb) => verb === 'bootstrap' })), /bootstrap failed/);
-  await assert.rejects(readFile(fresh.plistPath), { code: 'ENOENT' });
-  assert.deepEqual(freshCalls, ['bootstrap', 'bootstrap']);
+  assert.equal(await readFile(fixture.plistPath, 'utf8'), 'old plist');
 });
 
-test('installation reports a busy shared lock instead of deploying', async (t) => {
-  const root = await mkdtemp(join(tmpdir(), 'kct-lock-test-'));
-  t.after(() => rm(root, { recursive: true, force: true }));
-  const dataDir = join(root, 'data');
-  await mkdir(dataDir);
-  const lock = join(dataDir, '.runtime-lock');
-  await mkdir(lock);
-  await writeFile(join(lock, 'pid'), String(process.pid));
-  let commands = 0;
-  const files = new Map(CORE_FILES.map((name) => [name, Buffer.from(`new ${name}`)]));
-  await assert.rejects(deploy({
-    files, dataDir, plistPath: join(root, 'runtime.plist'), label: 'test.runtime',
-    platformCheck: () => {}, verify: async () => {},
-    run: async () => { commands += 1; },
-  }), /another runtime operation is in progress/);
-  assert.equal(commands, 0);
-});
-
-test('a live lock PID is not reclaimed after sixty seconds', async (t) => {
-  const root = await mkdtemp(join(tmpdir(), 'kct-live-lock-'));
-  t.after(() => rm(root, { recursive: true, force: true }));
-  const dataDir = join(root, 'data');
-  await mkdir(dataDir);
-  const lock = join(dataDir, '.runtime-lock');
-  await mkdir(lock);
-  await writeFile(join(lock, 'pid'), String(process.pid));
-  const old = new Date(Date.now() - 120000);
-  await import('node:fs/promises').then(({ utimes }) => utimes(lock, old, old));
-  let commands = 0;
-  const files = new Map(CORE_FILES.map((name) => [name, Buffer.from(`new ${name}`)]));
-  await assert.rejects(deploy({
-    files, dataDir, plistPath: join(root, 'runtime.plist'), label: 'test.runtime',
-    platformCheck: () => {}, verify: async () => {},
-    run: async () => { commands += 1; },
-  }), /another runtime operation is in progress/);
-  assert.equal(commands, 0);
-  assert.equal(await readFile(join(lock, 'pid'), 'utf8'), String(process.pid));
-});
-
-test('a failed stage still releases the shared lock', async (t) => {
-  const root = await mkdtemp(join(tmpdir(), 'kct-stage-lock-'));
-  t.after(() => rm(root, { recursive: true, force: true }));
-  const dataDir = join(root, 'data');
-  await mkdir(dataDir);
-  let released = 0;
-  await assert.rejects(deploy({
-    files: new Map([['x'.repeat(5000), Buffer.from('x')]]),
-    dataDir, plistPath: join(root, 'runtime.plist'), label: 'test.runtime',
-    platformCheck: () => {}, verify: async () => {},
-    acquire: async () => ({ release: async () => { released += 1; } }),
-  }), /name too long|ENAMETOOLONG/i);
-  assert.equal(released, 1);
-});
-
-test('an existing plist with no loaded LaunchAgent job installs successfully', async (t) => {
+test('a running service cannot migrate or unload itself', async (t) => {
   const fixture = await deployFixture();
   t.after(() => rm(fixture.root, { recursive: true, force: true }));
-  await writeFile(fixture.plistPath, 'old plist');
-  const calls = [];
-  await deploy(deployDeps(fixture, calls, {
-    loadCheck: () => {
-      const error = new Error('Could not find service "test.runtime" in domain for user');
-      error.stderr = error.message;
-      throw error;
-    },
-  }));
-  assert.deepEqual(calls, ['print', 'bootstrap']);
-  assert.match(await readFile(fixture.plistPath, 'utf8'), /new runtime\.mjs|runtime\.mjs/);
-  assert.equal(await readFile(join(fixture.dataDir, 'runtime.mjs'), 'utf8'), 'new runtime.mjs');
-  assert.deepEqual((await import('node:fs/promises')
-    .then(({ readdir }) => readdir(fixture.dataDir))).filter((name) => name.startsWith('.deploy')), []);
+  const agent = agentFixture(fixture, true);
+  const old = process.env.XPC_SERVICE_NAME;
+  process.env.XPC_SERVICE_NAME = 'test.runtime';
+  t.after(() => { if (old === undefined) delete process.env.XPC_SERVICE_NAME; else process.env.XPC_SERVICE_NAME = old; });
+  await assert.rejects(deploy(deployDeps(fixture, agent)), /outside the running service/);
+  assert.deepEqual(agent.calls, []);
 });
 
-test('a stage failure before plist handling preserves an existing plist', async (t) => {
-  const root = await mkdtemp(join(tmpdir(), 'kct-stage-plist-'));
-  t.after(() => rm(root, { recursive: true, force: true }));
-  const dataDir = join(root, 'data');
-  const plistPath = join(root, 'runtime.plist');
-  await mkdir(dataDir);
-  await writeFile(plistPath, 'existing plist');
-  await assert.rejects(deploy({
-    files: new Map([['x'.repeat(5000), Buffer.from('x')]]),
-    dataDir, plistPath, label: 'test.runtime',
-    platformCheck: () => {}, verify: async () => {},
-    acquire: async () => ({ release: async () => {} }),
-  }), /name too long|ENAMETOOLONG/i);
-  assert.equal(await readFile(plistPath, 'utf8'), 'existing plist');
-});
-
-test('a bootout failure does not bootstrap an unchanged running job', async (t) => {
+test('automatic deployment cannot migrate without an explicit --install, whatever the env marker says', async (t) => {
   const fixture = await deployFixture();
   t.after(() => rm(fixture.root, { recursive: true, force: true }));
-  await writeFile(fixture.plistPath, 'old plist');
-  const calls = [];
-  await assert.rejects(deploy(deployDeps(fixture, calls, {
-    failWhen: (verb) => verb === 'bootout',
-  })), /bootout failed/);
-  assert.deepEqual(calls, ['print', 'bootout']);
-});
-
-test('a backup cleanup failure after bootstrap keeps the new deployment', async (t) => {
-  const fixture = await deployFixture();
-  t.after(() => rm(fixture.root, { recursive: true, force: true }));
-  const calls = [];
-  const warnings = [];
-  const originalWarn = console.warn;
-  console.warn = (message) => warnings.push(String(message));
-  t.after(() => { console.warn = originalWarn; });
-  await deploy({
-    ...deployDeps(fixture, calls),
-    commit: async () => { throw new Error('cleanup failed'); },
+  const agent = agentFixture(fixture);
+  const old = process.env.XPC_SERVICE_NAME;
+  t.after(() => {
+    if (old === undefined) delete process.env.XPC_SERVICE_NAME;
+    else process.env.XPC_SERVICE_NAME = old;
   });
-  assert.equal(await readFile(join(fixture.dataDir, 'runtime.mjs'), 'utf8'), 'new runtime.mjs');
-  assert.deepEqual(calls, ['bootstrap']);
-  assert.match(warnings[0], /deployment backup cleanup failed/);
+  const attempt = async (value, pattern) => {
+    if (value === undefined) delete process.env.XPC_SERVICE_NAME;
+    else process.env.XPC_SERVICE_NAME = value;
+    agent.calls.length = 0;
+    await assert.rejects(deploy({ ...deployDeps(fixture, agent), allowMigration: false }), pattern);
+    assert.deepEqual(agent.calls, [], `no launchctl command for env=${String(value)}`);
+  };
+  await attempt(undefined, /explicit --install/);
+  await attempt('other.service', /explicit --install/);
+  await attempt('test.runtime', /outside the running service/);
+
+  delete process.env.XPC_SERVICE_NAME;
+  await writeFile(join(fixture.dataDir, '.migration.json'), '{}');
+  agent.calls.length = 0;
+  await assert.rejects(deploy({ ...deployDeps(fixture, agent), allowMigration: false }),
+    /requires --install/);
+  assert.deepEqual(agent.calls, [], 'an interrupted migration is not recovered by the automatic path');
+  await rm(join(fixture.dataDir, '.migration.json'), { force: true });
 });
 
-test('a failed plist restore keeps its backup and leaves the job stopped', async (t) => {
+test('installation refuses a busy live lock and releases a lock after invalid staging', async (t) => {
   const fixture = await deployFixture();
   t.after(() => rm(fixture.root, { recursive: true, force: true }));
-  await writeFile(fixture.plistPath, 'original plist');
-  const calls = [];
-  await assert.rejects(deploy({
-    ...deployDeps(fixture, calls),
-    // Both bootstrap attempts must fail, so the plist restore path is reached
-    // even with the retry in place; the restore then hits a directory where the
-    // plist was, keeping the backup on disk.
-    run: async (_command, args) => {
-      calls.push(args[0]);
-      // The second attempt is where the plist gets clobbered: after the first
-      // failure the restore already put the backup back, so breaking it here is
-      // what makes the final restore fail.
-      if (args[0] === 'bootstrap' && calls.filter((c) => c === 'bootstrap').length >= 2) {
-        await rm(fixture.plistPath);
-        await mkdir(fixture.plistPath);
-        throw new Error('bootstrap failed');
-      }
-      if (args[0] === 'bootstrap') throw new Error('bootstrap failed');
-    },
-  }), (error) => /bootstrap failed/.test(error.message) && !!error.plistRestoreError);
-  assert.equal(await readFile(join(fixture.dataDir, '.runtime-plist.backup'), 'utf8'), 'original plist');
-  assert.deepEqual(calls, ['print', 'bootout', 'bootstrap', 'bootstrap']);
+  const agent = agentFixture(fixture);
+  const lock = join(fixture.dataDir, '.runtime-lock');
+  await mkdir(lock);
+  await writeFile(join(lock, 'pid'), String(process.pid));
+  await assert.rejects(deploy(deployDeps(fixture, agent)), /another runtime operation/);
+  const stale = new Date(Date.now() - 120000);
+  await utimes(lock, stale, stale);
+  await assert.rejects(deploy(deployDeps(fixture, agent)), /another runtime operation/);
+  assert.equal(await readFile(join(lock, 'pid'), 'utf8'), String(process.pid));
+  await rm(lock, { recursive: true });
+  const broken = new Map(fixture.files);
+  broken.set('supported-runtimes.json', Buffer.from('[]'));
+  await assert.rejects(deploy({ ...deployDeps(fixture, agent), files: broken }), /invalid runtime entry/);
+  assert.equal(existsSync(lock), false);
+});
+
+test('runtime locks verify owner start time so a reused PID cannot keep them forever', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'kct-lock-identity-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const dataDir = join(root, 'data');
+  await mkdir(dataDir);
+  const lock = join(dataDir, '.runtime-lock');
+  const { acquireLock } = await import('./runtime-launcher.mjs');
+  const startedAt = 1000;
+  const identity = async () => startedAt;
+
+  const first = await acquireLock(dataDir, { startedAt: identity });
+  assert.ok(first);
+  assert.equal(await acquireLock(dataDir, { startedAt: identity }), null);
+  await first.release();
+
+  await mkdir(lock);
+  await writeFile(join(lock, 'pid'), String(process.pid));
+  await writeFile(join(lock, 'owner.json'), JSON.stringify({ pid: process.pid, startedAt }));
+  const reused = await acquireLock(dataDir, { startedAt: async () => 5000 });
+  assert.ok(reused, 'a different start time means the PID was reused');
+  await reused.release();
+
+  await mkdir(lock);
+  await writeFile(join(lock, 'pid'), String(process.pid));
+  await writeFile(join(lock, 'owner.json'), JSON.stringify({ pid: process.pid, startedAt }));
+  assert.equal(await acquireLock(dataDir, { startedAt: async () => null }), null,
+    'an unverifiable live owner must not be stolen');
+  await rm(lock, { recursive: true, force: true });
+
+  await mkdir(lock);
+  await writeFile(join(lock, 'pid'), '999999');
+  await writeFile(join(lock, 'owner.json'), JSON.stringify({ pid: 999999, startedAt }));
+  const dead = await acquireLock(dataDir, { startedAt: async () => null });
+  assert.ok(dead, 'a dead owner is reclaimed');
+  await dead.release();
+
+  await mkdir(lock);
+  await writeFile(join(lock, 'pid'), String(process.pid));
+  assert.equal(await acquireLock(dataDir, { startedAt: identity }), null,
+    'an old-format lock with a live PID is respected');
+  await rm(lock, { recursive: true, force: true });
+
+  const [a, b] = await Promise.all([
+    acquireLock(dataDir, { startedAt: identity }),
+    acquireLock(dataDir, { startedAt: identity }),
+  ]);
+  assert.equal([a, b].filter(Boolean).length, 1, 'concurrent callers never both acquire');
+  await (a ?? b).release();
+});
+
+test('a failed candidate rolls back the pointer and the stable entry keeps working', async (t) => {
+  const fixture = await deployFixture();
+  t.after(() => rm(fixture.root, { recursive: true, force: true }));
+  const agent = agentFixture(fixture);
+  await deploy(deployDeps(fixture, agent));
+  const launcher = await readFile(join(fixture.dataDir, 'runtime.mjs'));
+  const { launch, switchVersion, readDeployment, verifyVersion } = await import('./runtime-launcher.mjs');
+  const old = await readDeployment(fixture.dataDir);
+  const broken = new Map(fixture.files);
+  broken.set('runtime.mjs', Buffer.from('process.exitCode = 17;\n'));
+  await switchVersion(fixture.dataDir, broken);
+  assert.equal(await launch(fixture.dataDir, ['--once']), 17);
+  const rolledBack = await readDeployment(fixture.dataDir);
+  assert.equal(rolledBack.current, old.current);
+  assert.equal(rolledBack.candidate, false);
+  assert.match(rolledBack.blocked.detail, /exited with code 17/);
+  await verifyVersion(fixture.dataDir, rolledBack.current);
+  assert.deepEqual(await readFile(join(fixture.dataDir, 'runtime.mjs')), launcher);
+  assert.equal(await launch(fixture.dataDir, ['--once']), 0);
+  await assert.rejects(switchVersion(fixture.dataDir, broken), /previously rolled back/);
+});
+
+test('a candidate is healthy only after a structured success result', async (t) => {
+  const fixture = await deployFixture();
+  t.after(() => rm(fixture.root, { recursive: true, force: true }));
+  const agent = agentFixture(fixture);
+  await deploy(deployDeps(fixture, agent));
+  const { launch, readDeployment } = await import('./runtime-launcher.mjs');
+  const original = await readDeployment(fixture.dataDir);
+  const candidate = await switchCandidate(fixture, candidateRuntime('success', {
+    status: 'active', loaded: 1, inspectorClosed: true, revision: 'rev-1',
+  }));
+  assert.equal(await launch(fixture.dataDir, ['--once']), 0);
+  const healthy = await readDeployment(fixture.dataDir);
+  assert.equal(healthy.current, candidate.current);
+  assert.equal(healthy.candidate, false);
+  assert.equal(healthy.previous, original.current);
+  assert.ok(healthy.healthyAt);
+});
+
+test('a candidate that reports an injection error is rolled back even though it exits zero', async (t) => {
+  const fixture = await deployFixture();
+  t.after(() => rm(fixture.root, { recursive: true, force: true }));
+  const agent = agentFixture(fixture);
+  await deploy(deployDeps(fixture, agent));
+  const { launch, readDeployment } = await import('./runtime-launcher.mjs');
+  const original = await readDeployment(fixture.dataDir);
+  const candidate = await switchCandidate(fixture, candidateRuntime('failed', {
+    status: 'error', detail: 'renderer rejected injection',
+  }));
+  assert.equal(await launch(fixture.dataDir, ['--once']), 0);
+  const after = await readDeployment(fixture.dataDir);
+  assert.equal(after.current, original.current);
+  assert.equal(after.candidate, false);
+  assert.equal(after.blocked.id, candidate.current);
+  assert.match(after.blocked.detail, /renderer rejected injection/);
+});
+
+test('a waiting candidate stays pending without being marked healthy or failed', async (t) => {
+  const fixture = await deployFixture();
+  t.after(() => rm(fixture.root, { recursive: true, force: true }));
+  const agent = agentFixture(fixture);
+  await deploy(deployDeps(fixture, agent));
+  const { launch, readDeployment } = await import('./runtime-launcher.mjs');
+  const candidate = await switchCandidate(fixture, candidateRuntime('waiting', {
+    status: 'waiting', detail: 'Kimi Code is not running',
+  }));
+  assert.equal(await launch(fixture.dataDir, ['--once']), 0);
+  const waiting = await readDeployment(fixture.dataDir);
+  assert.equal(waiting.current, candidate.current);
+  assert.equal(waiting.candidate, true);
+  assert.equal(waiting.healthyAt, undefined);
+  assert.equal(waiting.startAttempts, undefined);
+  assert.equal(await launch(fixture.dataDir, ['--once']), 0);
+  assert.equal((await readDeployment(fixture.dataDir)).candidate, true);
+});
+
+test('a transient candidate failure is retried without rollback', async (t) => {
+  const fixture = await deployFixture();
+  t.after(() => rm(fixture.root, { recursive: true, force: true }));
+  const agent = agentFixture(fixture);
+  await deploy(deployDeps(fixture, agent));
+  const { launch, readDeployment } = await import('./runtime-launcher.mjs');
+  const candidate = await switchCandidate(fixture, candidateRuntime('transient', {
+    status: 'error', failureKind: 'transient', detail: 'Inspector port busy',
+  }));
+  assert.equal(await launch(fixture.dataDir, ['--once']), 0);
+  const after = await readDeployment(fixture.dataDir);
+  assert.equal(after.current, candidate.current);
+  assert.equal(after.candidate, true);
+  assert.equal(after.blocked, undefined);
+});
+
+test('a candidate with no confirmation result is rolled back', async (t) => {
+  const fixture = await deployFixture();
+  t.after(() => rm(fixture.root, { recursive: true, force: true }));
+  const agent = agentFixture(fixture);
+  await deploy(deployDeps(fixture, agent));
+  const { launch, readDeployment } = await import('./runtime-launcher.mjs');
+  const original = await readDeployment(fixture.dataDir);
+  const candidate = await switchCandidate(fixture, 'process.exitCode = 0;\nconst unconfirmed = true;\n');
+  assert.notEqual(candidate.current, original.current);
+  assert.equal(await launch(fixture.dataDir, ['--once']), 0);
+  const after = await readDeployment(fixture.dataDir);
+  assert.equal(after.current, original.current);
+  assert.equal(after.blocked.id, candidate.current);
+  assert.match(after.blocked.detail, /did not confirm injection/);
+});
+
+test('an incompatible candidate is rolled back with its diagnostic', async (t) => {
+  const fixture = await deployFixture();
+  t.after(() => rm(fixture.root, { recursive: true, force: true }));
+  const agent = agentFixture(fixture);
+  await deploy(deployDeps(fixture, agent));
+  const { launch, readDeployment } = await import('./runtime-launcher.mjs');
+  const original = await readDeployment(fixture.dataDir);
+  const candidate = await switchCandidate(fixture, candidateRuntime('incompatible', {
+    status: 'error', failureKind: 'permanent', detail: 'inspector fuse disabled',
+  }));
+  assert.equal(await launch(fixture.dataDir, ['--once']), 0);
+  const after = await readDeployment(fixture.dataDir);
+  assert.equal(after.current, original.current);
+  assert.equal(after.blocked.id, candidate.current);
+  assert.match(after.blocked.detail, /inspector fuse disabled/);
+});
+
+test('interrupted candidate starts recover to the last complete bundle', async (t) => {
+  const fixture = await deployFixture();
+  t.after(() => rm(fixture.root, { recursive: true, force: true }));
+  const agent = agentFixture(fixture);
+  await deploy(deployDeps(fixture, agent));
+  const { launch, switchVersion, readDeployment, atomicJSON } = await import('./runtime-launcher.mjs');
+  const original = await readDeployment(fixture.dataDir);
+  const next = new Map(fixture.files);
+  next.set('runtime.mjs', Buffer.from('process.exitCode = 0;\nconst candidate = true;\n'));
+  await switchVersion(fixture.dataDir, next);
+  const pending = await readDeployment(fixture.dataDir);
+  await atomicJSON(join(fixture.dataDir, 'deployment.json'), { ...pending, startAttempts: 2 });
+  assert.equal(await launch(fixture.dataDir, ['--once']), 0);
+  assert.equal((await readDeployment(fixture.dataDir)).current, original.current);
+});
+
+test('recovery prefers the recorded previous version over a newer orphan', async (t) => {
+  const fixture = await deployFixture();
+  t.after(() => rm(fixture.root, { recursive: true, force: true }));
+  const agent = agentFixture(fixture);
+  await deploy(deployDeps(fixture, agent));
+  const { launch, switchVersion, storeVersion, readDeployment, atomicJSON } =
+    await import('./runtime-launcher.mjs');
+  const original = await readDeployment(fixture.dataDir);
+  const next = new Map(fixture.files);
+  next.set('runtime.mjs', Buffer.from('process.exitCode = 0;\nconst v = 2;\n'));
+  await switchVersion(fixture.dataDir, next);
+  const candidate = await readDeployment(fixture.dataDir);
+  await atomicJSON(join(fixture.dataDir, 'deployment.json'), { ...candidate, candidate: false });
+  const orphan = new Map(fixture.files);
+  orphan.set('runtime.mjs', Buffer.from('process.exitCode = 0;\nconst orphan = true;\n'));
+  await storeVersion(fixture.dataDir, orphan);
+  await writeFile(join(fixture.dataDir, 'versions', candidate.current, 'kct.js'), 'corrupt');
+  assert.equal(await launch(fixture.dataDir, ['--once']), 0);
+  const recovered = await readDeployment(fixture.dataDir);
+  assert.equal(recovered.current, original.current);
+  assert.equal(recovered.previous, null);
+  assert.ok(recovered.recoveredAt);
+});
+
+test('missing LaunchAgent registration can be repaired without booting out a live job', async (t) => {
+  const fixture = await deployFixture();
+  t.after(() => rm(fixture.root, { recursive: true, force: true }));
+  const agent = agentFixture(fixture);
+  await deploy(deployDeps(fixture, agent));
+  await agent.run('/bin/launchctl', ['bootout']);
+  agent.calls.length = 0;
+  const { repairAgent } = await import('./runtime.mjs');
+  assert.deepEqual(await repairAgent({ dataDir: fixture.dataDir, plistPath: fixture.plistPath,
+    label: 'test.runtime', run: agent.run, retryDelayMs: 0 }), { registered: true, repaired: true });
+  assert.deepEqual(agent.calls, ['print', 'bootstrap', 'print']);
+});
+
+test('a historical active record never stands in for a live injection check', async (t) => {
+  const fixture = await deployFixture();
+  t.after(() => rm(fixture.root, { recursive: true, force: true }));
+  const agent = agentFixture(fixture, true);
+  await deploy(deployDeps(fixture, agent));
+  const { doctor } = await import('./runtime.mjs');
+  const report = await doctor({
+    dataDir: fixture.dataDir, plistPath: fixture.plistPath, label: 'test.runtime', run: agent.run,
+    find: async () => [{ pid: 4242, started: 'now' }],
+    verify: async () => ({}),
+    attach: async () => { throw new Error('inspector port 9229 is in use'); },
+    stateReader: async () => ({ status: 'active', checkedAt: '2026-11-01T00:00:00.000Z',
+      updateStatus: 'staged', updateVersion: '0.2.12' }),
+  });
+  assert.equal(report.installation.status, 'complete');
+  assert.equal(report.launchAgent.status, 'registered');
+  assert.equal(report.process.status, 'found');
+  assert.equal(report.injection.status, 'unknown');
+  assert.equal(report.page.status, 'unknown');
+  assert.equal(report.translation.status, 'unknown');
+  assert.equal(report.lastAttempt.evidence, 'history');
+  assert.equal(report.lastAttempt.status, 'active');
+});
+
+test('diagnostics confirm the live hook, page and translation state', async (t) => {
+  const fixture = await deployFixture();
+  t.after(() => rm(fixture.root, { recursive: true, force: true }));
+  const agent = agentFixture(fixture, true);
+  await deploy(deployDeps(fixture, agent));
+  const { doctor } = await import('./runtime.mjs');
+  let closed = 0;
+  const report = await doctor({
+    dataDir: fixture.dataDir, plistPath: fixture.plistPath, label: 'test.runtime', run: agent.run,
+    find: async () => [{ pid: 4242, started: 'now' }],
+    verify: async () => ({}),
+    attach: async () => ({
+      evaluate: async () => ({ present: true, revision: 'rev-1', health: { pages: [
+        { loaded: true, revision: 'rev-1', stale: false,
+          health: { ready: true, enabled: true, blocks: 2, mounted: 2,
+            unsupported: 0, translated: 1, failed: 0 } },
+      ] } }),
+      close: async () => { closed += 1; },
+    }),
+    stateReader: async () => ({ status: 'active' }),
+  });
+  assert.equal(report.injection.status, 'loaded');
+  assert.equal(report.injection.revision, 'rev-1');
+  assert.equal(report.page.status, 'mounted');
+  assert.equal(report.page.blocks, 2);
+  assert.equal(report.translation.status, 'working');
+  assert.equal(report.translation.translated, 1);
+  assert.equal(closed, 1);
 });
 
 // ---------------------------------------------------------------------------
 // self-update
 // ---------------------------------------------------------------------------
 
+test('diagnostics report a stale renderer instead of claiming the new hook is current', async (t) => {
+  const fixture = await deployFixture();
+  t.after(() => rm(fixture.root, { recursive: true, force: true }));
+  const agent = agentFixture(fixture, true);
+  await deploy(deployDeps(fixture, agent));
+  const { doctor } = await import('./runtime.mjs');
+  const report = await doctor({
+    dataDir: fixture.dataDir, plistPath: fixture.plistPath, label: 'test.runtime', run: agent.run,
+    find: async () => [{ pid: 4242, started: 'now' }],
+    verify: async () => ({}),
+    attach: async () => ({
+      evaluate: async () => ({ present: true, revision: 'rev-2', health: { pages: [
+        { loaded: true, revision: 'rev-1', stale: true, health: { ready: true, enabled: true,
+          blocks: 1, mounted: 1, unsupported: 0, translated: 1, failed: 0 } },
+      ] } }),
+      close: async () => {},
+    }),
+    stateReader: async () => ({ status: 'active' }),
+  });
+  assert.equal(report.page.status, 'stale-renderer');
+  assert.equal(report.page.stale, 1);
+  assert.equal(report.page.revisions.includes('rev-1'), true);
+  assert.equal(report.injection.staleRenderers, 1);
+});
+
+test('the refresh entry asks the hook to reload stale pages and closes the inspector', async (t) => {
+  const fixture = await deployFixture();
+  t.after(() => rm(fixture.root, { recursive: true, force: true }));
+  let closed = 0;
+  const { reloadStalePages } = await import('./runtime.mjs');
+  const result = await reloadStalePages({
+    dataDir: fixture.dataDir,
+    find: async () => [{ pid: 4242, started: 'now' }],
+    verify: async () => ({}),
+    attach: async () => ({
+      evaluate: async () => ({ present: true, revision: 'rev-2', reloaded: 1, stale: ['rev-1'] }),
+      close: async () => { closed += 1; },
+    }),
+  });
+  assert.deepEqual(result, { present: true, revision: 'rev-2', reloaded: 1, stale: ['rev-1'] });
+  assert.equal(closed, 1);
+});
+
 test('update manifest validation rejects malformed descriptors', async () => {
   const { validateManifest, isNewer, parseVersion } = await import('./runtime-update.mjs');
   const good = {
     version: '0.2.0', base: 'https://example.test',
-    files: Object.fromEntries(['runtime.mjs', 'runtime-hook.mjs', 'runtime-update.mjs',
-      'supported-runtimes.json', 'kct.js'].map((name) => [name, 'a'.repeat(64)])),
+    files: Object.fromEntries(CORE_FILES.map((name) => [name, 'a'.repeat(64)])),
   };
   assert.doesNotThrow(() => validateManifest(good));
   assert.throws(() => validateManifest({ ...good, version: 'latest' }), /valid version/);
@@ -715,22 +1007,59 @@ test('update manifest validation rejects malformed descriptors', async () => {
   assert.equal(isNewer('0.1.0', '0.1.0'), false);
 });
 
+test('an up-to-date client ignores an older manifest schema, a newer one is validated', async () => {
+  const { resolveUpdate } = await import('./runtime-update.mjs');
+  const manifest = { version: '0.2.11', base: 'https://example.test', files: {} };
+  const fetchImpl = async () => ({ ok: true, json: async () => structuredClone(manifest) });
+  const current = await resolveUpdate({ current: '0.2.11', fetchImpl });
+  assert.equal(current.available, false);
+  assert.equal(current.remote, '0.2.11');
+  manifest.version = '0.2.12';
+  await assert.rejects(resolveUpdate({ current: '0.2.11', fetchImpl }), /valid hash/);
+});
+
 test('a download whose bytes do not match the manifest hash is refused', async () => {
   const { downloadBundle } = await import('./runtime-update.mjs');
   const manifest = {
     version: '0.2.0', base: 'https://example.test',
-    files: Object.fromEntries(['runtime.mjs', 'runtime-hook.mjs', 'runtime-update.mjs',
-      'supported-runtimes.json', 'kct.js'].map((name) => [name, 'b'.repeat(64)])),
+    files: Object.fromEntries(CORE_FILES.map((name) => [name, 'b'.repeat(64)])),
   };
   const fetchImpl = async () => ({ ok: true, arrayBuffer: async () => Buffer.from('tampered') });
   await assert.rejects(() => downloadBundle(manifest, { fetchImpl }), /hash mismatch/);
 });
 
+test('a retried update reuses only hash-verified cached files', async (t) => {
+  const cacheDir = await mkdtemp(join(tmpdir(), 'kct-update-cache-'));
+  t.after(() => rm(cacheDir, { recursive: true, force: true }));
+  const { downloadBundle } = await import('./runtime-update.mjs');
+  const bodies = Object.fromEntries(CORE_FILES.map((name) => [name, `content of ${name}`]));
+  const manifest = {
+    version: '0.2.0', base: 'https://example.test',
+    files: Object.fromEntries(Object.entries(bodies)
+      .map(([name, text]) => [name, createHash('sha256').update(text).digest('hex')])),
+  };
+  let fetches = 0;
+  const fetchImpl = async (url) => {
+    fetches += 1;
+    return { ok: true, arrayBuffer: async () => Buffer.from(bodies[url.split('/').pop()]) };
+  };
+  const first = await downloadBundle(manifest, { fetchImpl, cacheDir });
+  assert.equal(fetches, CORE_FILES.length);
+  const cached = await downloadBundle(manifest,
+    { cacheDir, fetchImpl: async () => { throw new Error('cache miss'); } });
+  assert.equal(fetches, CORE_FILES.length);
+  assert.deepEqual([...cached.keys()], CORE_FILES);
+  assert.equal(cached.get('kct.js').toString(), bodies['kct.js']);
+  assert.equal(first.get('kct.js').toString(), bodies['kct.js']);
+  const changed = { ...manifest, files: { ...manifest.files, 'kct.js': 'd'.repeat(64) } };
+  await assert.rejects(downloadBundle(changed, { fetchImpl, cacheDir }), /hash mismatch/);
+  assert.ok(fetches > CORE_FILES.length, 'a changed manifest clears the old cache');
+});
+
 test('a newer published version is fetched and handed to the atomic deploy path', async () => {
   const { selfUpdate } = await import('./runtime.mjs');
   const { createHash } = await import('node:crypto');
-  const bodies = Object.fromEntries(['runtime.mjs', 'runtime-hook.mjs', 'runtime-update.mjs',
-    'supported-runtimes.json', 'kct.js'].map((name) => [name, `content of ${name}`]));
+  const bodies = Object.fromEntries(CORE_FILES.map((name) => [name, `content of ${name}`]));
   const files = Object.fromEntries(Object.entries(bodies)
     .map(([name, text]) => [name, createHash('sha256').update(Buffer.from(text)).digest('hex')]));
   const seen = [];
@@ -747,14 +1076,13 @@ test('a newer published version is fetched and handed to the atomic deploy path'
   assert.equal(result.updated, true);
   assert.equal(result.from, '0.1.0');
   assert.equal(result.to, '0.2.0');
-  assert.deepEqual(seen, [5]);
+  assert.deepEqual(seen, [6]);
 });
 
 test('an up-to-date install performs no download and no deployment', async () => {
   const { selfUpdate } = await import('./runtime.mjs');
   let deployed = 0;
-  const files = Object.fromEntries(['runtime.mjs', 'runtime-hook.mjs', 'runtime-update.mjs',
-    'supported-runtimes.json', 'kct.js'].map((name) => [name, 'c'.repeat(64)]));
+  const files = Object.fromEntries(CORE_FILES.map((name) => [name, 'c'.repeat(64)]));
   const result = await selfUpdate({
     currentVersion: '0.2.0',
     fetchImpl: async () => ({ ok: true, json: async () => ({
@@ -787,39 +1115,32 @@ test('an unknown runtime hash is accepted when signature, fuses and the renderer
     },
   };
   const result = await verifyApp(deps);
-  assert.equal(result.verified, 'contract');
+  assert.equal(result.verified, 'capabilities');
   assert.equal(result.electron, '43.1.1');
   assert.equal(result.version, '1.1.3');
 });
 
-test('a changed reasoning DOM stops the extension while an unseen Electron major does not', async () => {
+test('an unseen Electron major is allowed and missing stylesheet evidence stays unknown', async () => {
   const css = ['.think', '.think-head', '.think-body', '.think-body-inner', '.think-text']
     .map((name) => `${name}{}`).join('');
   const binary = Buffer.concat([Buffer.from('prefixdL7pKGdnNz796PbbjQWNKmHXBZaB9tsX'),
     Buffer.from([1, 9]), Buffer.from('101100001')]);
   const make = (electron, style) => ({
     fingerprint: async () => 'file',
-    output: async (_cmd, args) => {
-      const isElectron = args?.some((a) => a.includes(':CFBundleVersion'));
-      return `${isElectron ? electron : '1.1.3'}\n`;
-    },
-    run: async () => ({ stderr: 'Identifier=com.kimi.code.desktop\nTeamIdentifier=2J9472RW75\n' }),
+    output: async (_cmd, args) => args?.some((a) => a.includes(':CFBundleVersion')) ? electron : '1.1.3',
+    run: async () => ({}),
     readFile: async (file) => {
       if (String(file).endsWith('supported-runtimes.json')) return '[]';
       if (String(file).endsWith('Electron Framework')) return binary;
-      if (String(file).endsWith('index.html')) return '<link href="/assets/main.css">';
+      if (String(file).endsWith('index.html')) return "<link href='/assets/main.css'>";
       return style;
     },
   });
-  // What decides attachment is the capability, never the version number: an
-  // Electron major the allowlist has never seen attaches fine while the contract
-  // holds, and stops the moment the reasoning DOM no longer matches.
-  const unseen = await verifyApp(make('44.0.0', css));
-  assert.equal(unseen.verified, 'contract');
-  assert.equal(unseen.electron, '44.0.0');
-  for (const electron of ['44.0.0', '43.2.0']) {
-    await assert.rejects(() => verifyApp(make(electron, '.think{}.renamed{}.think-head{}')), /reasoning UI/);
-  }
+  const unseen = await verifyApp(make('99.0.0', css));
+  assert.equal(unseen.verified, 'capabilities');
+  assert.equal(unseen.electron, '99.0.0');
+  assert.equal(unseen.rendererContract, 'present-in-styles');
+  assert.equal((await verifyApp(make('99.0.0', '.renamed{}'))).rendererContract, 'unknown');
 });
 
 test('process discovery matches the executable path despite spaces in the name', async () => {
@@ -876,6 +1197,70 @@ test('no network access happens while Kimi is not running', async () => {
   assert.equal(resolved, 0, 'a stopped Kimi must never trigger an update check');
 });
 
+test('a failed update check is retried with bounded backoff and only commits success', async () => {
+  const { tick } = await import('./runtime.mjs');
+  let previous = {};
+  let attempts = 0;
+  let now = Date.UTC(2026, 9, 24, 12, 0, 0);
+  const deps = {
+    findProcesses: async () => [INFO],
+    readState: async () => structuredClone(previous),
+    saveState: async (state) => { previous = structuredClone(state); },
+    readFile: async () => 'source', fingerprint: async () => 'fp', portOpen: async () => false,
+    output: async () => '', verifyApp: async () => ({ version: '1.1.2', electron: '43.1.1' }),
+    installIntoProcess: async () => ({ loaded: 1 }), now: () => now,
+    update: { version: '0.2.0', dataDir: '/tmp/kct-update-retry-test', updateCheck: true,
+      resolveUpdateFn: async () => {
+        attempts++;
+        if (attempts < 3) throw new Error('offline');
+        return { available: false, current: '0.2.0', remote: '0.2.0' };
+      }, applyUpdate: async () => true },
+  };
+  let state = await tick(deps);
+  assert.equal(state.updateStatus, 'failed');
+  assert.equal(state.updateCheckedFor, undefined);
+  assert.equal(attempts, 1);
+  now += 59999;
+  state = await tick(deps);
+  assert.equal(attempts, 1);
+  now += 1;
+  state = await tick(deps);
+  assert.equal(attempts, 2);
+  now += 300000;
+  state = await tick(deps);
+  assert.equal(attempts, 3);
+  assert.equal(state.updateStatus, 'up-to-date');
+  assert.equal(state.updateCheckedFor, `${INFO.pid}:${INFO.started}`);
+});
+
+test('a migration that cannot run inside the service stops update retries', async () => {
+  const { tick } = await import('./runtime.mjs');
+  let previous = {};
+  let attempts = 0;
+  const deps = {
+    findProcesses: async () => [INFO],
+    readState: async () => structuredClone(previous),
+    saveState: async (state) => { previous = structuredClone(state); },
+    readFile: async () => 'source', fingerprint: async () => 'fp', portOpen: async () => false,
+    output: async () => '', verifyApp: async () => ({ version: '1.1.2', electron: '43.1.1' }),
+    installIntoProcess: async () => ({ loaded: 1 }),
+    now: () => Date.UTC(2026, 9, 24, 12, 0, 0),
+    update: { version: '0.2.0', dataDir: '/tmp/kct-update-migration-test', updateCheck: true,
+      resolveUpdateFn: async () => {
+        attempts++;
+        return { available: true, current: '0.2.0', remote: '0.2.1', manifest: {} };
+      }, applyUpdate: async () => {
+        throw new Error('LaunchAgent migration requires an explicit --install from a terminal session');
+      } },
+  };
+  const state = await tick(deps);
+  assert.equal(state.updateStatus, 'failed');
+  assert.equal(state.updateAttempts, 4);
+  assert.equal(state.updateNextRetryAt, null);
+  await tick(deps);
+  assert.equal(attempts, 1);
+});
+
 test('one Kimi launch checks for updates once, not on every tick', async () => {
   const { tick } = await import('./runtime.mjs');
   let resolved = 0;
@@ -908,19 +1293,6 @@ test('one Kimi launch checks for updates once, not on every tick', async () => {
   assert.equal(resolved, 2, 'a fresh Kimi launch checks again');
 });
 
-test('the installed LaunchAgent wakes on Kimi activity, never on a timer', async (t) => {
-  const fixture = await deployFixture();
-  t.after(() => rm(fixture.root, { recursive: true, force: true }));
-  const calls = [];
-  await deploy(deployDeps(fixture, calls));
-  const plist = await readFile(fixture.plistPath, 'utf8');
-  assert.doesNotMatch(plist, /StartInterval/, 'polling would wake the job while Kimi is closed');
-  assert.doesNotMatch(plist, /KeepAlive/, 'a resident job is not what this installs');
-  assert.match(plist, /<key>WatchPaths<\/key>/);
-  assert.match(plist, /kimi-code-app/);
-  assert.match(plist, /<key>RunAtLoad<\/key><true\/>/);
-});
-
 test('an unreachable canonical host falls back to the CDN mirror', async () => {
   const { downloadBundle, fetchManifest, mirrorUrl, MANIFEST_MIRRORS } = await import('./runtime-update.mjs');
   const seen = [];
@@ -929,8 +1301,7 @@ test('an unreachable canonical host falls back to the CDN mirror', async () => {
     if (url.includes('raw.githubusercontent.com')) throw Object.assign(new Error('timeout'), { name: 'TimeoutError' });
     return { ok: true, arrayBuffer: async () => Buffer.from(`mirrored ${url.split('/').pop()}`) };
   };
-  const files = Object.fromEntries(['runtime.mjs', 'runtime-hook.mjs', 'runtime-update.mjs',
-    'supported-runtimes.json', 'kct.js'].map((name) => [name,
+  const files = Object.fromEntries(CORE_FILES.map((name) => [name,
     createHash('sha256').update(Buffer.from(`mirrored ${name}`)).digest('hex')]));
   const fetched = await fetchManifest('https://raw.githubusercontent.com/wssz527/kimi-cot-translate/main/runtime-manifest.json', {
     fetchImpl, files,
@@ -947,9 +1318,166 @@ test('an unreachable canonical host falls back to the CDN mirror', async () => {
   const bundle = await downloadBundle({
     version: '0.2.8', base: 'https://raw.githubusercontent.com/wssz527/kimi-cot-translate/v0.2.8', files,
   }, { fetchImpl });
-  assert.equal(bundle.size, 5);
+  assert.equal(bundle.size, 6);
   assert.ok([...bundle.values()].every((bytes) => bytes.toString().startsWith('mirrored')));
   assert.equal(mirrorUrl('https://raw.githubusercontent.com/wssz527/kimi-cot-translate/v0.2.8/kct.js'),
     'https://cdn.statically.io/gh/wssz527/kimi-cot-translate/v0.2.8/kct.js');
   assert.equal(mirrorUrl('https://example.test/kct.js'), null);
+});
+
+// ---------------------------------------------------------------------------
+// candidate confirmation: live evidence only
+// ---------------------------------------------------------------------------
+
+function candidateFixture({ state = {}, installed = 1, health = null, verifyError } = {}) {
+  let previous = state;
+  let installedCount = 0;
+  let verifyCount = 0;
+  const deps = {
+    saveState: async (next) => { previous = structuredClone(next); },
+    readState: async () => structuredClone(previous),
+    findProcesses: async () => [INFO],
+    readFile: async (path) => String(path).endsWith('supported-runtimes.json') ? '[]' : 'source',
+    fingerprint: async () => 'executable-fingerprint',
+    portOpen: async () => false,
+    output: async () => '',
+    verifyApp: async () => {
+      verifyCount += 1;
+      if (verifyError) throw verifyError;
+      return { version: '1.1.1', electron: '43.1.1' };
+    },
+    installIntoProcess: async () => {
+      installedCount += 1;
+      // The real function rejects when neither a current nor a stale page
+      // accepted the script, so the fixture does the same.
+      if (!installed && !(health?.stale ?? 0)) {
+        throw Object.assign(new Error('No main Kimi renderer accepted the translation script'),
+          { failureKind: 'inspector-uncertain' });
+      }
+      return { loaded: installed, stale: 0, health };
+    },
+    now: () => Date.UTC(2026, 9, 21, 13, 58, 30),
+    candidate: true,
+  };
+  return { deps, state: () => previous, installed: () => installedCount, verified: () => verifyCount };
+}
+
+test('a historical active record with an identical revision still forces a live install', async (t) => {
+  const historical = {
+    identity: `${INFO.pid}:${INFO.started}:executable-fingerprint`,
+    revision: 'same-revision', pid: INFO.pid, started: INFO.started,
+    status: 'active', loaded: 1, inspectorClosed: true, attempts: 1,
+  };
+  const f = candidateFixture({ state: historical });
+  const saved = await tick(f.deps);
+  assert.equal(f.installed(), 1, 'a candidate never reuses a historical active record');
+  assert.equal(f.verified(), 1);
+  assert.equal(saved.status, 'active');
+  assert.equal(saved.liveVerified, true);
+  assert.notEqual(saved.revision, 'same-revision', 'the revision is recomputed from the bundle');
+  assert.equal(launchOutcome(saved), 'success');
+});
+
+test('a candidate whose hook is missing is not reported healthy', async (t) => {
+  const f = candidateFixture({ installed: 0 });
+  const saved = await tick(f.deps);
+  assert.equal(saved.status, 'blocked-inspector');
+  assert.notEqual(saved.liveVerified, true);
+  assert.equal(launchOutcome(saved), 'failed');
+  assert.match(saved.detail, /No main Kimi renderer accepted/);
+});
+
+test('a candidate that cannot attach leaves the run unverified instead of successful', async (t) => {
+  const f = candidateFixture({ verifyError: Object.assign(new Error('codesign timed out'), { killed: true }) });
+  const saved = await tick(f.deps);
+  assert.equal(saved.status, 'error');
+  assert.equal(saved.liveVerified, undefined);
+  assert.equal(launchOutcome(saved), 'transient');
+});
+
+test('a candidate with no page mounted is not a translation failure but is still unverified', async (t) => {
+  const f = candidateFixture({ health: { revision: 'rev', pages: [], current: 0, stale: 0,
+    unresponsive: 0, pending: 1, currentHealth: [], staleRevisions: [] } });
+  const saved = await tick(f.deps);
+  assert.equal(saved.renderer, 'none');
+  assert.equal(saved.pagesPending, 1);
+  assert.equal(saved.blocks, 0);
+  assert.equal(saved.translation, 'no-thinking-blocks');
+  assert.equal(saved.status, 'active');
+  assert.equal(launchOutcome(saved), 'success', 'the hook is installed; only the page has not loaded yet');
+});
+
+test('an installed hook with only stale pages is transient, not a failed injection', async (t) => {
+  const f = candidateFixture({ installed: 0, health: { revision: 'rev', pages: [], current: 0,
+    stale: 1, unresponsive: 0, pending: 0, currentHealth: [], staleRevisions: ['old'] } });
+  f.deps.installIntoProcess = async () => ({ loaded: 0, stale: 1, health: { revision: 'rev',
+    pages: [], current: 0, stale: 1, unresponsive: 0, pending: 0,
+    currentHealth: [], staleRevisions: ['old'] } });
+  const saved = await tick(f.deps);
+  assert.equal(saved.status, 'active');
+  assert.equal(saved.loaded, 0);
+  assert.equal(saved.renderer, 'stale');
+  assert.equal(launchOutcome(saved), 'transient',
+    'the new bundle must not be rolled back because a window still runs the old renderer');
+});
+
+test('a candidate whose pages are all stale is reported as a stale renderer', async (t) => {
+  const f = candidateFixture({ health: { revision: 'rev', pages: [], current: 0, stale: 2,
+    unresponsive: 0, pending: 0, currentHealth: [], staleRevisions: ['old-1', 'old-2'] } });
+  const saved = await tick(f.deps);
+  assert.equal(saved.renderer, 'stale');
+  assert.equal(saved.pagesStale, 2);
+  assert.deepEqual(saved.staleRevisions, ['old-1', 'old-2']);
+  assert.equal(saved.liveVerified, true);
+});
+
+test('a candidate with current pages and no thinking blocks is a confirmed healthy start', async (t) => {
+  const f = candidateFixture({ health: { revision: 'rev', pages: [], current: 1, stale: 0,
+    unresponsive: 0, pending: 0, staleRevisions: [],
+    currentHealth: [{ ready: true, enabled: true, blocks: 0, mounted: 0,
+      unsupported: 0, translated: 0, failed: 0 }] } });
+  const saved = await tick(f.deps);
+  assert.equal(saved.renderer, 'current');
+  assert.equal(saved.pagesCurrent, 1);
+  assert.equal(saved.blocks, 0);
+  assert.equal(saved.translation, 'no-thinking-blocks');
+  assert.equal(launchOutcome(saved), 'success');
+});
+
+test('an unavailable inspector never writes a healthy candidate', async (t) => {
+  const f = candidateFixture();
+  f.deps.installIntoProcess = async () => {
+    throw Object.assign(new Error('Kimi did not open its inspector'), { failureKind: 'inspector-uncertain' });
+  };
+  const saved = await tick(f.deps);
+  assert.equal(saved.status, 'blocked-inspector');
+  assert.equal(saved.liveVerified, undefined);
+  assert.equal(launchOutcome(saved), 'failed');
+});
+
+test('a retried candidate waits for its backoff instead of injecting again', async (t) => {
+  const f = candidateFixture();
+  f.deps.installIntoProcess = async () => {
+    throw Object.assign(new Error('Inspector port 9229 is in use'), { failureKind: 'transient' });
+  };
+  const first = await tick(f.deps);
+  assert.equal(first.status, 'error');
+  assert.equal(f.installed(), 0);
+  const second = await tick(f.deps);
+  assert.equal(second.status, 'error');
+  assert.equal(second.detail, first.detail, 'the second tick reuses the recorded failure');
+  assert.equal(launchOutcome(second), 'transient');
+});
+
+test('page health separates current, stale, pending and unresponsive pages', async () => {
+  assert.deepEqual(pageHealth({ current: 1, stale: 2, pending: 1, unresponsive: 1,
+    staleRevisions: ['a'], currentHealth: [{ blocks: 3, mounted: 3 }] }), {
+    renderer: 'stale', pagesCurrent: 1, pagesStale: 2, pagesPending: 1, pagesUnresponsive: 1,
+    staleRevisions: ['a'], blocks: 3, mounted: 3, translation: 'unconfirmed',
+  });
+  assert.deepEqual(pageHealth(null), {});
+  assert.equal(pageHealth({ current: 0, stale: 0, pending: 0, unresponsive: 0,
+    currentHealth: [] }).renderer, 'none');
+  assert.equal(pageHealth({ current: 1, stale: 0, pending: 0, unresponsive: 0,
+    currentHealth: [{ blocks: 2, mounted: 0 }] }).translation, 'unmounted');
 });

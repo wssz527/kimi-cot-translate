@@ -1,14 +1,14 @@
 {
-  "version": "0.2.11",
-  "base": "https://raw.githubusercontent.com/wssz527/kimi-cot-translate/v0.2.11",
+  "version": "0.3.0",
+  "base": "https://raw.githubusercontent.com/wssz527/kimi-cot-translate/v0.3.0",
   "files": {
     "runtime-windows.mjs": "35f02903bd5105f3c6ca4c4ffc42630380cb76666b035d612b8756606bbc29cb",
-    "runtime.mjs": "48256e68450b32d694de3cafdab0a69620cd8e90a0eef64a26a2d98c0b4a3b84",
-    "runtime-hook.mjs": "7bda813d0bd0e7397619cae77f8e7abbd29629e1f793652e86fe5c560de10018",
-    "runtime-update.mjs": "ded054756ca585a0ff1da701e043e2cc2414d73732caec351d97f9aed34ea708",
+    "runtime.mjs": "bdb7608413ddef55626ac6e6b4763485e167521e7463ff951c336002dc4fbaa1",
+    "runtime-hook.mjs": "101fa8bd20ce4f336f5ddcd1d3c78a9c9a188d4bd30d1879acb477da473858b2",
+    "runtime-update.mjs": "a10f26b233fdc35360c5ab34fc48258ced560998fc7952d532ae8e27288c88bf",
     "windows-bridge.ps1": "19d30809594565e17966c16ef7a3df1d73fb361cdde8292d62a9e9e3c2dd9336",
     "supported-windows-runtimes.json": "60bf85266efc7880ed3386c2dd6b3359f2f92f0482c007e99d21cff9f77add2b",
     "supported-runtimes.json": "ce40cd9f30c250913d3bd6bbb4cd3c53ded949eee55bb9b93c1a935878ce6814",
-    "kct.js": "1288d5d3192769fde80e18432e0863a226d282270cd61bdfbb215a7fb4b13f1e"
+    "kct.js": "07960f58c6c0694a8efefb01ff660df63e5a146c997f2178163a7f3d9a3ce700"
   }
 }

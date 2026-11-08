@@ -1,12 +1,12 @@
 {
   "name": "kimi-cot-translate",
-  "version": "0.2.11",
+  "version": "0.3.0",
   "engines": {
     "node": "24.x"
   },
   "scripts": {
     "test": "node --test test.cjs runtime-hook.test.mjs cli.test.mjs cli-acp.test.mjs",
-    "test:macos": "node --test runtime.test.mjs",
+    "test:macos": "node --test runtime.test.mjs legacy-upgrade.test.mjs legacy-bootstrap.test.mjs",
     "test:windows": "node --test runtime-windows.test.mjs",
     "test:browser": "node --test --test-timeout=30000 browser/browser.test.mjs",
     "build:browser": "node browser/build.mjs",

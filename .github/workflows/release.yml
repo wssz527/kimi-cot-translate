@@ -47,9 +47,13 @@ jobs:
           mkdir -p "$STAGE/kimi-cot-translate-${VERSION}/vscode/vendor"
           cp vscode/vendor/kct.cjs "$STAGE/kimi-cot-translate-${VERSION}/vscode/vendor/"
           (cd "$STAGE" && zip -qr "$GITHUB_WORKSPACE/kimi-cot-translate-${VERSION}.zip" "kimi-cot-translate-${VERSION}")
+          # Windows installs from the same source tree (runtime-windows.mjs plus
+          # windows-bridge.ps1), so it gets its own archive of that tree rather
+          # than a separate build: there is no compiled output to package.
+          (cd "$STAGE" && zip -qr "$GITHUB_WORKSPACE/kimi-cot-translate-${VERSION}-windows.zip" "kimi-cot-translate-${VERSION}")
           (cd browser/dist && zip -qr "$GITHUB_WORKSPACE/kct-browser-${VERSION}.zip" .)
           (cd "$STAGE/kimi-cot-translate-${VERSION}/vscode" && zip -qr "$GITHUB_WORKSPACE/kct-copied-thinking-${VERSION}.vsix" .)
-          shasum -a 256 "kimi-cot-translate-${VERSION}.zip" "kct-browser-${VERSION}.zip" "kct-copied-thinking-${VERSION}.vsix" > SHA256SUMS.txt
+          shasum -a 256 "kimi-cot-translate-${VERSION}.zip" "kimi-cot-translate-${VERSION}-windows.zip" "kct-browser-${VERSION}.zip" "kct-copied-thinking-${VERSION}.vsix" > SHA256SUMS.txt
           cat SHA256SUMS.txt
       - name: Smoke test packaged source
         run: |
@@ -66,6 +70,7 @@ jobs:
             --title "$GITHUB_REF_NAME" \
             --notes-file RELEASE_NOTES.md \
             "kimi-cot-translate-${GITHUB_REF_NAME}.zip" \
+            "kimi-cot-translate-${GITHUB_REF_NAME}-windows.zip" \
             "kct-browser-${GITHUB_REF_NAME}.zip" \
             "kct-copied-thinking-${GITHUB_REF_NAME}.vsix" \
             SHA256SUMS.txt

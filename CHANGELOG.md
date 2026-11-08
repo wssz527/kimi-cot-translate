@@ -4,7 +4,47 @@
 
 宿主（Kimi Code / Electron）兼容性变化不跟随本项目版本号：`supported-runtimes.json` 哈希的新增与失效单独记录在 `docs/compat.md`。
 
-## [Unreleased]
+## [0.3.0] - 2026-11-08
+
+### 新增
+
+- **macOS 稳定启动器与原子版本切换**：新增 `runtime-launcher.mjs`，LaunchAgent 只引用数据目录里的稳定入口；运行文件写入 `versions/<sha256>/`，逐个校验 SHA-256 后原子切换 `deployment.json`。普通模块更新不再 `bootout/bootstrap`，只有启动器或 plist 变化才执行带迁移日志的受控迁移。
+- **结构化启动结果**：`runtime.mjs --once` 写入 `.last-run.json`，区分 `success` / `waiting` / `transient` / `failed` / `incompatible`，并携带本次启动 ID。启动器只接受 ID 匹配、真实注入成功的结果，不再把“退出码 0 但状态 error”当成健康。
+- **`--doctor` 实时诊断**：分别报告安装/版本指针、LaunchAgent、进程发现、Hook 注入、页面挂载、翻译和最近更新；每项标注 `live` / `history` / `unknown`，不把历史 `active` 当成当前已注入。新增 `--repair`，服务未注册时只重新注册，不卸载现有任务。
+- **`--refresh` 安全刷新入口**：只对 revision 落后于当前 Hook 的页面调用 `webContents.reload()`；用户设置和缓存保存在 localStorage，不重复注入监听器。`--doctor` 会把这些页面标为 `stale-renderer`。
+- **页面健康指标**：`kct.js` 暴露只读 `window.__kct.health()`，hook 汇总每个渲染页面的 revision / stale / blocks / mounted / unsupported / translated / failed；渲染进程退出时清除旧的 loaded 状态。
+- **自更新缓存**：下载的运行时文件按清单哈希缓存，重试只补齐缺失或损坏文件；清单变化自动清空缓存，成功后删除。
+- **60 秒兜底唤醒**：LaunchAgent 增加 `StartInterval=60`，目录监听漏事件时仍能重新检查。
+
+### 修复
+
+- **候选版本只有真实注入成功才会标记健康**：启动器读取结构化结果；`waiting` / `transient` 保持候选并等待下一次运行，`failed` / `incompatible` 或缺少确认结果时回滚到 `previous`。等待状态不再消耗失败次数，也不会写入 `healthyAt`。
+- **自动更新显式禁止 LaunchAgent 迁移**：`deploy` 默认 `allowMigration: false`，自动更新路径强制关闭迁移；即使 `XPC_SERVICE_NAME` 缺失或异常，也只会在切换指针阶段失败并提示终端执行 `--install`，不会 `bootout/bootstrap`。只有 `--install` 和显式终端 `--update` 允许迁移。
+- **运行锁增加所有者启动时间**：锁目录写入 `pid` + `owner.json`（含进程启动时间）；PID 被复用时启动时间不匹配才回收，无法验证时保守保留，避免误删有效锁。
+- **渲染器版本滞后可被识别**：Hook 比较自身 revision 与页面 revision，`--doctor` 报告 `stale-renderer`，不再把旧页面上的新 Hook 误报成新版页面。
+- **更新失败有界退避**：检查成功才记录 `updateCheckedFor`；网络或校验失败按 1/5/30 分钟退避，最多 4 次，同一进程不重复下载相同文件。
+- **签名验证成为放行条件（macOS）**：恢复 `codesign --verify` 对官方签名、标识和团队身份的校验；失败停止挂载。打包 CSS 只作辅助证据，实时页面在注入后检查，避免官方改类名/资源名导致误停。
+- **迁移恢复顺序**：迁移日志在服务恢复成功后才删除，bootstrap 失败时下次仍可重试；`--repair` 会先确认稳定入口确实带 `launch()`，避免把旧加载器重新注册成后台服务。
+- **诊断与注入互斥**：`--doctor` 的实时探测先获取运行时锁，忙时报告 `busy`，不与 `--once` 争用 inspector 端口。
+
+### 修复（第三轮审查返工）
+
+- **v0.2.11 旧用户可安全进入新架构**：新增旧布局识别与一次性迁移。显式 `--install` 时写迁移日志、暂停服务、把磁盘上的旧五文件存成独立可回滚版本、再存新六文件、替换稳定入口与 plist，失败自动还原旧入口/plist 并重启旧服务。自动更新路径绝不 `bootout`，只做文件级迁移并原地替换入口（路径不变，launchd 无需改动），下一次触发由启动器完成确认。
+- **旧更新器留下的半迁移状态可自愈**：v0.2.11 的更新器只下载自己那五个文件，可能留下“五个文件已换新但没有启动器、没有版本指针”的安装。`migrateLegacyInPlace()` 会核对磁盘文件与发布清单一致后只补拉 `runtime-launcher.mjs`，重建版本目录与指针。
+- **候选版本必须实时验证**：候选启动跳过一切历史状态复用，强制重新验证应用签名、重新注入 Hook 并读取页面。`launchOutcome` 要求本次运行有 `liveVerified`；历史 `active` 记录只能得到 `transient`。自相矛盾的“声称 active 但未实时验证”按失败处理并回滚。
+- **页面 revision 分层统计**：Hook 现在区分“页面已挂载”和“本 revision 已挂载”。旧页面继续回答 `loaded` 时记为 `stale`，不再被计为成功注入；`health()` 返回 current / stale / pending / unresponsive 四类计数，只有当前 revision 的页面参与渲染健康判断。
+- **旧渲染器不会被误判为失败**：Hook 装好但打开的窗口仍跑旧 `kct.js` 时结果是 `transient`，候选保持待确认；连续 3 次启动后标记 `rendererStale` 并记录 `--refresh` 提示，而不是无限等待或错误回滚。
+- **无回滚目标时不留下损坏安装**：候选失败且没有 `previous` 时，稳定入口直接运行当前版本并标记 `degraded`，而不是让安装停在无法启动的指针上。
+
+- **五文件安装可以自我修复**：旧版更新器只部署五个文件，新版 `runtime.mjs` 可能成为没有 `runtime-launcher.mjs` 的入口。迁移现在按「识别旧布局 → 取发布清单 → 校验本地五文件 → 下载并校验启动器 → 原子写入并复核 → 才动态导入启动器」的顺序执行，不再在启动器存在之前导入它。任何一步失败都不写入指针，旧文件保持可运行，下次启动自动重试。
+- **入口类型判定不再依赖单个字符串**：`runtime.mjs` 自身含有启动器的函数签名（用于校验），只看签名会把运行时误判成启动器。判定改为「含 `launch(` 且不含 `tick(`」。
+
+### 测试
+
+- 新增 `legacy-bootstrap.test.mjs`（5 项）：在完全隔离的临时目录里只放旧版五文件，从该目录的 `runtime.mjs` 启动迁移，用本地模拟下载验证启动器获取、校验、安装与指针一致性，并覆盖下载失败保留可运行旧文件、重试成功、本地文件被篡改时拒绝迁移。
+- 新增 `legacy-upgrade.test.mjs`（14 项），直接以 `v0.2.11` 标签下的原始代码作为升级入口，覆盖旧更新器漏掉启动器、半迁移自愈、显式/自动迁移、迁移失败还原、旧版回滚、诊断读取、stale 渲染器宽限与 waiting 不消耗失败次数。
+- macOS 运行时套件增至 71 项，新增历史 `active` 强制实时注入、Hook 缺失、Inspector 不可用、页面未挂载、无思考区块、页面分层统计与重试退避测试。
+- 通用 145、macOS 85（含升级测试）、Windows 39、VS Code 12、浏览器 25+2（2 项真实浏览器检查按设计跳过）全部通过；`runtime-manifest.mjs --check` 通过。
 
 ## [0.2.11] - 2026-11-08
 

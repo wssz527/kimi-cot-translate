@@ -2,15 +2,23 @@ export async function installRuntimeHook(api, rendererSource, revision) {
   const app = api?.app;
   const contents = api?.webContents;
   const previous = globalThis.__kctRuntimeHook;
+  // `loaded` counts pages that actually run this revision: a page that kept an
+  // older kct.js keeps its own __kct and answers the probe, so counting it as
+  // loaded is what let a stale renderer pass for a verified one.
   const summarize = (state) => {
     let attached = 0;
     let loaded = 0;
+    let stale = 0;
     for (const record of state?.wired?.values?.() ?? []) {
       if (record.attached) attached += 1;
       if (record.loaded) loaded += 1;
+      if (record.stale) stale += 1;
     }
-    return { revision, attached, loaded };
+    return { revision, attached, loaded, stale };
   };
+  // One expression for every revision check: a page that mounted an older
+  // bundle answers `loaded` too, so the revision is what decides.
+  const probeExpression = `(() => ({ loaded: !!window.__kct, revision: window.__kctRuntimeRevision ?? null }))()`;
 
   if (previous?.revision === revision && typeof previous.dispose === 'function') {
     if (previous.ready) await previous.ready;
@@ -101,16 +109,25 @@ export async function installRuntimeHook(api, rendererSource, revision) {
     if (!active || wired.get(wc) !== record || !allowed(wc)) return;
     record.attached = true;
     record.loaded = false;
+    record.stale = false;
     await deadline(execute(wc, record, rendererSource));
     if (!active || wired.get(wc) !== record || !allowed(wc)) return;
-    const loaded = await deadline(execute(wc, record, '!!window.__kct'));
+    const page = await deadline(execute(wc, record, probeExpression));
     if (!active || wired.get(wc) !== record) return;
-    record.loaded = loaded === true;
+    record.revision = page?.revision ?? null;
+    // A page whose __kct predates this hook keeps answering `loaded`. It runs,
+    // but not this revision, so it is reported stale instead of counted as a
+    // successful install.
+    record.stale = page?.loaded === true && record.revision !== revision;
+    record.loaded = page?.loaded === true && !record.stale;
   }
 
   async function probe(wc, record) {
     if (!active || wired.get(wc) !== record || !allowed(wc)) return;
-    record.loaded = (await deadline(execute(wc, record, '!!window.__kct'))) === true;
+    const page = await deadline(execute(wc, record, probeExpression));
+    record.revision = page?.revision ?? null;
+    record.stale = page?.loaded === true && record.revision !== revision;
+    record.loaded = page?.loaded === true && !record.stale;
   }
 
   async function pump(wc, record) {
@@ -148,17 +165,22 @@ export async function installRuntimeHook(api, rendererSource, revision) {
     const record = {
       attached: false,
       loaded: false,
+      stale: false,
+      revision: null,
       running: false,
       pending: false,
       current: null,
       inflight: null,
       onLoad: null,
+      onGone: null,
       onDestroyed: null,
     };
     record.onLoad = () => queue(wc);
+    record.onGone = () => { record.loaded = false; record.stale = false; };
     record.onDestroyed = () => {
       try {
         wc.removeListener('did-finish-load', record.onLoad);
+        wc.removeListener('render-process-gone', record.onGone);
       } catch {
         // The record is removed without touching a dead webContents again.
       }
@@ -167,10 +189,12 @@ export async function installRuntimeHook(api, rendererSource, revision) {
     wired.set(wc, record);
     try {
       wc.on('did-finish-load', record.onLoad);
+      wc.on('render-process-gone', record.onGone);
       wc.once('destroyed', record.onDestroyed);
     } catch {
       try {
         wc.removeListener('did-finish-load', record.onLoad);
+        wc.removeListener('render-process-gone', record.onGone);
       } catch {
         // Ignore an already-destroyed webContents.
       }
@@ -195,6 +219,7 @@ export async function installRuntimeHook(api, rendererSource, revision) {
     for (const [wc, record] of wired) {
       try {
         wc.removeListener('did-finish-load', record.onLoad);
+        wc.removeListener('render-process-gone', record.onGone);
       } catch {
         // Ignore an already-destroyed webContents.
       }
@@ -208,7 +233,58 @@ export async function installRuntimeHook(api, rendererSource, revision) {
     if (globalThis.__kctRuntimeHook === hook) delete globalThis.__kctRuntimeHook;
   }
 
-  const hook = { revision, wired, listener: null, dispose };
+  async function health() {
+    const pages = [];
+    for (const [wc] of wired) {
+      if (!allowed(wc)) continue;
+      try {
+        const page = await deadline(wc.executeJavaScript(`(() => {
+          const loaded = !!window.__kct;
+          const pageRevision = window.__kctRuntimeRevision ?? null;
+          if (!loaded) return { loaded: false, revision: pageRevision };
+          return { loaded: true, revision: pageRevision,
+            health: typeof window.__kct.health === 'function' ? window.__kct.health() : null };
+        })()`));
+        page.stale = page.loaded === true && page.revision !== revision;
+        pages.push(page);
+      } catch {
+        pages.push({ loaded: null, revision: null, stale: false, error: 'renderer did not answer' });
+      }
+    }
+    const mounted = pages.filter((page) => page.loaded === true);
+    const current = mounted.filter((page) => page.revision === revision);
+    const stale = mounted.filter((page) => page.revision !== revision);
+    return {
+      revision, pages,
+      current: current.length,
+      stale: stale.length,
+      unresponsive: pages.filter((page) => page.loaded === null).length,
+      pending: pages.filter((page) => page.loaded === false).length,
+      // Only pages running this revision can report on this bundle's behaviour.
+      currentHealth: current.map((page) => page.health).filter(Boolean),
+      staleRevisions: [...new Set(stale.map((page) => page.revision ?? null))],
+    };
+  }
+
+  async function reloadStale() {
+    const stale = [];
+    for (const [wc, record] of wired) {
+      if (!allowed(wc)) continue;
+      try {
+        const page = await deadline(wc.executeJavaScript(
+          `(() => ({ loaded: !!window.__kct, revision: window.__kctRuntimeRevision ?? null }))()`));
+        if (!page?.loaded || page.revision === revision) continue;
+        wc.reload();
+        record.loaded = false;
+        stale.push(page.revision ?? null);
+      } catch {
+        // A page that cannot be inspected is left untouched.
+      }
+    }
+    return { revision, reloaded: stale.length, stale };
+  }
+
+  const hook = { revision, wired, listener: null, dispose, health, reloadStale };
   listener = (_event, wc) => {
     wire(wc);
   };

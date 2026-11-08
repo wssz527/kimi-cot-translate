@@ -59,7 +59,7 @@ shasum -a 256 -c SHA256SUMS.txt
 
 安装只设置扩展的后台加载器，不会强制退出或重启 Kimi，也不修改官方安装包。首次安装会向符合校验条件的现有进程加载翻译界面。更新扩展时，已经加载旧脚本的页面在下次正常刷新或重开后使用新版，安装命令不会擅自刷新页面。
 
-机器需要先安装对应架构的 Node.js 24。执行安装前，建议先阅读 `runtime.mjs` 的校验流程（进程身份 → inspector fuse → 渲染结构）。签名与版本号只记录，不参与放行。
+机器需要先安装对应架构的 Node.js 24。执行安装前，建议先阅读 `runtime.mjs` 的校验流程（官方签名与团队身份 → 进程身份 → inspector fuse → 实时页面结构）。签名验证失败会停止挂载；版本号和打包样式文件名不作为兼容依据。
 
 ### macOS
 
@@ -69,11 +69,24 @@ shasum -a 256 -c SHA256SUMS.txt
 node runtime.mjs --install
 ```
 
-安装会校验官方 App，并把四个运行文件复制到当前用户的持久目录：
+安装会校验官方 App，把所有运行文件写入独立版本目录，并安装一个只负责启动当前版本的稳定入口：
 
 ```text
 ~/Library/Application Support/kimi-cot-translate/
+├── runtime.mjs          稳定启动器，LaunchAgent 只引用它
+├── deployment.json      原子版本指针（current / previous）
+└── versions/<sha256>/   已完成哈希校验的运行副本
 ```
+
+普通更新只写入新的版本目录并切换指针，不重新注册 LaunchAgent；只有启动器或服务配置本身变化时才执行受控迁移。自动更新路径显式禁止迁移，即使服务环境变量缺失或异常也不会卸载自身；遇到必须迁移的版本会保留当前运行并提示从终端执行 `--install`。新版本首次启动失败会自动回滚到上一份完整副本。
+
+从 v0.2.x 升级不需要手动重装。旧版安装只有五个松散文件、没有版本目录，新版会识别这种布局并一次性迁移：
+
+- 旧文件被完整保存为一个独立版本，迁移失败或新版本首次启动失败都会回到它。
+- 旧版自动更新器不认识 `runtime-launcher.mjs`，可能只把五个文件换成新版而没有写入启动器。这种情况下新版运行时会核对磁盘文件与发布清单一致，补拉启动器并复核哈希后写入，再重建版本目录和指针。下载失败不会改动任何旧文件，下次启动自动重试。
+- 迁移过程不会让后台任务卸载自身：入口路径始终是 LaunchAgent 已经引用的那个文件，服务只在显式 `--install` 时才会被暂停并重新注册。
+
+迁移后的第一次启动是候选版本，只有真实注入成功才会写入 `healthyAt`。如果 Kimi 窗口仍运行旧版 `kct.js`，`--doctor` 的 `page.status` 会显示 `stale-renderer`，执行 `--refresh` 或让窗口正常刷新一次即可。
 
 后台任务位于：
 
@@ -81,7 +94,7 @@ node runtime.mjs --install
 ~/Library/LaunchAgents/com.user.kimi-cot-translate.runtime.plist
 ```
 
-登录时运行一次，之后只在 Kimi Code 的用户数据目录发生变化（即 Kimi 正在运行）时被唤醒。正常打开 Kimi Code 后，通常十几秒内自动挂载。Kimi 关闭后该目录静止，后台任务完全不被唤醒：不轮询、不驻留、不联网。加载器不会启动或退出 Kimi，也不会创建第二个 Kimi 应用。
+登录时运行一次；Kimi 运行期间，用户数据目录变化会立即唤醒它，另有 60 秒低频兜底检查，避免目录事件漏触发。正常打开 Kimi Code 后，通常十几秒内自动挂载。Kimi 关闭后兜底检查仍会启动，但只读本地进程表和状态文件，不驻留、不联网，也不启动或退出 Kimi。加载器不会创建第二个 Kimi 应用。
 
 运行副本独立于解压目录，安装后移动源码不会影响它。后台任务使用安装时 Node 的绝对路径；如果移除或移动该 Node，请重新执行安装命令。
 
@@ -184,7 +197,11 @@ code --extensionDevelopmentPath="$PWD/vscode"
 macOS：
 
 ```sh
-node "$HOME/Library/Application Support/kimi-cot-translate/runtime.mjs" --check
+D="$HOME/Library/Application Support/kimi-cot-translate"
+node "$D/runtime.mjs" --check     # 最近一次后台检查的历史记录
+node "$D/runtime.mjs" --doctor    # 实时探测当前安装、服务、进程、注入、页面和翻译
+node "$D/runtime.mjs" --repair    # 服务未注册时，仅重新注册 LaunchAgent
+node "$D/runtime.mjs" --refresh   # 只刷新 revision 落后的页面
 ```
 
 Windows 在本仓库目录执行：
@@ -193,12 +210,18 @@ Windows 在本仓库目录执行：
 node runtime-windows.mjs --check
 ```
 
-状态是最近一次后台检查的记录：
+`--check` 只反映最近一次后台检查，不能证明当前页面仍在运行；需要实时结论时使用 `--doctor`。诊断把「实时确认」「历史记录」「无法确认」分开标注，不会把历史 `active` 当成当前已注入。
 
-- `active`、`loaded: 1`：所记录的 PID 已完成挂载。
+后台检查状态的常见值：
+
+- `active`、`loaded: 1`：所记录的 PID 当时已完成挂载。
 - `waiting`：等待正常实例启动，或等待多个实例、端口占用等条件解除。
-- `error`：校验或挂载失败，读取 `detail`；瞬时失败会退避后自动重试，永久不兼容（inspector fuse 被禁用、思考区块结构变化）不会重试。
+- `error`：校验或挂载失败，读取 `detail`；瞬时失败会退避后自动重试，永久不兼容（官方签名/团队身份失败、inspector fuse 被禁用）不会重试。页面结构是否真的可用，以 `--doctor` 的 `page.status` 为准。
 - `blocked-inspector`（仅 macOS）：调试接口未能确认关闭，请正常退出 Kimi，再查看日志。
+
+`--doctor` 会分别报告：安装与版本指针、LaunchAgent 注册与配置、进程发现、Hook 注入、页面挂载、翻译结果、最近更新。每项标注 `live` / `history` / `unknown`，并明确 inspector 是否已关闭。
+
+如果页面仍运行旧版 `kct.js`，`page.status` 会显示 `stale-renderer`，`injection.staleRenderers` 给出数量。执行 `--refresh` 只会重载这些落后页面；用户设置和缓存保存在 localStorage，不会被清除。刷新会中断当前页面的未保存界面状态，只应在需要时手动执行。
 
 状态保存在对应用户数据目录的 `runtime-state.json`，macOS 另有 `runtime.log`。Windows 数据目录为 `%LOCALAPPDATA%\kimi-cot-translate\windows`。这些诊断记录不包含会话正文或服务密钥。
 
@@ -218,15 +241,15 @@ node runtime-windows.mjs --disable
 
 ## Kimi 更新后的行为
 
-扩展文件位于官方 App 以外，正常 App 更新不会覆盖这些文件。新进程启动后，后台任务会重新检查实际运行的进程与文件、注入能力和思考区块结构，再自动挂载。
+扩展文件位于官方 App 以外，正常 App 更新不会覆盖这些文件。新进程启动后，后台任务会重新检查实际运行的进程与文件、官方签名与注入能力，并在页面里确认思考区块结构，再自动挂载。
 
-**日常跟随不需要你做任何事。** 判断能否继续用的不是版本号，而是注入能力与思考区块的界面结构：
+**日常跟随不需要你做任何事。** 判断能否继续用的不是版本号，而是官方签名、注入能力与实时页面结构：
 
-- 官方更新后如果 `.think` / `.think-head` / `.think-body` / `.think-body-inner` / `.think-text` 这五个结构仍在，且注入能力还在，翻译会直接继续工作，不必等新版、也不必重装。
-- 跨 Electron 大版本同样如此：版本号本身不参与判断，只用于状态展示。Kimi Code 1.3.1 从 Electron 43 升到 45 时就是这种情况，结构没变、翻译照常。
-- 只有注入能力或结构真的变了，翻译才会停用并等待适配——这才是「上游坏了、需要我修」的情况。
+- 官方更新后如果官方签名仍有效、inspector 仍可用，且实时页面里仍能识别思考区块，翻译会直接继续工作，不必等新版、也不必重装。
+- 跨 Electron 大版本同样如此：版本号本身不参与判断，只用于状态展示。Kimi Code 1.3.1 从 Electron 43 升到 45 时就是这种情况，签名与结构都没变、翻译照常。
+- 只有官方签名、注入能力或实时页面结构真的变了，翻译才会停用并等待适配——这才是「上游坏了、需要我修」的情况。
 
-组件自身也会自动跟版，但**只在 Kimi Code 运行时**：每次 Kimi 启动后检查一次仓库发布的更新清单，发现新版本就下载运行时文件、逐个校验 SHA-256，通过后原子替换（失败自动回滚）。同一个 Kimi 进程不会重复检查；Kimi 关闭期间不发任何网络请求。
+组件自身也会自动跟版，但**只在 Kimi Code 运行时**：每次 Kimi 启动后检查一次仓库发布的更新清单，发现新版本就下载运行时文件、逐个校验 SHA-256，写入新的版本目录并原子切换指针；新版本只有真实注入成功才会被标记健康，否则回到 `previous`。普通文件更新不会重新注册 LaunchAgent；自动路径禁止迁移，启动器或服务配置变化时保留当前运行并提示从终端执行 `--install`。同一个 Kimi 进程不会重复检查；Kimi 关闭期间不发任何网络请求。
 
 两个入口各用各的清单：macOS 读 `runtime-manifest.json`，Windows 读 `runtime-manifest-windows.json`（多出 `runtime-windows.mjs` 与 `windows-bridge.ps1`）。Windows 的替换从暂存副本完成并重新注册计划任务，因为正在运行的脚本文件无法原地覆盖。
 
@@ -237,16 +260,18 @@ node runtime.mjs --update            # macOS
 node runtime-windows.mjs --update    # Windows
 ```
 
-更新状态写在 `--check` 输出的 `updateStatus` / `updateVersion` 字段里（`up-to-date` / `installed` / `available` / `staged` / `failed`），`updateCheckedFor` 记录已检查过的那次启动。
+更新状态写在 `--check` 输出的 `updateStatus` / `updateVersion` 字段里（`up-to-date` / `available` / `staged` / `failed`），`updateCheckedFor` 记录已检查过的那次启动。
 
-为什么仍然保留哈希允许列表：完全验证过的内核走快速路径，跳过额外探测。未知哈希不再直接熔断，而是转入上面的结构校验——这是「不因官方小版本升级而中断」的关键改动。
+为什么仍然保留哈希允许列表：完全验证过的内核走快速路径，跳过额外探测。未知哈希不再直接熔断，而是继续验证官方签名与 inspector fuse；打包样式只作辅助证据，实时页面在注入后再检查。这是「不因官方小版本升级而中断」的关键改动。
 
 常见现象对照：
 
 | 现象 | 可能原因 | 处理 |
 | --- | --- | --- |
-| 更新后翻译消失，detail 含 `reasoning UI changed` | 思考区块结构变了 | 提兼容性报告，等待适配版本 |
-| detail 含 `reasoning UI changed` 或 fuse 被禁用 | 官方包结构或调试能力变化 | 同上；不要手工绕过 |
+| detail 含 `signature or signing identity` | 官方签名或团队身份无法验证 | 确认官方 App 完整；如官方轮换证书，等待更新签名要求 |
+| `--doctor` 的 `page.status` 为 `stale-renderer` | 页面仍在运行旧版 `kct.js` | 执行 `--refresh`，或手动刷新页面 |
+| `--doctor` 的 `page.status` 为 `unsupported-structure` | 实时页面里思考区块结构变了 | 提兼容性报告，等待适配版本 |
+| detail 含 fuse 被禁用 | 官方关闭了 inspector 能力 | 无法安全注入；不要手工绕过 |
 | `blocked-inspector` | 调试接口未确认关闭 | 正常退出 Kimi 后查看日志 |
 
 这不是官方承诺稳定的扩展 API，不能保证所有未来版本都兼容。当前只验证过正常重启恢复和页面刷新恢复，尚未完成真实跨版本升级验收。静态结构检查也无法证明所有新版交互都兼容。
@@ -256,7 +281,7 @@ node runtime-windows.mjs --update    # Windows
 ## 已知限制
 
 - 已验证 Kimi Code 1.3.1 / Electron 45.1.0 与 1.1.1 / 1.1.2 / Electron 43.1.1（均为 macOS arm64）；Electron 45 的 Windows 分支、真实跨版本升级链路、睡眠唤醒、长期运行尚未验收。
-- 宿主版本号不参与放行判断：只要进程身份、inspector fuse 与思考区块结构三项成立，跨 Electron 大版本也会继续挂载；三者之一失效则停用并写出具体原因。
+- 宿主版本号不参与放行判断：只要官方签名与团队身份、进程身份、inspector fuse 成立，跨 Electron 大版本也会继续挂载；其中任一项失效则停用并写出具体原因。官方轮换证书或团队身份时，需要更新代码中的签名要求，不能绕过校验。
 - 不支持 Kimi 桌面端（Kimi.app，com.moonshot.kimichat）：官方在其 Electron 二进制中关闭了 Node inspector fuse，本项目的运行时注入机制在技术上无法挂载，且本项目不会通过修改官方二进制绕过。Kimi 网页版（kimi.com）用户请使用浏览器扩展入口。
 - kimi.com 普通聊天页未在登录会话验收；VS Code 入口未在真实扩展宿主验收。
 - 翻译使用公共免鉴权端点（Bing / Google），无 SLA，可能限流、变更或受服务方条款约束；长期或大量使用建议使用自带凭据的自定义服务。

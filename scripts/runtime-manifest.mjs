@@ -20,7 +20,8 @@ const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 // loader files it never installs.
 const MANIFESTS = [
   { out: 'runtime-manifest.json',
-    files: ['runtime.mjs', 'runtime-hook.mjs', 'runtime-update.mjs', 'supported-runtimes.json', 'kct.js'] },
+    files: ['runtime.mjs', 'runtime-hook.mjs', 'runtime-update.mjs', 'runtime-launcher.mjs',
+      'supported-runtimes.json', 'kct.js'] },
   { out: 'runtime-manifest-windows.json',
     files: ['runtime-windows.mjs', 'runtime.mjs', 'runtime-hook.mjs', 'runtime-update.mjs',
       'windows-bridge.ps1', 'supported-windows-runtimes.json', 'supported-runtimes.json', 'kct.js'] },

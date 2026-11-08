@@ -2,7 +2,7 @@
 // The official app stays sealed; only the running, verified main process is touched.
 import { createHash } from 'node:crypto';
 import { execFile } from 'node:child_process';
-import { mkdir, mkdtemp, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, open, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { connect } from 'node:net';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -10,7 +10,8 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { promisify } from 'node:util';
 import { installRuntimeHook } from './runtime-hook.mjs';
-import { downloadBundle, localVersion, resolveUpdate } from './runtime-update.mjs';
+import { downloadBundle, fetchManifest, localVersion, resolveUpdate, RUNTIME_FILES,
+  versionedManifestUrl } from './runtime-update.mjs';
 
 const run = promisify(execFile);
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -25,10 +26,13 @@ export const DATA = join(homedir(), 'Library/Application Support/kimi-cot-transl
 const KIMI_PROFILE = join(homedir(), 'Library/Application Support/kimi-code-app');
 const WATCH_PATHS = [KIMI_PROFILE, join(KIMI_PROFILE, 'Local Storage'), join(KIMI_PROFILE, 'Session Storage')];
 const STATE = join(DATA, 'runtime-state.json');
+const RUN_RESULT = join(DATA, '.last-run.json');
+const LEGACY_JOURNAL = join(DATA, '.legacy-migration.json');
 const LABEL = 'com.user.kimi-cot-translate.runtime';
 const PLIST = join(homedir(), 'Library/LaunchAgents', `${LABEL}.plist`);
 const hash = (bytes) => createHash('sha256').update(bytes).digest('hex');
-const CORE_FILES = ['runtime.mjs', 'runtime-hook.mjs', 'runtime-update.mjs', 'supported-runtimes.json', 'kct.js'];
+const CORE_FILES = ['runtime.mjs', 'runtime-hook.mjs', 'runtime-update.mjs', 'runtime-launcher.mjs',
+  'supported-runtimes.json', 'kct.js'];
 const SETTLED = new Set(['active', 'error', 'blocked-inspector', 'checking']);
 export const MAX_ATTEMPTS = 8;
 export const retryDelay = (attempts) => [30000, 120000, 600000, 1800000][
@@ -150,53 +154,63 @@ export function assertRendererContract(css) {
 }
 
 // The hash allowlist is the fast path for a fully validated runtime. An unknown
-// hash is still allowed when the official signature, the inspector fuse and the
-// renderer contract all hold. Those three are the only properties that decide
-// whether attaching can work, and none of them is inferred from a version
-// number: an official update that leaves them intact keeps translating, whether
-// it is a point release or an Electron major ahead.
+// hash is still allowed when the official signature and the inspector fuse hold.
+// The packaged stylesheet is auxiliary evidence only; the live page is inspected
+// after attachment. None of these gates is inferred from a version number, so an
+// official update that leaves them intact keeps translating.
 export async function verifyApp(deps = {}) {
   const identify = deps.fingerprint ?? fingerprint;
   const command = deps.output ?? output;
   const read = deps.readFile ?? readFile;
   const before = await identify(EXECUTABLE);
-  // The signature is reported, never required. This is a free third-party
-  // display-layer translator: whether the host is vendor-signed has no bearing on
-  // whether translation can work, and gating on it made an official certificate
-  // rotation or a re-signed build disable the extension. What still protects the
-  // attachment is the process identity check before any signal is sent.
-  const signature = { status: 'unknown' };
+  const codesign = deps.run ?? run;
+  const requirement = 'anchor apple generic and identifier "com.kimi.code.desktop" and certificate leaf[subject.OU] = "2J9472RW75"';
   try {
-    const detail = await (deps.run ?? run)('/usr/bin/codesign', ['-dv', '--verbose=2', APP], { timeout: 10000 });
-    signature.status = 'Valid';
-    signature.team = /^TeamIdentifier=(.+)$/m.exec(detail.stderr)?.[1]?.trim();
-    signature.identifier = /^Identifier=(.+)$/m.exec(detail.stderr)?.[1]?.trim();
-  } catch { /* unsigned or unreadable: recorded as unknown */ }
+    await codesign('/usr/bin/codesign', ['--verify', '--strict', '--deep', `-R=${requirement}`, APP], { timeout: 20000 });
+  } catch (error) {
+    if (error.killed || error.code === 'ETIMEDOUT') throw error;
+    throw permanentError('Official Kimi signature or signing identity could not be verified');
+  }
+  const signature = { status: 'valid', identifier: 'com.kimi.code.desktop', team: '2J9472RW75' };
+  const frameworkBefore = await identify(FRAMEWORK);
   const binary = await read(FRAMEWORK);
   inspectFuses(binary);
   const supported = JSON.parse(await read(join(HERE, 'supported-runtimes.json'), 'utf8'));
   const known = supported.find((item) => item.sha256 === hash(binary));
-  // Reported for diagnostics only. It is read but never gates attachment.
-  const electron = known?.electron ?? (await command('/usr/libexec/PlistBuddy', [
+  const electron = known?.electron ?? await command('/usr/libexec/PlistBuddy', [
     '-c', 'Print :CFBundleVersion', ELECTRON_INFO,
-  ])).trim();
-  if (!/^\d+\.\d+\.\d+$/.test(electron)) {
-    throw permanentError('Cannot read the Electron version of this Kimi build');
-  }
-  const version = (await command('/usr/libexec/PlistBuddy', [
+  ]).then((value) => value.trim(), () => null);
+  const version = await command('/usr/libexec/PlistBuddy', [
     '-c', 'Print :CFBundleShortVersionString', join(APP, 'Contents/Info.plist'),
-  ])).trim();
-  const dist = join(APP, 'Contents/Resources/desktop-dist');
-  const index = await read(join(dist, 'index.html'), 'utf8');
-  const assets = [...index.matchAll(/href="(\/assets\/[A-Za-z0-9_-]+\.css)"/g)].map((item) => item[1]);
-  assertRendererContract((await Promise.all(assets.map((name) => read(join(dist, name), 'utf8')))).join('\n'));
-  if (before !== await identify(EXECUTABLE)) throw new Error('Application changed during verification');
-  return { version, electron, executable: before, signature, verified: known ? 'exact' : 'contract' };
+  ]).then((value) => value.trim(), () => null);
+  let rendererContract = 'unknown';
+  try {
+    const dist = join(APP, 'Contents/Resources/desktop-dist');
+    const index = await read(join(dist, 'index.html'), 'utf8');
+    const assets = [...index.matchAll(/href\s*=\s*["'](\/assets\/[A-Za-z0-9_.-]+\.css)(?:\?[^"']*)?["']/gi)]
+      .map((item) => item[1]);
+    if (assets.length) {
+      assertRendererContract((await Promise.all(assets.map((name) => read(join(dist, name), 'utf8')))).join('\n'));
+      rendererContract = 'present-in-styles';
+    }
+  } catch {
+    // Stylesheet classes are auxiliary evidence only: asset names and class
+    // hashes change between builds, and the live page is the authority.
+    rendererContract = 'unknown';
+  }
+  if (before !== await identify(EXECUTABLE) || frameworkBefore !== await identify(FRAMEWORK)) {
+    throw new Error('Application changed during verification');
+  }
+  return { version, electron, executable: before, framework: frameworkBefore, signature,
+    rendererContract, verified: known ? 'exact' : 'capabilities' };
 }
 
 async function verifyLiveProcess(info, app) {
   assertIdentity(await processIdentity(info.pid), info);
-  if (await fingerprint(EXECUTABLE) !== app.executable) throw new Error('Application changed during attachment');
+  if (await fingerprint(EXECUTABLE) !== app.executable
+    || (app.framework && await fingerprint(FRAMEWORK) !== app.framework)) {
+    throw new Error('Application changed during attachment');
+  }
   const files = await output('/usr/sbin/lsof', ['-nP', '-a', '-p', String(info.pid), '-d', 'txt', '-Fin']);
   const inode = (await stat(EXECUTABLE)).ino;
   if (!files.includes(`i${inode}\nn${EXECUTABLE}\n`)) throw permanentError('Running executable does not match the verified app');
@@ -288,7 +302,8 @@ export async function attachInspector(info, app, operations = {}) {
     };
     // The first command arms a deadline before inspecting identity or loading plugin code.
     const identity = await evaluate(inspectorDeadlineExpression(info.pid));
-    if (identity?.pid !== info.pid || identity.type !== 'browser' || identity.electron !== app.electron) {
+    if (identity?.pid !== info.pid || identity.type !== 'browser' || !identity.electron
+      || (app.electron && identity.electron !== app.electron)) {
       throw new Error('Inspector identity mismatch');
     }
     return {
@@ -352,8 +367,15 @@ export async function installIntoProcess(info, app, source, revision, operations
       return await (${installRuntimeHook.toString()})(electron,
         ${JSON.stringify(rendererBootstrap(source, revision))},${JSON.stringify(revision)});
     })()`);
-    if (!result?.loaded) throw new Error('No main Kimi renderer accepted the translation script');
-    return result;
+    if (!result?.loaded && !result?.stale) throw new Error('No main Kimi renderer accepted the translation script');
+    // Read the page-level picture in the same inspector session: one signal per
+    // run, no extra attachment, and the answer describes this revision only.
+    const health = await inspector.evaluate(`(async () => {
+      const hook = globalThis.__kctRuntimeHook;
+      if (!hook || typeof hook.health !== 'function') return null;
+      return await hook.health();
+    })()`).catch(() => null);
+    return { ...result, health };
   } catch (error) {
     error.failureKind = 'inspector-uncertain';
     throw error;
@@ -373,8 +395,86 @@ export async function saveState(state, file = STATE) {
   await rename(`${file}.next`, file);
 }
 
+export function launchOutcome(state, error) {
+  if (error) return error.failureKind === 'permanent' ? 'incompatible' : 'failed';
+  switch (state?.status) {
+    case 'active':
+      // `liveVerified` records that this very run attached to the process,
+      // installed the hook and read the page back. A reused historical `active`
+      // record proves none of that, so it can never confirm a candidate.
+      if (state.liveVerified !== true) return 'transient';
+      if (state.inspectorClosed !== true) return 'failed';
+      if ((state.loaded ?? 0) > 0) return 'success';
+      // The hook is installed and every open window still runs the previous
+      // kct.js. The new bundle is in place; the pages adopt it on their next
+      // load, which is the user's window to close or refresh — not a failure.
+      if (state.renderer === 'stale') return 'transient';
+      return 'failed';
+    case 'waiting':
+      return 'waiting';
+    case 'error':
+    case 'blocked-inspector':
+      if (state.failureKind === 'permanent') return 'incompatible';
+      if (state.failureKind === 'transient') return 'transient';
+      return 'failed';
+    default:
+      return 'transient';
+  }
+}
+
+async function writeRunResult(state, error) {
+  const result = {
+    id: process.env.KCT_LAUNCH_ID ?? null,
+    candidate: process.env.KCT_CANDIDATE_ID ?? null,
+    outcome: launchOutcome(state, error),
+    status: state?.status ?? 'error',
+    failureKind: state?.failureKind ?? error?.failureKind ?? null,
+    loaded: state?.loaded ?? 0,
+    inspectorClosed: state?.inspectorClosed === true,
+    liveVerified: state?.liveVerified === true,
+    revision: state?.revision ?? null,
+    pid: state?.pid ?? null,
+    renderer: state?.renderer ?? null,
+    pagesCurrent: state?.pagesCurrent ?? null,
+    pagesStale: state?.pagesStale ?? null,
+    pagesPending: state?.pagesPending ?? null,
+    pagesUnresponsive: state?.pagesUnresponsive ?? null,
+    staleRevisions: state?.staleRevisions ?? [],
+    blocks: state?.blocks ?? null,
+    translation: state?.translation ?? null,
+    detail: state?.detail ?? error?.message ?? null,
+    checkedAt: state?.checkedAt ?? new Date().toISOString(),
+    finishedAt: new Date().toISOString(),
+  };
+  const next = JSON.stringify(result, null, 2) + '\n';
+  await writeFile(`${RUN_RESULT}.next`, next, { mode: 0o600 });
+  await rename(`${RUN_RESULT}.next`, RUN_RESULT);
+}
+
 function waitingState(detail, now = Date.now(), extra = {}) {
   return { status: 'waiting', detail, checkedAt: new Date(now).toISOString(), ...extra };
+}
+
+// Page-level facts travel with the run result so a candidate can be judged on
+// what the pages actually do, not only on the hook answering.
+export function pageHealth(health) {
+  if (!health) return {};
+  const current = health.currentHealth ?? [];
+  const blocks = current.reduce((count, page) => count + (page.blocks ?? 0), 0);
+  const mounted = current.reduce((count, page) => count + (page.mounted ?? 0), 0);
+  return {
+    renderer: health.stale ? 'stale' : health.current ? 'current' : 'none',
+    pagesCurrent: health.current ?? 0,
+    pagesStale: health.stale ?? 0,
+    pagesPending: health.pending ?? 0,
+    pagesUnresponsive: health.unresponsive ?? 0,
+    staleRevisions: health.staleRevisions ?? [],
+    blocks,
+    mounted,
+    // No thinking block is not a translation failure: a fresh conversation has
+    // nothing to translate yet.
+    translation: blocks === 0 ? 'no-thinking-blocks' : mounted === 0 ? 'unmounted' : 'unconfirmed',
+  };
 }
 
 function processSetIdentity(processes) {
@@ -403,55 +503,57 @@ export async function selfUpdate({
   resolve,
   deployFn,
   lock,
+  cacheDir,
 } = {}) {
   const check = await (resolve ?? (() => resolveUpdate({
     current: currentVersion, manifestUrl, fetchImpl,
   })))();
   if (!check?.available) return { updated: false, reason: 'up-to-date', current: check?.current, remote: check?.remote };
   if (!deployFn) return { updated: false, reason: 'no-deploy', available: true, remote: check.remote };
-  const files = await downloadBundle(check.manifest, { fetchImpl });
+  const files = await downloadBundle(check.manifest, { fetchImpl, cacheDir });
   await deployFn({ files, dataDir, acquire: lock });
+  if (cacheDir) await rm(cacheDir, { recursive: true, force: true });
   return { updated: true, from: check.current, to: check.remote };
 }
 
-// Update once per Kimi launch, not on a timer. `seenProcess` is the launch
-// identity that already triggered a check; a fresh Kimi start has a new one.
-async function maybeUpdate(state, {
-  now = Date.now(),
-  dataDir = DATA,
-  version,
-  updateCheck,
-  resolveUpdateFn,
-  applyUpdate,
-  processKey,
+export async function maybeUpdate(state, {
+  now = Date.now(), dataDir = DATA, version, updateCheck, resolveUpdateFn, applyUpdate, processKey,
 } = {}) {
-  if (!updateCheck || !resolveUpdateFn || !processKey) return state;
-  if (state.updateCheckedFor === processKey) return state;
-  state.updateCheckedFor = processKey;
-  state.lastUpdateCheckAt = new Date(now).toISOString();
+  if (!updateCheck || !resolveUpdateFn || !processKey || state.updateCheckedFor === processKey) return state;
+  if (state.updateAttemptFor !== processKey) {
+    state.updateAttemptFor = processKey;
+    state.updateAttempts = 0;
+    delete state.updateNextRetryAt;
+  }
+  if (state.updateAttempts >= 4 || now < Date.parse(state.updateNextRetryAt)) return state;
+  state.updateAttempts += 1;
+  state.lastUpdateAttemptAt = new Date(now).toISOString();
   try {
     const result = await resolveUpdateFn(version);
-    if (!result.available) {
-      state.updateStatus = 'up-to-date';
-      state.updateVersion = result.remote;
-      return state;
-    }
-    if (!applyUpdate) {
-      state.updateStatus = 'available';
-      state.updateVersion = result.remote;
-      return state;
-    }
-    const applied = await applyUpdate(result.manifest, dataDir);
-    state.updateStatus = applied ? 'installed' : 'deferred';
+    state.lastUpdateCheckAt = new Date(now).toISOString();
     state.updateVersion = result.remote;
+    if (!result.available) state.updateStatus = 'up-to-date';
+    else if (!applyUpdate) state.updateStatus = 'available';
+    else {
+      const applied = await applyUpdate(result.manifest, dataDir);
+      if (!applied) throw new Error('Update deployment deferred');
+      state.updateStatus = 'staged';
+    }
+    state.updateCheckedFor = processKey;
+    delete state.updateError;
+    delete state.updateNextRetryAt;
   } catch (error) {
     state.updateStatus = 'failed';
     state.updateError = error.message;
+    const migrationRequired = /migration (?:must be started outside|requires an explicit --install|requires --install)/.test(error.message);
+    if (migrationRequired) state.updateAttempts = 4;
+    state.updateNextRetryAt = state.updateAttempts >= 4 ? null
+      : new Date(now + [60000, 300000, 1800000][state.updateAttempts - 1]).toISOString();
   }
   return state;
 }
 
-export async function tick(deps = {}) {
+async function tickAttachment(deps = {}) {
   const find = deps.findProcesses ?? findProcesses;
   const save = deps.saveState ?? saveState;
   const command = deps.output ?? output;
@@ -461,19 +563,16 @@ export async function tick(deps = {}) {
   const checkPort = deps.portOpen ?? portOpen;
   const verify = deps.verifyApp ?? verifyApp;
   const install = deps.installIntoProcess ?? installIntoProcess;
-  const update = deps.update ?? null;
   const now = deps.now ?? Date.now;
+  // A candidate run has to prove itself against the live process: a persisted
+  // `active` record from an earlier revision or an earlier start describes what
+  // happened then, not what this bundle does now.
+  const candidate = deps.candidate ?? Boolean(process.env.KCT_CANDIDATE_ID);
   const processes = await find();
   let beforeWait = await previousState().catch(() => ({}));
   const diskState = structuredClone(beforeWait);
-  // Update bookkeeping lives outside the attachment state, so carry it forward.
-  const updateFields = () => ({
-    ...(beforeWait.lastUpdateCheckAt ? { lastUpdateCheckAt: beforeWait.lastUpdateCheckAt } : {}),
-    ...(beforeWait.updateCheckedFor ? { updateCheckedFor: beforeWait.updateCheckedFor } : {}),
-    ...(beforeWait.updateStatus ? { updateStatus: beforeWait.updateStatus } : {}),
-    ...(beforeWait.updateVersion ? { updateVersion: beforeWait.updateVersion } : {}),
-    ...(beforeWait.updateError ? { updateError: beforeWait.updateError } : {}),
-  });
+  const updateFields = () => Object.fromEntries(Object.entries(beforeWait)
+    .filter(([key]) => key.startsWith('update') || key.startsWith('lastUpdate')));
   const persist = async (state) => {
     Object.assign(state, updateFields());
     const fields = (value) => JSON.stringify({ ...value, checkedAt: undefined });
@@ -499,15 +598,9 @@ export async function tick(deps = {}) {
   }
   const info = processes[0];
   const processKey = `${info.pid}:${info.started}`;
-  // Kimi is running (exactly one instance): this is the only point where the
-  // extension may reach the network. A launch checks once; later ticks for the
-  // same process are silent.
-  if (update) {
-    beforeWait = await maybeUpdate({ ...beforeWait }, { now: now(), processKey, ...update });
-  }
   const sameProcess = preserved?.pid === info.pid
     && (preserved.started === info.started || preserved.identity?.startsWith(`${processKey}:`));
-  if (sameProcess && preserved.status !== 'active' && preserved.failureKind !== 'permanent') {
+  if (!candidate && sameProcess && preserved.status !== 'active' && preserved.failureKind !== 'permanent') {
     const reusable = await reusableAttempt(preserved, now(), checkPort);
     if (reusable) return persist(reusable);
   }
@@ -522,12 +615,14 @@ export async function tick(deps = {}) {
     const loader = await read(new URL(import.meta.url), 'utf8');
     const revision = runtimeRevision(source, supported, installRuntimeHook.toString(), loader);
     const identity = `${processKey}:${await fileFingerprint(EXECUTABLE)}`;
-    const matched = matchedAttempt(beforeWait, identity, revision);
-    if (matched) {
-      const reusable = await reusableAttempt(matched, now(), checkPort);
-      if (reusable) return persist(reusable);
+    if (!candidate) {
+      const matched = matchedAttempt(beforeWait, identity, revision);
+      if (matched) {
+        const reusable = await reusableAttempt(matched, now(), checkPort);
+        if (reusable) return persist(reusable);
+      }
     }
-    if (sameProcess && state.attempts > MAX_ATTEMPTS) return persist(preserved);
+    if (sameProcess && state.attempts > MAX_ATTEMPTS && !candidate) return persist(preserved);
     state.identity = identity;
     state.revision = revision;
     const args = await command('/bin/ps', ['-p', String(info.pid), '-o', 'command=']);
@@ -543,7 +638,14 @@ export async function tick(deps = {}) {
     const result = await install(info, app, source, revision);
     state.status = 'active';
     state.loaded = result.loaded;
+    state.stalePages = result.stale ?? 0;
     state.inspectorClosed = true;
+    state.liveVerified = true;
+    state.verifiedAt = new Date(now()).toISOString();
+    // healthyAt means the runtime could run, the hook is installed in the live
+    // process and the pages were read back. It never means translation has been
+    // proven: an empty conversation has no thinking blocks to translate.
+    Object.assign(state, pageHealth(result.health));
   } catch (error) {
     recordFailure(state, error, now());
   }
@@ -552,31 +654,48 @@ export async function tick(deps = {}) {
   return saved;
 }
 
+export async function tick(deps = {}) {
+  let processes;
+  const find = deps.findProcesses ?? findProcesses;
+  const state = await tickAttachment({ ...deps, findProcesses: async () => (processes = await find()) });
+  if (!deps.update || processes.length !== 1) return state;
+  const info = processes[0];
+  const updated = await maybeUpdate({ ...state }, {
+    now: (deps.now ?? Date.now)(), processKey: `${info.pid}:${info.started}`, ...deps.update,
+  });
+  if (JSON.stringify(updated) !== JSON.stringify(state)) await (deps.saveState ?? saveState)(updated);
+  return updated;
+}
+
 async function acquireLock(dataDir = DATA) {
+  try {
+    const { acquireLock: shared } = await import('./runtime-launcher.mjs');
+    return await shared(dataDir);
+  } catch (error) {
+    if (error?.code !== 'ERR_MODULE_NOT_FOUND') throw error;
+  }
+  // Windows bundles do not ship the macOS launcher; keep a compatible fallback.
   const lock = join(dataDir, '.runtime-lock');
   try { await mkdir(lock); }
   catch (error) {
     if (error.code !== 'EEXIST') throw error;
     const pidText = await readFile(join(lock, 'pid'), 'utf8').catch(() => '');
     const pid = Number(pidText);
-    if (pidText.trim() && pid) {
-      try {
-        process.kill(pid, 0);
-        return null;
-      } catch (error) {
-        if (error.code === 'ESRCH') {
-          await rm(lock, { recursive: true });
-          return acquireLock(dataDir);
-        }
-        if (error.code === 'EPERM') return null;
-        throw error;
+    if (pidText.trim() && Number.isInteger(pid) && pid > 0) {
+      try { process.kill(pid, 0); return null; }
+      catch (probe) {
+        if (probe.code === 'EPERM') return null;
+        if (probe.code !== 'ESRCH') throw probe;
+        await rm(lock, { recursive: true, force: true });
+        return acquireLock(dataDir);
       }
     }
     if (Date.now() - (await stat(lock)).mtimeMs < 60000) return null;
-    await rm(lock, { recursive: true });
+    await rm(lock, { recursive: true, force: true });
     return acquireLock(dataDir);
   }
-  await writeFile(join(lock, 'pid'), String(process.pid), { mode: 0o600 });
+  try { await writeFile(join(lock, 'pid'), String(process.pid), { mode: 0o600 }); }
+  catch (error) { await rm(lock, { recursive: true, force: true }); throw error; }
   return { async release() { await rm(lock, { recursive: true, force: true }); } };
 }
 
@@ -625,79 +744,105 @@ export async function stageBundle(dataDir, files, read = readFile, write = write
   }
 }
 
-export async function switchBundle({
-  dataDir,
-  stageDir,
-  backupDir,
-  names = CORE_FILES,
-  renameFile = rename,
-}) {
-  backupDir ??= await mkdtemp(join(dataDir, '.deploy-backup-'));
-  const backedUp = [];
-  const installed = [];
-  const missing = [];
-  let rolledBack = false;
+function agentPlist(dataDir, label) {
+  const log = join(dataDir, 'runtime.log');
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>${xml(label)}</string>
+<key>ProgramArguments</key><array><string>${xml(process.execPath)}</string><string>${xml(join(dataDir, 'runtime.mjs'))}</string><string>--once</string></array>
+<key>WatchPaths</key><array>${WATCH_PATHS.map((path) => `<string>${xml(path)}</string>`).join('')}</array>
+<key>StartInterval</key><integer>60</integer>
+<key>RunAtLoad</key><true/>
+<key>ThrottleInterval</key><integer>5</integer>
+<key>ProcessType</key><string>Background</string>
+<key>StandardOutPath</key><string>${xml(log)}</string>
+<key>StandardErrorPath</key><string>${xml(log)}</string>
+</dict></plist>\n`;
+}
 
-  const rollback = async () => {
-    const failures = [];
-    for (const name of [...installed].reverse()) {
-      try { await rm(join(dataDir, name), { force: true }); } catch (error) { failures.push(error); }
-    }
-    for (const name of [...backedUp].reverse()) {
-      try { await renameFile(join(backupDir, name), join(dataDir, name)); } catch (error) { failures.push(error); }
-    }
-    for (const name of missing) {
-      try { await rm(join(dataDir, name), { force: true }); } catch (error) { failures.push(error); }
-    }
-    if (!failures.length) {
-      try { await rm(backupDir, { recursive: true, force: true }); } catch (error) { failures.push(error); }
-    }
-    if (failures.length) throw new AggregateError(failures, 'Deployment rollback failed');
-    rolledBack = true;
-  };
-
+async function agentLoaded(run, label) {
   try {
-    for (const name of names) {
-      try {
-        await renameFile(join(dataDir, name), join(backupDir, name));
-        backedUp.push(name);
-      } catch (error) {
-        if (error.code !== 'ENOENT') throw error;
-        missing.push(name);
-      }
-    }
-    for (const name of names) {
-      await renameFile(join(stageDir, name), join(dataDir, name));
-      installed.push(name);
-    }
+    await run('/bin/launchctl', ['print', `gui/${process.getuid()}/${label}`]);
+    return true;
   } catch (error) {
-    try { await rollback(); } catch (rollbackError) { error.rollbackError = rollbackError; }
+    if (/could not find service|service.*not found/i.test(String(error.stderr ?? error.message))) return false;
     throw error;
   }
+}
 
-  return {
-    async rollback() {
-      if (!rolledBack) await rollback();
-    },
-    async commit() {
-      if (rolledBack) return;
-      await rm(backupDir, { recursive: true, force: true });
-    },
-  };
+async function bootstrapAgent(run, plistPath, label, retryDelayMs = 1000, onStarted = () => {}) {
+  const bootstrap = () => run('/bin/launchctl', ['bootstrap', `gui/${process.getuid()}`, plistPath]);
+  try { await bootstrap(); }
+  catch (firstError) {
+    await sleep(retryDelayMs);
+    try { await bootstrap(); } catch (error) { error.firstError = firstError; throw error; }
+  }
+  onStarted();
+  if (!await agentLoaded(run, label)) throw new Error('LaunchAgent registration could not be confirmed');
+}
+
+export async function repairAgent({ dataDir = DATA, plistPath = PLIST, label = LABEL,
+  run = output, retryDelayMs = 1000 } = {}) {
+  const config = JSON.parse(await run('/usr/bin/plutil', ['-convert', 'json', '-o', '-', plistPath]));
+  const args = config.ProgramArguments;
+  if (config.Label !== label || !Array.isArray(args) || args.length !== 3
+    || args[0] !== process.execPath || args[1] !== join(dataDir, 'runtime.mjs') || args[2] !== '--once'
+    || config.RunAtLoad !== true || config.StartInterval !== 60) {
+    throw new Error('LaunchAgent configuration is invalid; run --install from a verified KCT package');
+  }
+  const entry = await readFile(join(dataDir, 'runtime.mjs'), 'utf8').catch((error) => {
+    if (error.code === 'ENOENT') throw new Error('Stable launcher is missing; run --install from a verified KCT package');
+    throw error;
+  });
+  const { ENTRY_MARKER } = await import('./runtime-launcher.mjs');
+  if (!entry.includes(ENTRY_MARKER)) {
+    throw new Error('Stable launcher is missing; run --install from a verified KCT package');
+  }
+  const { readDeployment, verifyVersion } = await import('./runtime-launcher.mjs');
+  const deployment = await readDeployment(dataDir);
+  await verifyVersion(dataDir, deployment.current);
+  if (await agentLoaded(run, label)) return { registered: true, repaired: false };
+  await bootstrapAgent(run, plistPath, label, retryDelayMs);
+  return { registered: true, repaired: true };
+}
+
+async function replaceFile(file, bytes) {
+  const temp = `${file}.${process.pid}.next`;
+  try {
+    const handle = await open(temp, 'w', 0o600);
+    try { await handle.writeFile(bytes); await handle.sync(); } finally { await handle.close(); }
+    await rename(temp, file);
+    const directory = await open(dirname(file), 'r');
+    try { await directory.sync(); } finally { await directory.close(); }
+  } finally { await rm(temp, { force: true }).catch(() => {}); }
+}
+
+async function recoverMigration({ dataDir, journal, plistPath, label, run, allowMigration = true }) {
+  const snapshot = await readFile(journal, 'utf8').then(JSON.parse, (error) => {
+    if (error.code === 'ENOENT') return null;
+    throw error;
+  });
+  if (!snapshot) return false;
+  if (process.env.XPC_SERVICE_NAME === label || !allowMigration) {
+    throw new Error('Interrupted LaunchAgent migration requires --install from a terminal session');
+  }
+  const loaded = await agentLoaded(run, label);
+  if (loaded) await run('/bin/launchctl', ['bootout', `gui/${process.getuid()}/${label}`]);
+  for (const [file, value] of [[join(dataDir, 'runtime.mjs'), snapshot.entry],
+    [plistPath, snapshot.plist], [join(dataDir, 'deployment.json'), snapshot.pointer]]) {
+    if (value) await replaceFile(file, Buffer.from(value, 'base64'));
+    else await rm(file, { force: true });
+  }
+  if (snapshot.wasLoaded && snapshot.plist) await bootstrapAgent(run, plistPath, label);
+  await rm(journal, { force: true });
+  return true;
 }
 
 export async function deploy({
-  files: providedFiles,
-  dataDir = DATA,
-  plistPath = PLIST,
-  label = LABEL,
-  acquire,
-  verify = verifyApp,
-  run = output,
-  fileStat = stat,
-  commit,
-  platformCheck = assertInstallPlatform,
-  retryDelayMs = 1000,
+  files: providedFiles, dataDir = DATA, plistPath = PLIST, label = LABEL,
+  acquire, verify = verifyApp, run = output, platformCheck = assertInstallPlatform,
+  retryDelayMs = 1000, checkSyntax = true, allowMigration = false,
 } = {}) {
   platformCheck();
   await verify();
@@ -705,115 +850,375 @@ export async function deploy({
   await mkdir(dataDir, { recursive: true, mode: 0o700 });
   const lock = await (acquire ? acquire() : acquireLock(dataDir));
   if (!lock) throw new Error('Installation skipped: another runtime operation is in progress; retry shortly');
-  let switched;
-  let staged;
-  let hadAgent = false;
-  let plistChanged = false;
-  let stoppedJob = false;
-  let keepPlistBackup = false;
-  const log = join(dataDir, 'runtime.log');
-  const plistBackup = join(dataDir, '.runtime-plist.backup');
+  const { detectLegacyInstall, stageLegacyMigration, storeVersion, switchVersion,
+    readDeployment, atomicJSON } = await import('./runtime-launcher.mjs');
+  const pointer = join(dataDir, 'deployment.json');
+  const entry = join(dataDir, 'runtime.mjs');
+  const journal = join(dataDir, '.migration.json');
+  let stopped = false;
+  let started = false;
+  let changed = false;
+  let oldEntry, oldPlist, oldPointer;
   try {
-    staged = await stageBundle(dataDir, files);
-    hadAgent = await fileStat(plistPath).then(() => true, (error) => {
-      if (error.code === 'ENOENT') return false;
+    await recoverMigration({ dataDir, journal, plistPath, label, run, allowMigration });
+    const oldState = await readDeployment(dataDir).catch((error) => {
+      if (error.code === 'ENOENT') return null;
       throw error;
     });
-    if (hadAgent) {
-      await writeFile(plistBackup, await readFile(plistPath), { mode: 0o600 });
-      const domain = `gui/${process.getuid()}/${label}`;
-      let loaded = true;
-      try { await run('/bin/launchctl', ['print', domain]); }
-      catch (error) {
-        if (!/could not find service|service.*not found/i.test(String(error.stderr ?? error.message))) throw error;
-        loaded = false;
-      }
-      if (loaded) {
-        await run('/bin/launchctl', ['bootout', domain]);
-        stoppedJob = true;
-      }
-    }
-    switched = await switchBundle({ dataDir, stageDir: staged });
-    await verifyBundle(dataDir, files);
-    await mkdir(dirname(plistPath), { recursive: true });
-    const contents = `<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-<key>Label</key><string>${label}</string>
-<key>ProgramArguments</key><array><string>${xml(process.execPath)}</string><string>${xml(join(dataDir, 'runtime.mjs'))}</string><string>--once</string></array>
-<key>WatchPaths</key><array>${WATCH_PATHS.map((path) => `<string>${xml(path)}</string>`).join('')}</array>
-<key>RunAtLoad</key><true/>
-<key>ThrottleInterval</key><integer>5</integer>
-<key>ProcessType</key><string>Background</string>
-<key>StandardOutPath</key><string>${xml(log)}</string>
-<key>StandardErrorPath</key><string>${xml(log)}</string>
-</dict></plist>\n`;
-    const plistNext = `${plistPath}.next`;
-    try {
-      await writeFile(plistNext, contents, { mode: 0o600 });
-      await rename(plistNext, plistPath);
-      plistChanged = true;
-    } catch (error) {
-      await rm(plistNext, { force: true }).catch(() => {});
-      throw error;
-    }
-    // A single failed bootstrap used to leave the agent unloaded: launchd
-    // occasionally refuses the first bootstrap right after a bootout, and the
-    // catch path only restored the plist file, not the running service. Retry
-    // before giving up — without the agent nothing checks for updates, so a
-    // failed re-registration silently pauses translation until it is noticed.
-    const bootstrap = () => run('/bin/launchctl', ['bootstrap', `gui/${process.getuid()}`, plistPath]);
-    try {
-      await bootstrap();
-    } catch (error) {
-      await sleep(retryDelayMs);
-      await bootstrap().catch((retryError) => {
-        retryError.firstError = error;
-        throw retryError;
+    oldEntry = await readFile(entry).catch((error) => { if (error.code === 'ENOENT') return null; throw error; });
+    oldPlist = await readFile(plistPath).catch((error) => { if (error.code === 'ENOENT') return null; throw error; });
+    oldPointer = await readFile(pointer).catch((error) => { if (error.code === 'ENOENT') return null; throw error; });
+    const plist = agentPlist(dataDir, label);
+    const launcher = files.get('runtime-launcher.mjs');
+    if (!launcher?.length) throw new Error('Runtime bundle missing runtime-launcher.mjs');
+    // A v0.2.x install has no pointer and no launcher, so nothing below applies
+    // until its five loose files are turned into a real version directory.
+    const legacy = oldState ? null : await detectLegacyInstall(dataDir);
+    const inService = process.env.XPC_SERVICE_NAME === label;
+    if (legacy && !inService && allowMigration) {
+      const loaded = await agentLoaded(run, label);
+      await atomicJSON(journal, {
+        entry: oldEntry?.toString('base64') ?? null, plist: oldPlist?.toString('base64') ?? null,
+        pointer: null, wasLoaded: loaded, createdAt: new Date().toISOString(),
       });
-    }
-    const completed = switched;
-    switched = undefined;
-    await (commit ? commit(completed) : completed.commit()).catch((commitError) => {
-      console.warn(`[kct] deployment backup cleanup failed: ${commitError.message}`);
-    });
-  } catch (error) {
-    if (switched) {
-      try { await switched.rollback(); } catch (rollbackError) { error.rollbackError = rollbackError; }
-    }
-    if (plistChanged) {
-      try {
-        if (hadAgent) await rename(plistBackup, plistPath);
-        else await rm(plistPath, { force: true });
-      } catch (plistError) {
-        error.plistRestoreError = plistError;
-        keepPlistBackup = hadAgent;
+      if (loaded) {
+        await run('/bin/launchctl', ['bootout', `gui/${process.getuid()}/${label}`]);
+        stopped = true;
       }
+      await stageLegacyMigration(dataDir, files, { checkSyntax });
+      changed = true;
+      await mkdir(dirname(plistPath), { recursive: true });
+      await replaceFile(plistPath, plist);
+      await bootstrapAgent(run, plistPath, label, retryDelayMs, () => { started = true; });
+      await rm(journal, { force: true });
+      console.log(`Runtime loader migrated from a v0.2.x install: ${dataDir}`);
+      return;
     }
-    if (stoppedJob && !error.rollbackError && !error.plistRestoreError) {
-      await run('/bin/launchctl', ['bootstrap', `gui/${process.getuid()}`, plistPath])
-        .catch((restartError) => { error.agentRestartError = restartError; });
+    if (legacy) {
+      // Inside the running service — and for the automatic updater, which runs
+      // from the same job — nothing may bootout. The stable entry is replaced
+      // with the launcher in place, which is exactly the path the legacy plist
+      // already invokes, so launchd needs no change and the current invocation
+      // finishes normally. The next trigger goes through the launcher, which is
+      // also what confirms the new version.
+      await stageLegacyMigration(dataDir, files, { checkSyntax });
+      // The plist file is updated either way; launchd keeps the configuration it
+      // already loaded, so a live job is not disturbed and picks the new file up
+      // on its next natural reload.
+      await mkdir(dirname(plistPath), { recursive: true });
+      await replaceFile(plistPath, plist);
+      if (!await agentLoaded(run, label)) {
+        await bootstrapAgent(run, plistPath, label, retryDelayMs, () => { started = true; });
+      }
+      console.log(`Runtime loader staged over a v0.2.x install; the next trigger confirms it: ${dataDir}`);
+      return;
     }
+    const migrate = !oldEntry?.equals(launcher) || oldPlist?.toString() !== plist;
+    if (migrate && inService) {
+      throw new Error('LaunchAgent migration must be started outside the running service');
+    }
+    if (migrate && !allowMigration) {
+      throw new Error('LaunchAgent migration requires an explicit --install from a terminal session');
+    }
+    if (!migrate) {
+      // A pending candidate is confirmed by the launcher, not by re-installing
+      // over it: rewriting the pointer here would drop the first-start check.
+      if (!oldState?.candidate) await switchVersion(dataDir, files, { checkSyntax });
+      await repairAgent({ dataDir, plistPath, label, run, retryDelayMs });
+      return;
+    }
+    const id = await storeVersion(dataDir, files, { checkSyntax });
+    const loaded = await agentLoaded(run, label);
+    await atomicJSON(journal, {
+      entry: oldEntry?.toString('base64') ?? null, plist: oldPlist?.toString('base64') ?? null,
+      pointer: oldPointer?.toString('base64') ?? null, wasLoaded: loaded,
+      createdAt: new Date().toISOString(),
+    });
+    if (loaded) {
+      await run('/bin/launchctl', ['bootout', `gui/${process.getuid()}/${label}`]);
+      stopped = true;
+    }
+    if (oldState) {
+      await switchVersion(dataDir, files, { checkSyntax });
+    } else {
+      await atomicJSON(pointer, { current: id, previous: null, candidate: false, installedAt: new Date().toISOString() });
+    }
+    changed = true;
+    await replaceFile(entry, launcher);
+    await mkdir(dirname(plistPath), { recursive: true });
+    await replaceFile(plistPath, plist);
+    await bootstrapAgent(run, plistPath, label, retryDelayMs, () => { started = true; });
+    await rm(journal, { force: true });
+  } catch (error) {
+    if (started) {
+      await run('/bin/launchctl', ['bootout', `gui/${process.getuid()}/${label}`])
+        .catch((failure) => { error.agentStopError = failure; });
+    }
+    if (changed) {
+      try {
+        for (const [file, bytes] of [[entry, oldEntry], [plistPath, oldPlist], [pointer, oldPointer]]) {
+          if (bytes) await replaceFile(file, bytes);
+          else await rm(file, { force: true });
+        }
+      } catch (failure) { error.rollbackError = failure; }
+    }
+    if (stopped && !error.rollbackError) {
+      await bootstrapAgent(run, plistPath, label, retryDelayMs)
+        .catch((failure) => { error.agentRestartError = failure; });
+    }
+    if (!error.rollbackError && !error.agentRestartError) await rm(journal, { force: true }).catch(() => {});
     throw error;
-  } finally {
-    await lock.release();
-    if (!keepPlistBackup) await rm(plistBackup, { force: true }).catch(() => {});
-    if (staged) await rm(staged, { recursive: true, force: true }).catch(() => {});
-  }
+  } finally { await lock.release(); }
   console.log(`Runtime loader installed: ${dataDir}`);
+}
+
+// The v0.2.x updater only ever fetched its own five files, so it could replace
+// every loose file with the new bundle and still leave no launcher and no
+// pointer behind — an install that reports 0.3.0 while running the old layout.
+//
+// Nothing here touches launchd: the loose files are verified against the
+// published manifest, the launcher is fetched from the same tag, and the entry
+// is swapped in place. The next job trigger goes through the launcher, which is
+// what confirms the version.
+//
+// The order matters and is the whole point of this function: a legacy install
+// has no runtime-launcher.mjs, so nothing may import it before it has been
+// fetched, verified and written. Detection and fetching use only what a legacy
+// install already has.
+const LAUNCHER = 'runtime-launcher.mjs';
+// A legacy layout is recognised by its own file set, not by the launcher that
+// is missing from it. Keeping the test here rather than importing it is what
+// breaks the bootstrapping cycle.
+//
+// A single signature is not enough to tell the two entry points apart: this
+// module mentions the launcher's signature in the checks it performs, so a
+// literal match would classify the runtime as a launcher and send it looking for
+// a dependency that a legacy install does not have. The runtime exports tick();
+// the launcher never does.
+const isLauncherEntry = (source) => source.includes('export async function launch(')
+  && !source.includes('export async function tick(');
+
+async function legacyLayout(dataDir, read = readFile, fileStat = stat) {
+  const has = (name) => fileStat(join(dataDir, name)).then(() => true, (error) => {
+    if (error.code === 'ENOENT') return false;
+    throw error;
+  });
+  if (await has('deployment.json')) return null;
+  const present = [];
+  for (const name of RUNTIME_FILES) {
+    if (name === LAUNCHER) continue;
+    if (await has(name)) present.push(name);
+  }
+  if (present.length !== RUNTIME_FILES.length - 1) return null;
+  const entry = await read(join(dataDir, 'runtime.mjs'), 'utf8').catch(() => '');
+  return { present, entry, isLauncher: isLauncherEntry(entry) };
+}
+
+export async function migrateLegacyInPlace({ dataDir = DATA, fetchImpl = fetch } = {}) {
+  const layout = await legacyLayout(dataDir);
+  if (!layout) return null;
+
+  if (layout.isLauncher) {
+    // The entry is already a launcher but the pointer is gone: rebuild both from
+    // the local files. The launcher is present here, so importing it is safe.
+    const { stageLegacyMigration } = await import('./runtime-launcher.mjs');
+    const files = await readBundle(dataDir).catch(() => null);
+    if (!files) throw new Error('Stable launcher is present but the version pointer is missing');
+    return { adopted: true, ...(await stageLegacyMigration(dataDir, files, { checkSyntax: false })) };
+  }
+
+  const version = await localVersion();
+  const manifest = await fetchManifest(versionedManifestUrl(version), { fetchImpl });
+  const files = new Map();
+  for (const name of RUNTIME_FILES) {
+    if (name === LAUNCHER) continue;
+    const bytes = await readFile(join(dataDir, name));
+    if (hash(bytes) !== manifest.files[name]) {
+      throw new Error(`Installed ${name} does not match v${version}; run --install from a verified package`);
+    }
+    files.set(name, bytes);
+  }
+  const launcher = (await downloadBundle(manifest, { fetchImpl, required: [LAUNCHER] })).get(LAUNCHER);
+  if (!launcher?.length || hash(launcher) !== manifest.files[LAUNCHER]) {
+    throw new Error(`Downloaded ${LAUNCHER} does not match v${version}`);
+  }
+  // Written before the import: the file has to exist on disk for the dynamic
+  // import below to resolve. A failed write leaves the install untouched, so the
+  // next start simply retries.
+  await replaceFile(join(dataDir, LAUNCHER), launcher);
+  const written = await readFile(join(dataDir, LAUNCHER));
+  if (hash(written) !== manifest.files[LAUNCHER]) {
+    throw new Error(`Installed ${LAUNCHER} failed verification after writing`);
+  }
+
+  files.set(LAUNCHER, written);
+  const { stageLegacyMigration } = await import('./runtime-launcher.mjs');
+  const staged = await stageLegacyMigration(dataDir, files);
+  console.log(`[kct] migrated a v0.2.x install to the versioned loader: ${staged.current}`);
+  return { version, ...staged };
+}
+
+export async function doctor({
+  dataDir = DATA, plistPath = PLIST, label = LABEL, run = output,
+  find = findProcesses, verify = verifyApp, attach = attachInspector, stateReader = readState,
+} = {}) {
+  const report = {
+    installation: { evidence: 'live', status: 'unknown' },
+    launchAgent: { evidence: 'live', status: 'unknown' },
+    process: { evidence: 'live', status: 'unknown' },
+    injection: { evidence: 'unknown', status: 'unknown' },
+    page: { evidence: 'unknown', status: 'unknown' },
+    translation: { evidence: 'unknown', status: 'unknown' },
+    update: { evidence: 'history', status: 'unknown' },
+  };
+  try {
+    const { readDeployment, verifyVersion } = await import('./runtime-launcher.mjs');
+    const deployment = await readDeployment(dataDir);
+    await verifyVersion(dataDir, deployment.current);
+    const { ENTRY_MARKER } = await import('./runtime-launcher.mjs');
+    const entry = await readFile(join(dataDir, 'runtime.mjs'), 'utf8');
+    if (!entry.includes(ENTRY_MARKER)) throw new Error('Stable launcher is missing');
+    report.installation = { evidence: 'live', status: 'complete', current: deployment.current,
+      previous: deployment.previous, candidate: !!deployment.candidate };
+    if (deployment.blocked) report.update.rollback = deployment.blocked;
+  } catch (error) {
+    report.installation = { evidence: 'live', status: 'incomplete', detail: error.message };
+  }
+  try {
+    const config = JSON.parse(await run('/usr/bin/plutil', ['-convert', 'json', '-o', '-', plistPath]));
+    const args = config.ProgramArguments;
+    const valid = config.Label === label && Array.isArray(args) && args.length === 3
+      && args[0] === process.execPath && args[1] === join(dataDir, 'runtime.mjs') && args[2] === '--once'
+      && config.RunAtLoad === true && config.StartInterval === 60;
+    let loaded = false;
+    let actual = '';
+    try { actual = await run('/bin/launchctl', ['print', `gui/${process.getuid()}/${label}`]); loaded = true; }
+    catch (error) {
+      if (!/could not find service|service.*not found/i.test(String(error.stderr ?? error.message))) throw error;
+    }
+    const loadedPathsMatch = !loaded || (actual.includes(args?.[0] ?? '\0') && actual.includes(args?.[1] ?? '\0'));
+    report.launchAgent = { evidence: 'live', status: !valid || !loadedPathsMatch ? 'invalid'
+      : loaded ? 'registered' : 'unregistered', configurationValid: valid, registered: loaded,
+    };
+  } catch (error) {
+    report.launchAgent = { evidence: 'live', status: 'unknown', detail: error.message };
+  }
+  const historical = await stateReader().catch(() => ({}));
+  report.update = { ...report.update, status: historical.updateStatus ?? 'unknown',
+    lastAttemptAt: historical.lastUpdateAttemptAt ?? null, lastCheckAt: historical.lastUpdateCheckAt ?? null,
+    version: historical.updateVersion ?? null, nextRetryAt: historical.updateNextRetryAt ?? null,
+    detail: historical.updateError ?? null };
+  report.lastAttempt = { evidence: 'history', status: historical.status ?? 'unknown',
+    checkedAt: historical.checkedAt ?? null, detail: historical.detail ?? null };
+  let processes;
+  try { processes = await find(); }
+  catch (error) {
+    report.process = { evidence: 'unknown', status: 'unknown', detail: error.message };
+    return report;
+  }
+  report.process = { evidence: 'live', status: processes.length === 1 ? 'found'
+    : processes.length ? 'multiple' : 'not-running', count: processes.length };
+  if (processes.length !== 1) return report;
+  let lock;
+  try { lock = await acquireLock(dataDir); }
+  catch (error) {
+    report.injection = { evidence: 'unknown', status: 'unknown', detail: error.message };
+    return report;
+  }
+  if (!lock) {
+    report.injection = { evidence: 'live', status: 'busy',
+      detail: 'Another runtime operation is in progress; retry shortly' };
+    return report;
+  }
+  try {
+    const app = await verify();
+    const inspector = await attach(processes[0], app);
+    let result;
+    try {
+      result = await inspector.evaluate(`(async () => {
+        const hook = globalThis.__kctRuntimeHook;
+        if (!hook) return { present: false };
+        return { present: true, revision: hook.revision,
+          health: typeof hook.health === 'function' ? await hook.health() : null };
+      })()`);
+    } finally { await inspector.close(); }
+    report.injection = { evidence: 'live', status: result?.present ? 'loaded' : 'missing',
+      revision: result?.revision ?? null, inspectorClosed: true };
+    if (!result?.present || !result.health) return report;
+    const pages = result.health.pages ?? [];
+    const loaded = pages.filter((page) => page?.loaded === true);
+    const stale = loaded.filter((page) => page.stale === true || page.revision !== result.revision);
+    const health = loaded.map((page) => page.health).filter(Boolean);
+    const invalid = health.reduce((count, page) => count + page.unsupported, 0);
+    const blocks = health.reduce((count, page) => count + page.blocks, 0);
+    const mounted = health.reduce((count, page) => count + page.mounted, 0);
+    report.injection = { ...report.injection, staleRenderers: stale.length };
+    report.page = { evidence: 'live', status: stale.length ? 'stale-renderer'
+      : invalid ? 'unsupported-structure'
+        : mounted ? 'mounted' : blocks ? 'unmounted' : health.length ? 'no-thinking-blocks' : 'unknown',
+    pages: pages.length, loaded: loaded.length, stale: stale.length,
+    revisions: [...new Set(pages.map((page) => page.revision ?? null))],
+    blocks, mounted, unsupported: invalid };
+    const failures = health.reduce((count, page) => count + page.failed, 0);
+    const translated = health.reduce((count, page) => count + page.translated, 0);
+    report.translation = { evidence: health.length ? 'live' : 'unknown', status: failures ? 'error'
+      : translated ? 'working' : health.length && health.every((page) => !page.enabled) ? 'disabled' : 'unconfirmed',
+    translated, failures };
+  } catch (error) {
+    report.injection = { evidence: 'unknown', status: 'unknown', detail: error.message };
+  } finally { await lock.release(); }
+  return report;
+}
+
+export async function reloadStalePages({
+  dataDir = DATA, find = findProcesses, verify = verifyApp, attach = attachInspector,
+} = {}) {
+  const lock = await acquireLock(dataDir);
+  if (!lock) throw new Error('Another runtime operation is in progress; retry shortly');
+  try {
+    const processes = await find();
+    if (processes.length !== 1) {
+      throw new Error(processes.length ? 'Multiple Kimi main processes; refresh skipped'
+        : 'Kimi Code is not running; refresh skipped');
+    }
+    const app = await verify();
+    const inspector = await attach(processes[0], app);
+    try {
+      return await inspector.evaluate(`(async () => {
+        const hook = globalThis.__kctRuntimeHook;
+        if (!hook) return { present: false, reloaded: 0, stale: [] };
+        if (typeof hook.reloadStale !== 'function') {
+          return { present: true, reloaded: 0, stale: 'unknown',
+            detail: 'Installed hook is too old to refresh pages; refresh the window manually' };
+        }
+        return { present: true, ...(await hook.reloadStale()) };
+      })()`);
+    } finally { await inspector.close(); }
+  } finally { await lock.release(); }
 }
 
 async function main() {
   const arg = process.argv[2];
-  if (process.argv.length !== 3 || !['--once', '--check', '--install', '--disable', '--update'].includes(arg)) {
-    throw new Error('Use --install, --check, --once, --update or --disable');
+  if (process.argv.length !== 3
+    || !['--once', '--check', '--doctor', '--repair', '--refresh', '--install', '--disable', '--update'].includes(arg)) {
+    throw new Error('Use --install, --check, --doctor, --repair, --refresh, --once, --update or --disable');
   }
-  if (arg === '--install') return deploy();
+  if (arg === '--install') return deploy({ allowMigration: true });
   if (arg === '--check') return console.log(JSON.stringify(await readState(), null, 2));
+  if (arg === '--doctor') return console.log(JSON.stringify(await doctor(), null, 2));
+  if (arg === '--repair') return console.log(JSON.stringify(await repairAgent(), null, 2));
+  if (arg === '--refresh') return console.log(JSON.stringify(await reloadStalePages(), null, 2));
   if (arg === '--update') {
-    const result = await selfUpdate({ currentVersion: await localVersion(), deployFn: deploy });
-    console.log(JSON.stringify(result, null, 2));
-    if (result.updated) console.log(`Updated ${result.from} -> ${result.to}`);
+    await mkdir(DATA, { recursive: true, mode: 0o700 });
+    const lock = await acquireLock();
+    if (!lock) throw new Error('Another runtime operation is in progress; retry shortly');
+    try {
+      const result = await selfUpdate({ currentVersion: await localVersion(),
+        cacheDir: join(DATA, '.download-cache'),
+        deployFn: ({ files, dataDir }) => deploy({ files, dataDir, allowMigration: true,
+          acquire: async () => ({ release: async () => {} }) }) });
+      console.log(JSON.stringify(result, null, 2));
+    } finally { await lock.release(); }
     return;
   }
   if (arg === '--disable') {
@@ -830,19 +1235,27 @@ async function main() {
   }
   await mkdir(DATA, { recursive: true, mode: 0o700 });
   const lock = await acquireLock();
-  if (!lock) return;
+  if (!lock) { process.exitCode = 75; return; }
   try {
-    await tick({ update: { version: await localVersion(), dataDir: DATA, updateCheck: true,
+    // A half-migrated install is repaired before the tick, so the run that
+    // notices it is also the run that fixes it.
+    await migrateLegacyInPlace().catch((error) => {
+      console.error(`[kct] legacy migration deferred: ${error.message}`);
+    });
+    const state = await tick({ update: { version: await localVersion(), dataDir: DATA, updateCheck: true,
       resolveUpdateFn: (current) => resolveUpdate({ current }),
       applyUpdate: async (manifest, dataDir) => {
-        await deploy({
-          files: await downloadBundle(manifest),
-          dataDir,
-          // The periodic run already holds the lock; deploy must not re-acquire it.
-          acquire: async () => ({ async release() {} }),
-        });
+        const cacheDir = join(dataDir, '.download-cache');
+        const files = await downloadBundle(manifest, { cacheDir });
+        await deploy({ files, dataDir, allowMigration: false,
+          acquire: async () => ({ release: async () => {} }) });
+        await rm(cacheDir, { recursive: true, force: true });
         return true;
       } } });
+    await writeRunResult(state);
+  } catch (error) {
+    await writeRunResult(null, error).catch(() => {});
+    throw error;
   } finally { await lock.release(); }
 }
 
